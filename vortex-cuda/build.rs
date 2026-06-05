@@ -6,7 +6,6 @@
 #![expect(clippy::use_debug)]
 
 use std::env;
-use std::fs::File;
 use std::io;
 use std::path::Path;
 use std::path::PathBuf;
@@ -103,16 +102,31 @@ fn generate_unpack<T: FastLanes>(output_dir: &Path, thread_count: usize) -> io::
     // Generate the lanes header (.cuh) — device functions only, no __global__ kernels.
     // This is what dynamic_dispatch.cu includes (via bit_unpack.cuh).
     let cuh_path = output_dir.join(format!("bit_unpack_{}_lanes.cuh", T::T));
-    let mut cuh_file = File::create(&cuh_path)?;
-    generate_cuda_unpack_lanes::<T>(&mut cuh_file)?;
+    let mut cuh_buf = Vec::new();
+    generate_cuda_unpack_lanes::<T>(&mut cuh_buf)?;
+    write_if_changed(&cuh_path, &cuh_buf)?;
 
     // Generate the standalone kernels (.cu) — includes the lanes header,
     // adds _device template + __global__ wrappers. Compiled to its own PTX.
     let cu_path = output_dir.join(format!("bit_unpack_{}.cu", T::T));
-    let mut cu_file = File::create(&cu_path)?;
-    generate_cuda_unpack_kernels::<T>(&mut cu_file, thread_count)?;
+    let mut cu_buf = Vec::new();
+    generate_cuda_unpack_kernels::<T>(&mut cu_buf, thread_count)?;
+    write_if_changed(&cu_path, &cu_buf)?;
 
     Ok(cu_path)
+}
+
+/// Write `bytes` to `path` only when the content differs. These generated files
+/// live in `kernels/src`, which `build.rs` declares `rerun-if-changed`; rewriting
+/// them unconditionally bumps their mtime even when the content is identical,
+/// which invalidates the fingerprint and forces a full `vortex-cuda` rebuild
+/// (recompiling every PTX kernel) on *every* `cargo`/`run.py` invocation. Skipping
+/// the no-op write keeps the mtime stable so an unchanged tree is a true no-op.
+fn write_if_changed(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    if std::fs::read(path).is_ok_and(|existing| existing == bytes) {
+        return Ok(());
+    }
+    std::fs::write(path, bytes)
 }
 
 fn nvcc_compile_ptx(
