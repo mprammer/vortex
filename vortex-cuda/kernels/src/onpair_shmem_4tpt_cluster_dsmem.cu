@@ -58,6 +58,12 @@ __device__ inline void emit_token_cdsm(uint8_t *s_buf, uint32_t base,
     }
 }
 
+// Thread-block clusters, `cg::this_cluster()`, and `map_shared_rank` are
+// sm_90+ (Hopper/Blackwell) features. On older targets (e.g. A100 / sm_80) nvcc
+// rejects `__cluster_dims__`, so guard the real kernel behind the arch and emit
+// a same-signature stub elsewhere (mirrors `onpair_shmem_tma.cu`). The stub is
+// never selected as the auto/best kernel and is gated inapplicable on cc < 9.
+#if __CUDA_ARCH__ >= 900
 extern "C" __global__ void __cluster_dims__(ONPAIR_CLUSTER_N, 1, 1)
     onpair_shmem_4tpt_cluster_dsmem(
         const uint16_t *__restrict codes,
@@ -172,3 +178,11 @@ extern "C" __global__ void __cluster_dims__(ONPAIR_CLUSTER_N, 1, 1)
     // it: park every block here until the whole cluster has finished decoding.
     cluster.sync();
 }
+#else
+// sm_80 and earlier: clusters are unavailable. Emit a same-signature no-op so
+// the PTX symbol exists; the bench gates this kernel inapplicable on cc < 9.
+extern "C" __global__ void onpair_shmem_4tpt_cluster_dsmem(
+    const uint16_t *, const uint64_t *, const uint8_t *, const uint8_t *,
+    uint8_t *, uint64_t, uint32_t) {
+}
+#endif

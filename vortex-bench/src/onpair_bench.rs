@@ -1265,7 +1265,8 @@ async fn run_gpu_kernel_bench(
     setup_ctx.synchronize_stream()?;
 
     let decoded_bytes = chunks.iter().map(|c| c.decoded_bytes).sum::<u64>();
-    let auto_kernel = pick_auto_kernel(&chunks, device_cc_major(&setup_ctx)).to_string();
+    let cc_major = device_cc_major(&setup_ctx);
+    let auto_kernel = pick_auto_kernel(&chunks, cc_major).to_string();
     let frac_le8 = if chunks.is_empty() {
         0.0
     } else {
@@ -1308,7 +1309,11 @@ async fn run_gpu_kernel_bench(
         if fast && matches!(variant.layout, KernelLayout::Ref) {
             continue;
         }
-        if let Some(reason) = inapplicable_reason(*variant, &chunks) {
+        // Thread-block-cluster kernels need sm_90+; on older GPUs (e.g. A100 /
+        // sm_80) report inapplicable rather than launching the arch stub.
+        let cc_reason = (cc_major < 9 && matches!(variant.layout, KernelLayout::ClusterDsmem))
+            .then(|| format!("thread-block clusters require sm_90+ (device cc {cc_major}.x)"));
+        if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
             kernels.push(GpuKernelResult {
                 kernel: variant.name.to_string(),
                 decode_ms: 0.0,
