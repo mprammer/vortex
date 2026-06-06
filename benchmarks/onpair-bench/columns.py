@@ -55,7 +55,7 @@ class Column:
 
     dataset_id: str
     column: str
-    kind: str  # "tpch" | "tpcds" | "parquet"
+    kind: str  # "tpch" | "tpcds" | "parquet" | "text" | "synthetic"
     # tpch / tpcds
     scale_factor: float = 10.0
     table: str = "lineitem"
@@ -63,6 +63,8 @@ class Column:
     url: str | None = None
     cache: str | None = None  # filename under SRC_DIR/<dataset_id>/
     local: list[Path] = field(default_factory=list)
+    # synthetic
+    rows: int = 10_000_000  # row count for the `synthetic` generator
 
     def tpch_dir(self) -> Path:
         return SRC_DIR / f"tpch_sf{int(self.scale_factor)}"
@@ -85,6 +87,8 @@ class Column:
             for p in self.local:
                 if Path(p).exists():
                     return Path(p)
+            return self.cache_path()
+        if self.kind == "synthetic":
             return self.cache_path()
         raise ValueError(f"unknown source kind {self.kind!r}")
 
@@ -163,4 +167,9 @@ COLUMNS: list[Column] = [
     # reused from a local copy if present, otherwise skipped.
     Column(dataset_id="book-reviews", column="text", kind="parquet",
            cache="book_reviews.parquet", local=_LOCAL["book-reviews"]),
+    # Synthetic ClickBench-style URL corpus (deterministic, seed 123) — the
+    # micro-benchmark workload, regenerated in-pipeline via `gen-synth-urls`
+    # (no external source). Column name `url` matches the paper's synthetic row.
+    Column(dataset_id="synthetic", column="url", kind="synthetic",
+           cache="synthetic_urls.parquet"),
 ]

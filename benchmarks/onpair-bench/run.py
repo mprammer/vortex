@@ -143,6 +143,18 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
             download(col.url, raw_path)
         text_to_parquet(raw_path, col.cache_path(), col.column)
         return col.cache_path()
+    if col.kind == "synthetic":
+        # Deterministic in-pipeline generation (seed 123) via the Rust binary;
+        # no external source. Idempotent on the Rust side.
+        cache = col.cache_path()
+        cache.parent.mkdir(parents=True, exist_ok=True)
+        print(f"==> generating synthetic URL corpus ({col.rows} rows)", file=sys.stderr)
+        subprocess.run(
+            [str(binary), "gen-synth-urls", "--rows", str(col.rows), "--out", str(cache)],
+            cwd=REPO_ROOT,
+            check=True,
+        )
+        return cache
     raise FileNotFoundError(
         f"parquet for {col.dataset_id}/{col.column} not found at {path} "
         f"and no download url configured"

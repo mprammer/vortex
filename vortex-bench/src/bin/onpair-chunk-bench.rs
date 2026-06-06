@@ -16,6 +16,7 @@
 
 #![expect(clippy::print_stdout)]
 
+use std::path::Path;
 use std::path::PathBuf;
 
 use anyhow::Result;
@@ -61,6 +62,17 @@ enum Command {
         /// Output directory; tables land in `<out-dir>/parquet/<table>.parquet`.
         #[arg(long)]
         out_dir: PathBuf,
+    },
+    /// Generate a deterministic synthetic ClickBench-style URL corpus as a
+    /// single-column (`url`) parquet (idempotent). Reproduces the seed-123
+    /// generator the original `onpair_cuda` micro-benchmark used.
+    GenSynthUrls {
+        /// Number of URL rows to generate.
+        #[arg(long, default_value_t = 10_000_000)]
+        rows: usize,
+        /// Output parquet path (single Utf8 column named `url`).
+        #[arg(long)]
+        out: PathBuf,
     },
     /// Compress one column across the matrix and emit JSON results.
     Run {
@@ -132,6 +144,10 @@ async fn main() -> Result<()> {
             vortex_bench::tpcds::duckdb::generate_tpcds(out_dir.clone(), format!("{sf}"))?;
             eprintln!("TPC-DS (sf={sf}) ready under {}/parquet", out_dir.display());
         }
+        Command::GenSynthUrls { rows, out } => {
+            gen_synth_urls(rows, &out)?;
+            eprintln!("synthetic URLs ({rows} rows) ready at {}", out.display());
+        }
         Command::Run {
             parquet,
             column,
@@ -183,6 +199,134 @@ async fn main() -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&result)?);
         }
     }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Synthetic ClickBench-style URL corpus.
+//
+// Reproduces `vortex_fsst::test_utils::generate_clickbench_urls` (seed 123)
+// verbatim — the deterministic generator the original (since-removed)
+// `onpair_cuda` micro-benchmark used for its synthetic 10M-URL workload.
+// Inlined rather than depending on `vortex-fsst`'s `test_utils` so the corpus
+// is regenerable from this binary alone, with no cross-crate feature coupling.
+// ---------------------------------------------------------------------------
+
+const CB_DOMAINS: &[&str] = &[
+    "www.google.com",
+    "yandex.ru",
+    "mail.ru",
+    "vk.com",
+    "www.youtube.com",
+    "www.facebook.com",
+    "ok.ru",
+    "go.mail.ru",
+    "www.avito.ru",
+    "pogoda.yandex.ru",
+    "news.yandex.ru",
+    "maps.yandex.ru",
+    "market.yandex.ru",
+    "afisha.yandex.ru",
+    "auto.ru",
+    "www.kinopoisk.ru",
+    "www.ozon.ru",
+    "www.wildberries.ru",
+    "aliexpress.ru",
+    "lenta.ru",
+];
+
+const CB_PATHS: &[&str] = &[
+    "/search",
+    "/catalog/electronics/smartphones",
+    "/product/item/123456789",
+    "/news/2024/03/15/article-about-technology",
+    "/user/profile/settings/notifications",
+    "/api/v2/catalog/search",
+    "/checkout/cart/summary",
+    "/blog/2024/how-to-optimize-database-queries-for-better-performance",
+    "/category/home-and-garden/furniture/tables",
+    "/",
+];
+
+const CB_PARAMS: &[&str] = &[
+    "?utm_source=google&utm_medium=cpc&utm_campaign=spring_sale_2024&utm_content=banner_v2",
+    "?q=buy+smartphone+online+cheap+free+shipping&category=electronics&sort=price_asc&page=3",
+    "?ref=main_page_carousel_block_position_4&sessionid=abc123def456",
+    "?from=tabbar&clid=2270455&text=weather+forecast+tomorrow",
+    "?lr=213&msid=1234567890.12345&suggest_reqid=abcdef&csg=12345",
+    "",
+    "",
+    "",
+    "?page=1&per_page=20",
+    "?source=serp&forceshow=1",
+];
+
+const CB_FRAGMENTS: &[&str] = &[
+    "",
+    "",
+    "",
+    "#section-reviews",
+    "#comments",
+    "#price-history",
+    "",
+    "",
+    "",
+    "",
+];
+
+/// Deterministic ClickBench-style URL generator (seed 123). Byte-identical to
+/// `vortex_fsst::test_utils::generate_clickbench_urls`.
+fn generate_clickbench_urls(n: usize) -> Vec<String> {
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::prelude::StdRng;
+
+    let mut rng = StdRng::seed_from_u64(123);
+    (0..n)
+        .map(|_| {
+            let scheme = if rng.random_bool(0.7) { "https" } else { "http" };
+            let domain = CB_DOMAINS[rng.random_range(0..CB_DOMAINS.len())];
+            let path = CB_PATHS[rng.random_range(0..CB_PATHS.len())];
+            let params = CB_PARAMS[rng.random_range(0..CB_PARAMS.len())];
+            let fragment = CB_FRAGMENTS[rng.random_range(0..CB_FRAGMENTS.len())];
+            format!("{scheme}://{domain}{path}{params}{fragment}")
+        })
+        .collect()
+}
+
+/// Generate `rows` synthetic URLs and write them as a single-column (`url`)
+/// parquet at `out` (idempotent; a no-op if `out` already exists).
+fn gen_synth_urls(rows: usize, out: &Path) -> Result<()> {
+    use std::sync::Arc;
+
+    use arrow_array::RecordBatch;
+    use arrow_array::StringArray;
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+    use parquet::arrow::ArrowWriter;
+
+    if out.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = out.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let urls = generate_clickbench_urls(rows);
+    let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, false)]));
+
+    let tmp = out.with_extension("parquet.part");
+    let file = std::fs::File::create(&tmp)?;
+    let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)?;
+    // Bounded row groups so we never hold two full copies of the corpus.
+    for chunk in urls.chunks(1_000_000) {
+        let arr = StringArray::from_iter(chunk.iter().map(|s| Some(s.as_str())));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])?;
+        writer.write(&batch)?;
+    }
+    writer.close()?;
+    std::fs::rename(&tmp, out)?;
     Ok(())
 }
 
