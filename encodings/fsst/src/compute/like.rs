@@ -8,9 +8,8 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-#[expect(deprecated)]
-use vortex_array::ToCanonical;
 use vortex_array::arrays::BoolArray;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::varbin::VarBinArrayExt;
 use vortex_array::match_each_integer_ptype;
 use vortex_array::scalar_fn::fns::like::LikeKernel;
@@ -49,7 +48,7 @@ impl LikeKernel for FSST {
         array: ArrayView<'_, Self>,
         pattern: &ArrayRef,
         options: LikeOptions,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
         let trace = like_trace_enabled();
         let phase_us = |start: Option<std::time::Instant>| {
@@ -92,8 +91,7 @@ impl LikeKernel for FSST {
 
         let negated = options.negated;
         let codes = array.codes();
-        #[expect(deprecated)]
-        let offsets = codes.offsets().to_primitive();
+        let offsets = codes.offsets().clone().execute::<PrimitiveArray>(ctx)?;
         let all_bytes = codes.bytes();
         let all_bytes = all_bytes.as_slice();
         let n = codes.len();
@@ -114,7 +112,11 @@ impl LikeKernel for FSST {
         // This fires when progressing-code density is too high (Teddy
         // prefilter generates excessive candidates) or when the DFA would
         // fall back to the slow RowLoop path.
-        if matcher.should_bail_to_decompress(all_bytes) {
+        //
+        // SQL-escaped patterns (`\`) are always kept on the FSST path: the
+        // repo's contract is that escaped LIKE patterns are pushed down, and
+        // they are built as literal-mode matchers, so we never bail them.
+        if !pattern_bytes.contains(&b'\\') && matcher.should_bail_to_decompress(all_bytes) {
             if trace {
                 eprintln!(
                     "[fsst::like] bailing to decompress+like: rows={} bytes={} pattern={:?}",
@@ -215,7 +217,13 @@ mod tests {
         let compressor = fsst_train_compressor(&varbin);
         let len = varbin.len();
         let dtype = varbin.dtype().clone();
-        fsst_compress(varbin, len, &dtype, &compressor)
+        fsst_compress(
+            varbin,
+            len,
+            &dtype,
+            &compressor,
+            &mut SESSION.create_execution_ctx(),
+        )
     }
 
     fn run_like(array: FSSTArray, pattern: &str, opts: LikeOptions) -> VortexResult<BoolArray> {
@@ -400,6 +408,95 @@ mod tests {
         };
         let result = <FSST as LikeKernel>::like(fsst_v, &pattern, opts, &mut ctx)?;
         assert!(result.is_some(), "ilike should now be handled");
+
+        // Suffix patterns are still unsupported, even when the suffix is an escaped literal.
+        let pattern = ConstantArray::new(r"%\%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(result.is_none(), "escaped suffix pattern should fall back");
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_like_kernel_handles_escaped_prefix_and_contains() -> VortexResult<()> {
+        let fsst = make_fsst(
+            &[
+                Some("%front"),
+                Some("_front"),
+                Some("\\front"),
+                Some("middle%value"),
+                Some("middle_value"),
+                Some("middle\\value"),
+                Some("front"),
+            ],
+            Nullability::NonNullable,
+        );
+        let fsst_v = fsst.as_view();
+        let mut ctx = SESSION.create_execution_ctx();
+
+        let pattern = ConstantArray::new(r"\%%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(result.is_some(), "escaped percent prefix should use FSST");
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([true, false, false, false, false, false, false])
+        );
+
+        let pattern = ConstantArray::new(r"\_%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(
+            result.is_some(),
+            "escaped underscore prefix should use FSST"
+        );
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([false, true, false, false, false, false, false])
+        );
+
+        let pattern = ConstantArray::new(r"\\%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(result.is_some(), "escaped backslash prefix should use FSST");
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([false, false, true, false, false, false, false])
+        );
+
+        let pattern = ConstantArray::new(r"%\%%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(result.is_some(), "escaped percent contains should use FSST");
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([true, false, false, true, false, false, false])
+        );
+
+        let pattern = ConstantArray::new(r"%\_%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(
+            result.is_some(),
+            "escaped underscore contains should use FSST"
+        );
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([false, true, false, false, true, false, false])
+        );
+
+        let pattern = ConstantArray::new(r"%\\%", fsst.len()).into_array();
+        let result =
+            <FSST as LikeKernel>::like(fsst_v, &pattern, LikeOptions::default(), &mut ctx)?;
+        assert!(
+            result.is_some(),
+            "escaped backslash contains should use FSST"
+        );
+        assert_arrays_eq!(
+            result.unwrap(),
+            BoolArray::from_iter([false, false, true, false, false, true, false])
+        );
 
         Ok(())
     }

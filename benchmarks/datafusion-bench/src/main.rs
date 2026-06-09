@@ -9,6 +9,7 @@ use clap::Parser;
 use clap::value_parser;
 use custom_labels::asynchronous::Label;
 use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::util::pretty::pretty_format_batches;
 use datafusion::common::runtime::set_join_set_tracer;
 use datafusion::datasource::listing::ListingOptions;
 use datafusion::datasource::listing::ListingTable;
@@ -26,6 +27,7 @@ use datafusion_physical_plan::collect;
 use futures::StreamExt;
 use parking_lot::Mutex;
 use tokio::fs::File;
+use vortex::io::filesystem::FileSystemRef;
 use vortex::scan::DataSourceRef;
 use vortex_bench::Benchmark;
 use vortex_bench::BenchmarkArg;
@@ -44,6 +46,7 @@ use vortex_bench::runner::BenchmarkQueryResult;
 use vortex_bench::runner::SqlBenchmarkRunner;
 use vortex_bench::runner::filter_queries;
 use vortex_bench::setup_logging_and_tracing;
+use vortex_bench::v3;
 use vortex_datafusion::metrics::VortexMetricsFinder;
 
 /// Common arguments shared across benchmarks
@@ -82,6 +85,11 @@ struct Args {
     #[arg(short)]
     output_path: Option<PathBuf>,
 
+    /// Additionally write v3 JSONL records to this path. See
+    /// `benchmarks-website/planning/02-contracts.md`.
+    #[arg(long)]
+    gh_json_v3: Option<PathBuf>,
+
     #[arg(long, default_value_t = false)]
     show_metrics: bool,
 
@@ -93,6 +101,9 @@ struct Args {
 
     #[arg(long, default_value_t = false)]
     track_memory: bool,
+
+    #[arg(long, default_value = "unknown")]
+    runner: String,
 
     #[arg(long, default_value_t = false)]
     explain: bool,
@@ -149,6 +160,7 @@ async fn main() -> anyhow::Result<()> {
     let mut runner = SqlBenchmarkRunner::new(
         &*benchmark,
         Engine::DataFusion,
+        args.runner.clone(),
         args.formats.clone(),
         args.track_memory,
         args.hide_progress_bar,
@@ -222,6 +234,10 @@ async fn main() -> anyhow::Result<()> {
             print_metrics(plans.as_ref());
         }
 
+        if let Some(path) = args.gh_json_v3.as_ref() {
+            v3::write_jsonl_to_path(path, &runner.v3_records())?;
+        }
+
         let benchmark_id = format!("datafusion-{}", benchmark.dataset_name());
         let writer = create_output_writer(&args.display_format, args.output_path, &benchmark_id)?;
         runner.export_to(&args.display_format, writer)?;
@@ -252,18 +268,8 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
                 let pattern = benchmark.pattern(table.name, format);
                 let table_url = ListingTableUrl::try_new(benchmark_base.clone(), pattern)?;
 
-                let mut listing_options = ListingOptions::new(Arc::clone(&file_format))
+                let listing_options = ListingOptions::new(Arc::clone(&file_format))
                     .with_session_config_options(session.state().config());
-                if benchmark.dataset_name() == "polarsignals" && format == Format::Parquet {
-                    // Work around a DataFusion bug (fixed in 53.0.0) where the
-                    // constant-column optimization extracts ScalarValues using
-                    // the statistic scalar type, which may not match the table
-                    // column type.
-                    // See: https://github.com/apache/datafusion/pull/20042
-                    // TODO(asubiotto): Remove this after the datafusion 53
-                    // upgrade.
-                    listing_options = listing_options.with_collect_stat(false);
-                }
                 let mut config =
                     ListingTableConfig::new(table_url).with_listing_options(listing_options);
 
@@ -272,7 +278,14 @@ async fn register_benchmark_tables<B: Benchmark + ?Sized>(
                     None => config.infer_schema(&session.state()).await?,
                 };
 
-                let listing_table = Arc::new(ListingTable::try_new(config)?);
+                let listing_table = Arc::new(
+                    ListingTable::try_new(config)?.with_cache(
+                        session
+                            .runtime_env()
+                            .cache_manager
+                            .get_file_statistic_cache(),
+                    ),
+                );
 
                 session.register_table(table.name, listing_table)?;
             }
@@ -304,7 +317,7 @@ async fn register_v2_tables<B: Benchmark + ?Sized>(
             .runtime_env()
             .object_store(table_url.object_store())?;
 
-        let fs: vortex::io::filesystem::FileSystemRef = Arc::new(ObjectStoreFileSystem::new(
+        let fs: FileSystemRef = Arc::new(ObjectStoreFileSystem::new(
             Arc::clone(&store),
             SESSION.handle(),
         ));
@@ -397,7 +410,7 @@ impl BenchmarkQueryResult for DataFusionQueryResult {
     }
 
     fn display(self) -> String {
-        datafusion::arrow::util::pretty::pretty_format_batches(&self.0)
+        pretty_format_batches(&self.0)
             .map(|d| d.to_string())
             .unwrap_or_else(|e| format!("<error: {e}>"))
     }

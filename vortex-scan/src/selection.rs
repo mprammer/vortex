@@ -43,6 +43,10 @@ impl Selection {
 
     /// Extract the [`RowMask`] for the given range from this selection.
     pub fn row_mask(&self, range: &Range<u64>) -> RowMask {
+        if range.start >= range.end {
+            return RowMask::new(0, Mask::AllFalse(0));
+        }
+
         // Saturating subtraction to prevent underflow, though range should be valid
         let range_diff = range.end.saturating_sub(range.start);
         let range_len = usize::try_from(range_diff).unwrap_or_else(|_| {
@@ -77,8 +81,7 @@ impl Selection {
                                 .filter_map(|idx| {
                                     // Only include indices that fit in usize
                                     usize::try_from(idx).ok()
-                                })
-                                .collect(),
+                                }),
                         )
                     })
                     .unwrap_or_else(|| Mask::new_false(range_len));
@@ -117,8 +120,7 @@ impl Selection {
                         .filter_map(|idx| {
                             // Only include indices that fit in usize
                             usize::try_from(idx).ok()
-                        })
-                        .collect(),
+                        }),
                 );
 
                 RowMask::new(range.start, mask)

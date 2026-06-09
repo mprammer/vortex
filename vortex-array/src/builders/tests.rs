@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use rstest::rstest;
 use vortex_error::VortexExpect;
+use vortex_error::VortexResult;
+use vortex_mask::Mask;
 
 use crate::LEGACY_SESSION;
 use crate::VortexSessionExecute;
@@ -586,35 +588,14 @@ fn create_test_scalars_for_dtype(dtype: &DType, count: usize) -> Vec<Scalar> {
                 PType::F32 => Scalar::primitive(i as f32 * 1.5, *n),
                 PType::F64 => Scalar::primitive(i as f64 * 1.5, *n),
             },
-            DType::Utf8(n) => Scalar::utf8(format!("test_string_{}", i), *n),
-            DType::Binary(n) => Scalar::binary(format!("bytes_{}", i).into_bytes(), *n),
             DType::Decimal(dec_dtype, n) => {
                 // Create decimal scalars based on the decimal dtype.
                 use crate::scalar::DecimalValue;
                 let value = DecimalValue::I128((i as i128 + 1) * 100); // Simple decimal values.
                 Scalar::decimal(value, *dec_dtype, *n)
             }
-            DType::Struct(fields, n) => {
-                // Create struct scalars with field values.
-                let field_values: Vec<Scalar> = fields
-                    .fields()
-                    .enumerate()
-                    .map(|(j, field_dtype)| {
-                        // Create simple values for each field.
-                        match &field_dtype {
-                            DType::Primitive(PType::I32, n) => {
-                                Scalar::primitive((i as i32).saturating_add(j as i32), *n)
-                            }
-                            DType::Primitive(PType::F64, n) => {
-                                Scalar::primitive((i + j) as f64, *n)
-                            }
-                            DType::Utf8(n) => Scalar::utf8(format!("field_{}", i + j), *n),
-                            _ => Scalar::default_value(&field_dtype),
-                        }
-                    })
-                    .collect();
-                Scalar::struct_(DType::Struct(fields.clone(), *n), field_values)
-            }
+            DType::Utf8(n) => Scalar::utf8(format!("test_string_{}", i), *n),
+            DType::Binary(n) => Scalar::binary(format!("bytes_{}", i).into_bytes(), *n),
             DType::List(element_dtype, n) => {
                 // Create list scalars with a few elements.
                 let elements: Vec<Scalar> = (0..=i)
@@ -639,6 +620,29 @@ fn create_test_scalars_for_dtype(dtype: &DType, count: usize) -> Vec<Scalar> {
                     .collect();
                 Scalar::fixed_size_list(Arc::clone(element_dtype), elements, *n)
             }
+            DType::Struct(fields, n) => {
+                // Create struct scalars with field values.
+                let field_values: Vec<Scalar> = fields
+                    .fields()
+                    .enumerate()
+                    .map(|(j, field_dtype)| {
+                        // Create simple values for each field.
+                        match &field_dtype {
+                            DType::Primitive(PType::I32, n) => {
+                                Scalar::primitive((i as i32).saturating_add(j as i32), *n)
+                            }
+                            DType::Primitive(PType::F64, n) => {
+                                Scalar::primitive((i + j) as f64, *n)
+                            }
+                            DType::Utf8(n) => Scalar::utf8(format!("field_{}", i + j), *n),
+                            _ => Scalar::default_value(&field_dtype),
+                        }
+                    })
+                    .collect();
+                Scalar::struct_(DType::Struct(fields.clone(), *n), field_values)
+            }
+            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+            DType::Variant(_) => continue,
             DType::Extension(ext_dtype) => {
                 // Create extension scalars with storage values.
                 let storage_scalar = match ext_dtype.storage_dtype() {
@@ -647,7 +651,6 @@ fn create_test_scalars_for_dtype(dtype: &DType, count: usize) -> Vec<Scalar> {
                 };
                 Scalar::extension_ref(ext_dtype.clone(), storage_scalar)
             }
-            DType::Variant(_) => continue,
         };
         scalars.push(scalar);
     }
@@ -818,4 +821,68 @@ fn test_append_scalar_repeated_same_instance() {
             i
         );
     }
+}
+
+/// Test that `set_validity` correctly overrides a builder's validity across all mask variants.
+///
+/// `set_validity` moves the mask's buffer into the builder rather than copying it, so the
+/// `sliced_offset` case is important: slicing a `Mask::Values` at a non-byte-aligned boundary
+/// yields a buffer with a non-zero bit offset, which the move path must preserve.
+#[rstest]
+#[case::all_true(Mask::new_true(8), vec![true; 8])]
+#[case::all_false(Mask::new_false(8), vec![false; 8])]
+#[case::values(
+    Mask::from_iter([true, false, true, true, false, false, true, false]),
+    vec![true, false, true, true, false, false, true, false]
+)]
+#[case::sliced_offset(
+    Mask::from_iter([
+        false, false, false, // dropped by the slice
+        true, false, true, true, false, false, true, false, // kept: indices 3..11
+        true, true, true, true, true, // dropped by the slice
+    ])
+    .slice(3..11),
+    vec![true, false, true, true, false, false, true, false]
+)]
+fn test_set_validity_overrides_validity(
+    #[case] mask: Mask,
+    #[case] expected: Vec<bool>,
+) -> VortexResult<()> {
+    let dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+    let mut builder = builder_with_capacity(&dtype, mask.len());
+    builder.append_zeros(mask.len());
+
+    builder.set_validity(mask);
+
+    let validity = builder.finish().validity()?;
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    for (i, &valid) in expected.iter().enumerate() {
+        assert_eq!(
+            validity.execute_is_valid(i, &mut ctx)?,
+            valid,
+            "validity mismatch at index {i}"
+        );
+    }
+    Ok(())
+}
+
+/// Test that `set_validity` is a no-op on a non-nullable builder.
+#[test]
+fn test_set_validity_noop_when_non_nullable() -> VortexResult<()> {
+    let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+    let mut builder = builder_with_capacity(&dtype, 4);
+    builder.append_zeros(4);
+
+    // Providing an all-false mask must not make the non-nullable array invalid.
+    builder.set_validity(Mask::new_false(4));
+
+    let validity = builder.finish().validity()?;
+    let mut ctx = LEGACY_SESSION.create_execution_ctx();
+    for i in 0..4 {
+        assert!(
+            validity.execute_is_valid(i, &mut ctx)?,
+            "index {i} should remain valid"
+        );
+    }
+    Ok(())
 }

@@ -41,7 +41,7 @@ use crate::scalar::Scalar;
 /// See [`Sum`] for details.
 pub fn sum(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Scalar> {
     // Short-circuit using cached array statistics.
-    if let Some(Precision::Exact(sum_scalar)) = array.statistics().get(Stat::Sum) {
+    if let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum) {
         return Ok(sum_scalar);
     }
 
@@ -347,6 +347,7 @@ mod tests {
     use crate::arrays::ConstantArray;
     use crate::arrays::DecimalArray;
     use crate::arrays::FixedSizeListArray;
+    use crate::arrays::ListViewArray;
     use crate::arrays::PrimitiveArray;
     use crate::assert_arrays_eq;
     use crate::dtype::DType;
@@ -379,7 +380,7 @@ mod tests {
 
         // For non-float types, try statistics short-circuit with accumulator.
         if !matches!(&sum_dtype, DType::Primitive(p, _) if p.is_float())
-            && let Some(Precision::Exact(sum_scalar)) = array.statistics().get(Stat::Sum)
+            && let Precision::Exact(sum_scalar) = array.statistics().get(Stat::Sum)
         {
             return add_scalars(&sum_dtype, &sum_scalar, accumulator);
         }
@@ -613,6 +614,25 @@ mod tests {
 
         let expected2 = PrimitiveArray::from_option_iter([Some(30i64)]).into_array();
         assert_arrays_eq!(&result2, &expected2);
+        Ok(())
+    }
+
+    #[test]
+    fn grouped_sum_listview_out_of_order_offsets_with_null_group() -> VortexResult<()> {
+        let elements =
+            PrimitiveArray::new(buffer![100i32, 200, 300], Validity::NonNullable).into_array();
+        let offsets = PrimitiveArray::new(buffer![2i32, 0, 1], Validity::NonNullable).into_array();
+        let sizes = PrimitiveArray::new(buffer![1i32, 1, 1], Validity::NonNullable).into_array();
+        let validity = Validity::from_iter([true, false, true]);
+        let groups = ListViewArray::try_new(elements, offsets, sizes, validity)?.into_array();
+
+        let elem_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let result = run_grouped_sum(&groups, &elem_dtype)?;
+
+        // group 0 -> elements[2..3] = 300; group 1 -> null; group 2 -> elements[1..2] = 200.
+        let expected =
+            PrimitiveArray::from_option_iter([Some(300i64), None, Some(200i64)]).into_array();
+        assert_arrays_eq!(&result, &expected);
         Ok(())
     }
 

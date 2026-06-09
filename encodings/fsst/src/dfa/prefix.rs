@@ -62,6 +62,28 @@ impl FlatPrefixDfa {
         prefix: &[u8],
         case_insensitive: bool,
     ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, prefix, case_insensitive, true)
+    }
+
+    /// Like [`Self::new`] but matches every prefix byte literally — the `_`
+    /// wildcard sentinel is disabled. Used for SQL-escaped prefixes where a
+    /// literal underscore (`\_`) must match only `_`.
+    pub(crate) fn new_literal(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        prefix: &[u8],
+        case_insensitive: bool,
+    ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, prefix, case_insensitive, false)
+    }
+
+    fn build(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        prefix: &[u8],
+        case_insensitive: bool,
+        wildcards: bool,
+    ) -> VortexResult<Self> {
         if prefix.len() > Self::MAX_PREFIX_LEN {
             vortex_bail!(
                 "prefix length {} exceeds maximum {} for flat prefix DFA",
@@ -75,8 +97,13 @@ impl FlatPrefixDfa {
         let n_states = fail_state + 1;
         let sentinel = fail_state + 1;
 
-        let byte_table =
-            build_prefix_byte_table(prefix, accept_state, fail_state, case_insensitive);
+        let byte_table = build_prefix_byte_table(
+            prefix,
+            accept_state,
+            fail_state,
+            case_insensitive,
+            wildcards,
+        );
 
         let sym_trans =
             build_symbol_transitions(symbols, symbol_lengths, &byte_table, n_states, accept_state);
@@ -233,6 +260,7 @@ fn build_prefix_byte_table(
     accept_state: u8,
     fail_state: u8,
     case_insensitive: bool,
+    wildcards: bool,
 ) -> Vec<u8> {
     let n_states = fail_state + 1;
     let mut table = vec![fail_state; usize::from(n_states) * 256];
@@ -249,7 +277,7 @@ fn build_prefix_byte_table(
             } else {
                 state + 1
             };
-            if prefix[s] == super::WILDCARD {
+            if wildcards && prefix[s] == super::WILDCARD {
                 // Wildcard: every byte advances.
                 for byte in 0..256 {
                     table[s * 256 + byte] = next_state;

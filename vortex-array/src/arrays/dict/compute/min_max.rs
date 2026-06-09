@@ -60,21 +60,27 @@ impl DynAggregateKernel for DictMinMaxKernel {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
     use crate::IntoArray;
-    use crate::LEGACY_SESSION;
     use crate::VortexSessionExecute;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::arrays::DictArray;
     use crate::arrays::PrimitiveArray;
     use crate::builders::dict::dict_encode;
+    use crate::session::ArraySession;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     fn assert_min_max(array: &ArrayRef, expected: Option<(i32, i32)>) -> VortexResult<()> {
-        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let mut ctx = SESSION.create_execution_ctx();
         match (min_max(array, &mut ctx)?, expected) {
             (Some(result), Some((expected_min, expected_max))) => {
                 assert_eq!(i32::try_from(&result.min)?, expected_min);
@@ -92,42 +98,78 @@ mod tests {
         Ok(())
     }
 
-    #[rstest]
-    #[case::covering(
+    fn dict_covering() -> DictArray {
         DictArray::try_new(
             buffer![0u32, 1, 2, 3, 0, 1].into_array(),
             buffer![10i32, 20, 30, 40].into_array(),
-        ).unwrap(),
-        (10, 40)
-    )]
-    #[case::non_covering_duplicates(
+        )
+        .expect("valid test dictionary")
+    }
+
+    fn dict_non_covering_duplicates() -> DictArray {
         DictArray::try_new(
             buffer![1u32, 1, 1, 3, 3].into_array(),
             buffer![1i32, 2, 3, 4, 5].into_array(),
-        ).unwrap(),
-        (2, 4)
-    )]
-    #[case::non_covering_gaps(
+        )
+        .expect("valid test dictionary")
+    }
+
+    fn dict_non_covering_gaps() -> DictArray {
         DictArray::try_new(
             buffer![0u32, 2, 4].into_array(),
             buffer![1i32, 2, 3, 4, 5].into_array(),
-        ).unwrap(),
-        (1, 5)
-    )]
-    #[case::single(dict_encode(&buffer![42i32].into_array()).unwrap(), (42, 42))]
-    #[case::nullable_codes(
+        )
+        .expect("valid test dictionary")
+    }
+
+    fn dict_single() -> DictArray {
+        dict_encode(
+            &buffer![42i32].into_array(),
+            &mut SESSION.create_execution_ctx(),
+        )
+        .expect("valid single-value dictionary")
+    }
+
+    fn dict_nullable_codes() -> DictArray {
         DictArray::try_new(
             PrimitiveArray::from_option_iter([Some(0u32), None, Some(1), Some(2)]).into_array(),
             buffer![10i32, 20, 30].into_array(),
-        ).unwrap(),
-        (10, 30)
-    )]
-    #[case::nullable_values(
+        )
+        .expect("valid nullable-code dictionary")
+    }
+
+    fn dict_nullable_values() -> DictArray {
         dict_encode(
-            &PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array()
-        ).unwrap(),
-        (1, 2)
-    )]
+            &PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None])
+                .into_array(),
+            &mut SESSION.create_execution_ctx(),
+        )
+        .expect("valid nullable-value dictionary")
+    }
+
+    fn dict_empty() -> DictArray {
+        DictArray::try_new(
+            PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
+            buffer![10i32, 20, 30].into_array(),
+        )
+        .expect("valid empty dictionary")
+    }
+
+    fn dict_all_null_codes() -> DictArray {
+        DictArray::try_new(
+            PrimitiveArray::from_option_iter([Option::<u32>::None, None, None]).into_array(),
+            buffer![10i32, 20, 30].into_array(),
+        )
+        .expect("valid all-null-code dictionary")
+    }
+
+    #[rstest]
+    #[case::covering(dict_covering(), (10, 40))]
+    #[case::non_covering_duplicates(dict_non_covering_duplicates(), (2, 4))]
+    #[case::non_covering_gaps(dict_non_covering_gaps(), (1, 5))]
+    #[case::single(dict_single(), (42, 42))]
+    #[case::nullable_codes(dict_nullable_codes(), (10, 30))]
+    #[case::nullable_values(dict_nullable_values(), (1, 2))]
     fn test_min_max(#[case] dict: DictArray, #[case] expected: (i32, i32)) -> VortexResult<()> {
         assert_min_max(&dict.into_array(), Some(expected))
     }
@@ -135,24 +177,14 @@ mod tests {
     #[test]
     fn test_sliced_dict() -> VortexResult<()> {
         let reference = PrimitiveArray::from_iter([1, 5, 10, 50, 100]);
-        let dict = dict_encode(&reference.into_array())?;
+        let dict = dict_encode(&reference.into_array(), &mut SESSION.create_execution_ctx())?;
         let sliced = dict.slice(1..3)?;
         assert_min_max(&sliced, Some((5, 10)))
     }
 
     #[rstest]
-    #[case::empty(
-        DictArray::try_new(
-            PrimitiveArray::from_iter(Vec::<u32>::new()).into_array(),
-            buffer![10i32, 20, 30].into_array(),
-        ).unwrap()
-    )]
-    #[case::all_null_codes(
-        DictArray::try_new(
-            PrimitiveArray::from_option_iter([Option::<u32>::None, None, None]).into_array(),
-            buffer![10i32, 20, 30].into_array(),
-        ).unwrap()
-    )]
+    #[case::empty(dict_empty())]
+    #[case::all_null_codes(dict_all_null_codes())]
     fn test_min_max_none(#[case] dict: DictArray) -> VortexResult<()> {
         assert_min_max(&dict.into_array(), None)
     }

@@ -46,8 +46,10 @@ impl Handle {
         #[cfg(feature = "tokio")]
         {
             use tokio::runtime::Handle as TokioHandle;
+
+            use crate::runtime::tokio::TokioRuntime;
             if TokioHandle::try_current().is_ok() {
-                return Some(crate::runtime::tokio::TokioRuntime::current());
+                return Some(TokioRuntime::current());
             }
         }
 
@@ -66,7 +68,13 @@ impl Handle {
         R: Send + 'static,
     {
         let (send, recv) = oneshot::channel();
-        let span = tracing::Span::current();
+        // Instrument with a dedicated, named span on its own target rather than
+        // re-entering `Span::current()`. `Instrumented::poll` enters and exits the
+        // span on every poll, so re-entering the caller's span makes its cost scale
+        // with poll count. A distinct target lets subscribers opt these spans in or
+        // out via filtering; when filtered out the span is disabled and enter/exit
+        // are no-ops, which keeps frequently-polled spawned futures cheap.
+        let span = tracing::trace_span!(target: "vortex_io::spawn", "spawn");
         let abort_handle = self.runtime().spawn(
             async move {
                 // Task::detach allows the receiver to be dropped, so we ignore send errors.
@@ -89,6 +97,36 @@ impl Handle {
         R: Send + 'static,
     {
         self.spawn(f(Handle::new(Weak::clone(&self.runtime))))
+    }
+
+    /// Spawn a new I/O future onto the runtime.
+    ///
+    /// See [`Executor::spawn_io`] for more details about how this future is expected to run.
+    ///
+    // See [`Task`] for details on cancelling or detaching the spawned task.
+    pub fn spawn_io<Fut, R>(&self, f: Fut) -> Task<R>
+    where
+        Fut: Future<Output = R> + Send + 'static,
+        R: Send + 'static,
+    {
+        let (send, recv) = oneshot::channel();
+        // See `spawn` above: a dedicated target rather than `Span::current()` so
+        // subscribers can filter these spans in or out. I/O futures are polled
+        // frequently, so disabling the span (the default for an unconfigured
+        // target) avoids per-poll enter/exit cost.
+        let span = tracing::trace_span!(target: "vortex_io::spawn_io", "spawn_io");
+        let abort_handle = self.runtime().spawn_io(
+            async move {
+                // Task::detach allows the receiver to be dropped, so we ignore send errors.
+                drop(send.send(f.await));
+            }
+            .instrument(span)
+            .boxed(),
+        );
+        Task {
+            recv: recv.into_future(),
+            abort_handle: Some(abort_handle),
+        }
     }
 
     /// Spawn a CPU-bound task for execution on the runtime.

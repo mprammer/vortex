@@ -58,7 +58,7 @@ mod test {
     use crate::bitpacking::array::BitPackedArrayExt;
 
     fn bp(array: &ArrayRef, bit_width: u8) -> BitPackedArray {
-        BitPackedData::encode(array, bit_width).unwrap()
+        BitPackedData::encode(array, bit_width, &mut LEGACY_SESSION.create_execution_ctx()).unwrap()
     }
 
     fn slice_via_reduce(array: &BitPackedArray, range: Range<usize>) -> BitPackedArray {
@@ -141,16 +141,25 @@ mod test {
 
     #[test]
     fn slice_empty_patches() {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         // We create an array that has 1 element that does not fit in the 6-bit range.
-        let array = BitPackedData::encode(&buffer![0u32..=64].into_array(), 6).unwrap();
+        let array = BitPackedData::encode(&buffer![0u32..=64].into_array(), 6, &mut ctx).unwrap();
 
         assert!(array.patches().is_some());
 
         let patch_indices = array.patches().unwrap().indices().clone();
         assert_eq!(patch_indices.len(), 1);
 
-        // Slicing drops the empty patches array.
-        let sliced_bp = slice_via_reduce(&array, 0..64);
+        // Slicing with patches requires the execute path (not reduce) since patches.slice()
+        // reads buffers. The slice range 0..64 excludes the patch at index 64, so the
+        // resulting array should have no patches.
+        let array_ref = array.into_array();
+        let slice_array = SliceArray::new(array_ref.clone(), 0..64);
+        let sliced = array_ref
+            .execute_parent(&slice_array.into_array(), 0, &mut ctx)
+            .expect("execute_parent failed")
+            .expect("expected slice kernel to execute");
+        let sliced_bp = sliced.as_::<BitPacked>().into_owned();
         assert!(sliced_bp.patches().is_none());
     }
 
@@ -213,9 +222,10 @@ mod test {
 
     #[test]
     fn scalar_at() {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let values = (0u32..257).collect::<Buffer<_>>();
         let uncompressed = values.clone().into_array();
-        let packed = BitPackedData::encode(&uncompressed, 8).unwrap();
+        let packed = BitPackedData::encode(&uncompressed, 8, &mut ctx).unwrap();
         assert!(packed.patches().is_some());
 
         let patches = packed.patches().unwrap().indices().clone();

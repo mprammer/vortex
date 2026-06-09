@@ -21,10 +21,10 @@ use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayParts;
@@ -82,20 +82,20 @@ pub struct PatchedMetadata {
 }
 
 impl ArrayHash for PatchedData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.offset.hash(state);
         self.n_lanes.hash(state);
     }
 }
 
 impl ArrayEq for PatchedData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.offset == other.offset && self.n_lanes == other.n_lanes
     }
 }
 
 impl VTable for Patched {
-    type ArrayData = PatchedData;
+    type TypedArrayData = PatchedData;
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
 
@@ -358,6 +358,7 @@ mod tests {
     use vortex_session::registry::ReadContext;
 
     use crate::ArrayContext;
+    use crate::ArraySlots;
     use crate::Canonical;
     use crate::ExecutionCtx;
     use crate::IntoArray;
@@ -373,6 +374,7 @@ mod tests {
     use crate::patches::Patches;
     use crate::serde::SerializeOptions;
     use crate::serde::SerializedArray;
+    use crate::session::ArraySessionExt;
     use crate::validity::Validity;
 
     #[test]
@@ -588,7 +590,9 @@ mod tests {
         let dtype = array.dtype().clone();
         let len = array.len();
 
-        let ctx = ArrayContext::empty();
+        LEGACY_SESSION.arrays().register(Patched);
+
+        let ctx = ArrayContext::empty().with_registry(LEGACY_SESSION.arrays().registry().clone());
         let serialized = array
             .serialize(&ctx, &LEGACY_SESSION, &SerializeOptions::default())
             .unwrap();
@@ -622,7 +626,14 @@ mod tests {
         let array = make_patched_array(vec![0u16; 1024], &[1, 2, 3], &[10, 20, 30])?;
 
         // Get original children via accessor methods
-        let slots = PatchedSlots::from_slots(array.as_array().slots().to_vec());
+        let slots = PatchedSlots::from_slots(
+            array
+                .as_array()
+                .slots()
+                .iter()
+                .cloned()
+                .collect::<ArraySlots>(),
+        );
         let view = PatchedSlotsView::from_slots(array.as_array().slots());
         assert_eq!(view.inner.len(), array.inner().len());
 

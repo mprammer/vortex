@@ -11,6 +11,9 @@ use vortex_session::registry::Id;
 mod accumulator;
 pub use accumulator::*;
 
+mod satisfaction;
+pub use satisfaction::*;
+
 mod accumulator_grouped;
 pub use accumulator_grouped::*;
 
@@ -32,6 +35,7 @@ pub use erased::*;
 mod options;
 pub use options::*;
 
+pub mod combined;
 pub mod fns;
 pub mod kernels;
 pub mod proto;

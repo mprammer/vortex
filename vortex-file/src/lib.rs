@@ -110,12 +110,15 @@ pub use forever_constant::*;
 pub use open::*;
 pub use strategy::*;
 use vortex_array::arrays::Dict;
+use vortex_array::arrays::Patched;
+use vortex_array::arrays::patched::use_experimental_patches;
 use vortex_array::session::ArraySessionExt;
 use vortex_bytebool::ByteBool;
 use vortex_fsst::FSST;
+#[cfg(feature = "unstable_encodings")]
+use vortex_onpair::OnPair;
 use vortex_pco::Pco;
 use vortex_session::VortexSession;
-use vortex_sparse::Sparse;
 use vortex_zigzag::ZigZag;
 pub use writer::*;
 
@@ -161,13 +164,17 @@ pub fn register_default_encodings(session: &VortexSession) {
         arrays.register(ByteBool);
         arrays.register(Dict);
         arrays.register(FSST);
+        #[cfg(feature = "unstable_encodings")]
+        arrays.register(OnPair);
         arrays.register(Pco);
-        arrays.register(Sparse);
         arrays.register(ZigZag);
         #[cfg(feature = "zstd")]
         arrays.register(vortex_zstd::Zstd);
         #[cfg(all(feature = "zstd", feature = "unstable_encodings"))]
         arrays.register(vortex_zstd::ZstdBuffers);
+        if use_experimental_patches() {
+            arrays.register(Patched);
+        }
     }
 
     // Eventually all encodings crates should expose an initialize function. For now it's only
@@ -178,6 +185,7 @@ pub fn register_default_encodings(session: &VortexSession) {
     vortex_fastlanes::initialize(session);
     vortex_runend::initialize(session);
     vortex_sequence::initialize(session);
+    vortex_sparse::initialize(session);
 
     #[cfg(feature = "unstable_encodings")]
     vortex_tensor::initialize(session);

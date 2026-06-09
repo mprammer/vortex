@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::collections::BTreeSet;
+use std::any::Any;
 use std::ops::Range;
 use std::sync::Arc;
 
@@ -20,16 +20,113 @@ use vortex_error::vortex_bail;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
+use crate::LayoutReaderContext;
 use crate::children::LayoutChildren;
 use crate::segments::SegmentSource;
 
 pub type LayoutReaderRef = Arc<dyn LayoutReader>;
+
+/// A row range used when registering natural scan splits.
+///
+/// Row range is relative to the reader that receives it. Offset is the offset
+/// that the local row range needs to be shifted by to get the global row range.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SplitRange {
+    row_offset: u64,
+    row_range: Range<u64>,
+}
+
+impl SplitRange {
+    /// Constructs a split range, returning an error if the local row range is invalid.
+    pub fn try_new(row_offset: u64, row_range: Range<u64>) -> VortexResult<Self> {
+        if row_range.start > row_range.end {
+            vortex_bail!("Invalid split range {:?}", row_range);
+        }
+
+        Ok(Self {
+            row_offset,
+            row_range,
+        })
+    }
+
+    /// Constructs a split range for the root layout.
+    pub fn root(row_range: Range<u64>) -> VortexResult<Self> {
+        Self::try_new(0, row_range)
+    }
+
+    /// The root-layout row offset of this reader's local row zero.
+    pub fn row_offset(&self) -> u64 {
+        self.row_offset
+    }
+
+    /// The local row range within this reader.
+    pub fn row_range(&self) -> &Range<u64> {
+        &self.row_range
+    }
+
+    /// The length of the local row range.
+    pub fn len(&self) -> u64 {
+        self.row_range.end - self.row_range.start
+    }
+
+    /// Returns `true` if the local row range is empty.
+    pub fn is_empty(&self) -> bool {
+        self.row_range.is_empty()
+    }
+
+    /// Returns the equivalent row range in the root layout's coordinate space.
+    pub fn root_row_range(&self) -> Range<u64> {
+        self.row_offset + self.row_range.start..self.row_offset + self.row_range.end
+    }
+
+    /// Returns an error if the local row range is outside the given row count.
+    pub fn check_bounds(&self, row_count: u64) -> VortexResult<()> {
+        if self.row_range.end > row_count {
+            vortex_bail!(
+                "Split range {:?} is out of bounds for row count {}",
+                self.row_range,
+                row_count
+            );
+        }
+
+        Ok(())
+    }
+}
+
+/// A collection of row split points
+pub struct RowSplits(Vec<u64>);
+
+impl RowSplits {
+    /// Add row to splits
+    pub fn push(&mut self, row: u64) {
+        self.0.push(row);
+    }
+
+    /// Reserve space for "additional" elements
+    pub fn reserve(&mut self, additional: usize) {
+        self.0.reserve(additional);
+    }
+
+    /// Create a new RowSplits with preallocated "capacity"
+    pub(crate) fn new_capacity(capacity: usize) -> Self {
+        Self(Vec::with_capacity(capacity))
+    }
+
+    pub(crate) fn into_sorted_deduped(mut self) -> Vec<u64> {
+        self.0.sort_unstable();
+        self.0.dedup();
+        self.0.shrink_to_fit();
+        self.0
+    }
+}
 
 /// A [`LayoutReader`] is used to read a [`crate::Layout`] in a way that can cache state across multiple
 /// evaluation operations.
 pub trait LayoutReader: 'static + Send + Sync {
     /// Returns the name of the layout reader for debugging.
     fn name(&self) -> &Arc<str>;
+
+    fn as_any(&self) -> &dyn Any;
 
     /// Returns the un-projected dtype of the layout reader.
     fn dtype(&self) -> &DType;
@@ -42,8 +139,8 @@ pub trait LayoutReader: 'static + Send + Sync {
     fn register_splits(
         &self,
         field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()>;
 
     /// Returns a mask where all false values are proven to be false in the given expression.
@@ -111,6 +208,7 @@ pub struct LazyReaderChildren {
     names: Vec<Arc<str>>,
     segment_source: Arc<dyn SegmentSource>,
     session: VortexSession,
+    ctx: LayoutReaderContext,
     // TODO(ngates): we may want a hash map of some sort here?
     cache: Vec<OnceCell<LayoutReaderRef>>,
 }
@@ -122,6 +220,7 @@ impl LazyReaderChildren {
         names: Vec<Arc<str>>,
         segment_source: Arc<dyn SegmentSource>,
         session: VortexSession,
+        ctx: LayoutReaderContext,
     ) -> Self {
         let nchildren = children.nchildren();
         let cache = (0..nchildren).map(|_| OnceCell::new()).collect();
@@ -131,6 +230,7 @@ impl LazyReaderChildren {
             names,
             segment_source,
             session,
+            ctx,
             cache,
         }
     }
@@ -147,6 +247,7 @@ impl LazyReaderChildren {
                 Arc::clone(&self.names[idx]),
                 Arc::clone(&self.segment_source),
                 &self.session,
+                &self.ctx,
             )
         })
     }

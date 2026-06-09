@@ -5,16 +5,16 @@ use vortex_error::VortexResult;
 
 use crate::ArrayEq;
 use crate::ArrayRef;
+use crate::EqMode;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
 use crate::arrays::Dict;
 use crate::arrays::DictArray;
+use crate::arrays::ScalarFn;
 use crate::arrays::ScalarFnArray;
-use crate::arrays::ScalarFnVTable;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::arrays::filter::FilterReduceAdaptor;
 use crate::arrays::scalar_fn::AnyScalarFn;
@@ -51,7 +51,7 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnValuesPushDownRule {
     fn reduce_parent(
         &self,
         array: ArrayView<'_, Dict>,
-        parent: ArrayView<'_, ScalarFnVTable>,
+        parent: ArrayView<'_, ScalarFn>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // Check that the scalar function can actually be pushed down.
@@ -156,7 +156,7 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnCodesPullUpRule {
     fn reduce_parent(
         &self,
         array: ArrayView<'_, Dict>,
-        parent: ArrayView<'_, ScalarFnVTable>,
+        parent: ArrayView<'_, ScalarFn>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // Don't attempt to pull up if there are less than 2 siblings.
@@ -175,11 +175,10 @@ impl ArrayParentReduceRule<Dict> for DictionaryScalarFnCodesPullUpRule {
         }
 
         // Now run the slightly more expensive check that all siblings have the same codes as us.
-        // We use the cheaper Precision::Ptr to avoid doing data comparisons.
         if !parent.iter_children().enumerate().all(|(idx, c)| {
             idx == child_idx
                 || c.as_opt::<Dict>()
-                    .is_some_and(|c| c.codes().array_eq(array.codes(), Precision::Value))
+                    .is_some_and(|c| c.codes().array_eq(array.codes(), EqMode::Value))
         }) {
             return Ok(None);
         }

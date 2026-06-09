@@ -11,6 +11,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 use vortex_utils::aliases::hash_set::HashSet;
 
 use crate::ArrayRef;
@@ -51,7 +52,8 @@ impl ScalarFnVTable for Merge {
     type Options = DuplicateHandling;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::from("vortex.merge")
+        static ID: CachedId = CachedId::new("vortex.merge");
+        *ID
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -82,22 +84,6 @@ impl ScalarFnVTable for Merge {
 
     fn child_name(&self, _instance: &Self::Options, child_idx: usize) -> ChildName {
         ChildName::from(Arc::from(format!("{}", child_idx)))
-    }
-
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "merge(")?;
-        for (i, child) in expr.children().iter().enumerate() {
-            child.fmt_sql(f)?;
-            if i + 1 < expr.children().len() {
-                write!(f, ", ")?;
-            }
-        }
-        write!(f, ")")
     }
 
     fn return_dtype(&self, options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
@@ -550,10 +536,13 @@ mod tests {
     #[test]
     pub fn test_display() {
         let expr = merge([get_item("struct1", root()), get_item("struct2", root())]);
-        assert_eq!(expr.to_string(), "merge($.struct1, $.struct2)");
+        assert_eq!(
+            expr.to_string(),
+            "vortex.merge($.struct1, $.struct2, opts=Error)"
+        );
 
         let expr2 = merge(vec![get_item("a", root())]);
-        assert_eq!(expr2.to_string(), "merge($.a)");
+        assert_eq!(expr2.to_string(), "vortex.merge($.a, opts=Error)");
     }
 
     #[test]

@@ -2,16 +2,17 @@ name: Close inactive PRs
 on:
   schedule:
     - cron: "30 1 * * *"
-  workflow_dispatch:
+  workflow_dispatch: { }
 
 jobs:
   close-issues:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     permissions:
+      actions: write
       pull-requests: write
     steps:
-      - uses: actions/stale@v10
+      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899  # v10
         with:
           # After 30 days of no activity, a PR will be marked as stale
           days-before-pr-stale: 14

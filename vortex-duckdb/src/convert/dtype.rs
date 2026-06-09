@@ -33,7 +33,6 @@ use std::sync::Arc;
 
 use vortex::dtype::DType;
 use vortex::dtype::DecimalDType;
-use vortex::dtype::FieldName;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::dtype::PType::F32;
@@ -160,6 +159,7 @@ impl FromLogicalType for DType {
                     .collect::<VortexResult<_>>()?,
                 nullability,
             ),
+            DUCKDB_TYPE::DUCKDB_TYPE_VARIANT => DType::Variant(nullability),
             DUCKDB_TYPE::DUCKDB_TYPE_TIME_TZ => todo!(),
             DUCKDB_TYPE::DUCKDB_TYPE_INTERVAL => todo!(),
             DUCKDB_TYPE::DUCKDB_TYPE_ENUM => todo!(),
@@ -174,20 +174,6 @@ impl FromLogicalType for DType {
             DUCKDB_TYPE::DUCKDB_TYPE_GEOMETRY => todo!(),
         })
     }
-}
-
-pub fn from_duckdb_table<'a, I, S>(iter: I) -> VortexResult<StructFields>
-where
-    I: Iterator<Item = (S, &'a LogicalTypeRef, Nullability)>,
-    S: AsRef<str>,
-{
-    iter.map(|(name, type_, nullability)| {
-        Ok((
-            FieldName::from(name.as_ref()),
-            DType::from_logical_type(type_, nullability)?,
-        ))
-    })
-    .collect::<VortexResult<StructFields>>()
 }
 
 impl TryFrom<DType> for LogicalType {
@@ -218,17 +204,14 @@ impl TryFrom<&DType> for LogicalType {
             DType::Null => DUCKDB_TYPE::DUCKDB_TYPE_SQLNULL,
             DType::Bool(_) => DUCKDB_TYPE::DUCKDB_TYPE_BOOLEAN,
             DType::Primitive(ptype, _) => return LogicalType::try_from(*ptype),
-            DType::Utf8(_) => DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR,
-            DType::Binary(_) => DUCKDB_TYPE::DUCKDB_TYPE_BLOB,
-            DType::Struct(struct_type, _) => {
-                return LogicalType::try_from(struct_type);
-            }
             DType::Decimal(decimal_dtype, _) => {
                 return LogicalType::decimal_type(
                     decimal_dtype.precision(),
                     decimal_dtype.scale().try_into()?,
                 );
             }
+            DType::Utf8(_) => DUCKDB_TYPE::DUCKDB_TYPE_VARCHAR,
+            DType::Binary(_) => DUCKDB_TYPE::DUCKDB_TYPE_BLOB,
             DType::List(element_dtype, _) => {
                 let element_logical_type = LogicalType::try_from(element_dtype.as_ref())?;
                 return LogicalType::list_type(element_logical_type);
@@ -237,6 +220,10 @@ impl TryFrom<&DType> for LogicalType {
                 let element_logical_type = LogicalType::try_from(element_dtype.as_ref())?;
                 return LogicalType::array_type(element_logical_type, *list_size);
             }
+            DType::Struct(struct_type, _) => {
+                return LogicalType::try_from(struct_type);
+            }
+            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
             DType::Variant(_) => {
                 vortex_bail!("Vortex Variant array aren't supported in DuckDB")
             }
@@ -337,6 +324,7 @@ mod tests {
     use std::sync::Arc;
 
     use rstest::rstest;
+    use vortex::array::EmptyMetadata;
     use vortex::dtype::DType;
     use vortex::dtype::FieldName;
     use vortex::dtype::FieldNames;
@@ -347,7 +335,6 @@ mod tests {
     use vortex::dtype::extension::ExtId;
     use vortex::dtype::extension::ExtVTable;
     use vortex::error::VortexResult;
-    use vortex::extension::EmptyMetadata;
     use vortex::extension::datetime::Date;
     use vortex::extension::datetime::Time;
     use vortex::extension::datetime::Timestamp;

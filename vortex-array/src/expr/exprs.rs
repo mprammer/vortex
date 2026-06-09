@@ -21,6 +21,7 @@ use crate::scalar_fn::ScalarFnVTableExt;
 use crate::scalar_fn::fns::between::Between;
 use crate::scalar_fn::fns::between::BetweenOptions;
 use crate::scalar_fn::fns::binary::Binary;
+use crate::scalar_fn::fns::byte_length::ByteLength;
 use crate::scalar_fn::fns::case_when::CaseWhen;
 use crate::scalar_fn::fns::case_when::CaseWhenOptions;
 use crate::scalar_fn::fns::cast::Cast;
@@ -46,6 +47,9 @@ use crate::scalar_fn::fns::pack::PackOptions;
 use crate::scalar_fn::fns::root::Root;
 use crate::scalar_fn::fns::select::FieldSelection;
 use crate::scalar_fn::fns::select::Select;
+use crate::scalar_fn::fns::variant_get::VariantGet;
+use crate::scalar_fn::fns::variant_get::VariantGetOptions;
+use crate::scalar_fn::fns::variant_get::VariantPath;
 use crate::scalar_fn::fns::zip::Zip;
 
 // ---- Root ----
@@ -111,6 +115,20 @@ pub fn col(field: impl Into<FieldName>) -> Expression {
 /// ```
 pub fn get_item(field: impl Into<FieldName>, child: Expression) -> Expression {
     GetItem.new_expr(field.into(), vec![child])
+}
+
+// ---- VariantGet ----
+
+/// Creates an expression that extracts a path from a Variant expression.
+///
+/// Missing paths, traversal mismatches, and failed casts return null. When `dtype` is `None`,
+/// results are nullable Variant values; otherwise results are nullable values of `dtype`.
+pub fn variant_get(
+    child: Expression,
+    path: impl Into<VariantPath>,
+    dtype: Option<DType>,
+) -> Expression {
+    VariantGet.new_expr(VariantGetOptions::new(path.into(), dtype), vec![child])
 }
 
 // ---- CaseWhen ----
@@ -397,17 +415,19 @@ where
 ///
 /// ```
 /// # use vortex_array::IntoArray;
-/// # use vortex_array::arrow::IntoArrowArray as _;
+/// # use vortex_array::arrow::ArrowArrayExecutor;
+/// # use vortex_array::{LEGACY_SESSION, VortexSessionExecute};
 /// # use vortex_buffer::buffer;
 /// # use vortex_array::expr::{checked_add, lit, root};
 /// let xs = buffer![1, 2, 3].into_array();
 /// let result = xs.apply(&checked_add(root(), lit(5))).unwrap();
 ///
+/// let mut ctx = LEGACY_SESSION.create_execution_ctx();
 /// assert_eq!(
-///     &result.into_arrow_preferred().unwrap(),
+///     &result.execute_arrow(None, &mut ctx).unwrap(),
 ///     &buffer![6, 7, 8]
 ///         .into_array()
-///         .into_arrow_preferred()
+///         .execute_arrow(None, &mut ctx)
 ///         .unwrap()
 /// );
 /// ```
@@ -698,4 +718,17 @@ pub fn dynamic(
 /// ```
 pub fn list_contains(list: Expression, value: Expression) -> Expression {
     ListContains.new_expr(EmptyOptions, [list, value])
+}
+
+// ---- ByteLength ----
+
+/// Creates an expression that computes the byte length of each element.
+/// This is akin to ANSI SQL OCTET_LENGTH(), or DuckDB's strlen().
+///
+/// ```rust
+/// # use vortex_array::expr::{byte_length, root};
+/// let expr = byte_length(root());
+/// ```
+pub fn byte_length(input: Expression) -> Expression {
+    ByteLength.new_expr(EmptyOptions, [input])
 }

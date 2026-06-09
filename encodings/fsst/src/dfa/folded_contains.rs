@@ -194,7 +194,8 @@ impl FoldedContainsDfa {
     /// Maximum needle length: `2N + 1 <= 255` so `N <= 127`.
     pub(crate) const MAX_NEEDLE_LEN: usize = 127;
 
-    /// Build a folded contains DFA for `needle`.
+    /// Build a folded contains DFA for `needle`, treating `_` as the
+    /// single-char wildcard.
     ///
     /// Returns `Err` if `needle.len() > `[`Self::MAX_NEEDLE_LEN`].
     pub(crate) fn new(
@@ -202,6 +203,28 @@ impl FoldedContainsDfa {
         symbol_lengths: &[u8],
         needle: &[u8],
         case_insensitive: bool,
+    ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, needle, case_insensitive, true)
+    }
+
+    /// Like [`Self::new`] but matches every needle byte literally — the `_`
+    /// wildcard sentinel is disabled. Used for SQL-escaped needles where a
+    /// literal underscore (`\_`) must match only `_`.
+    pub(crate) fn new_literal(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        needle: &[u8],
+        case_insensitive: bool,
+    ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, needle, case_insensitive, false)
+    }
+
+    fn build(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        needle: &[u8],
+        case_insensitive: bool,
+        wildcards: bool,
     ) -> VortexResult<Self> {
         if needle.len() > Self::MAX_NEEDLE_LEN {
             vortex_bail!(
@@ -218,7 +241,7 @@ impl FoldedContainsDfa {
         // Total states: 2N+1 (normal 0..=N, escape N+1..=2N for base 0..=N-1).
         let n_states_usize = 2 * usize::from(accept_state) + 1;
 
-        let byte_table = kmp_byte_transitions(needle, case_insensitive);
+        let byte_table = kmp_byte_transitions(needle, case_insensitive, wildcards);
         let sym_trans =
             build_symbol_transitions(symbols, symbol_lengths, &byte_table, n_normal, accept_state);
 
@@ -454,10 +477,7 @@ impl FoldedContainsDfa {
     /// overhead dominates.
     ///
     /// Returns `true` when the caller should bail to decompress+like.
-    pub(crate) fn estimated_candidate_density_too_high(
-        &self,
-        all_bytes: &[u8],
-    ) -> bool {
+    pub(crate) fn estimated_candidate_density_too_high(&self, all_bytes: &[u8]) -> bool {
         let progressing = match self.progressing_codes.as_deref() {
             Some(codes) if !codes.is_empty() => codes,
             // No progressing codes → RowLoop fallback, which is ~150 ns/row.

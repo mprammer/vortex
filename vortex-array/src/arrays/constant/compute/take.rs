@@ -23,7 +23,7 @@ impl TakeReduce for Constant {
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let result = match indices
             .validity()?
-            .to_mask(indices.len(), &mut ctx)?
+            .execute_mask(indices.len(), &mut ctx)?
             .bit_buffer()
         {
             AllOr::All => {
@@ -66,6 +66,8 @@ impl Constant {
 
 #[cfg(test)]
 mod tests {
+    use std::f64;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
     use vortex_mask::AllOr;
@@ -112,7 +114,7 @@ mod tests {
             taken
                 .validity()
                 .unwrap()
-                .to_mask(taken.len(), &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_mask(taken.len(), &mut LEGACY_SESSION.create_execution_ctx())
                 .unwrap()
                 .indices(),
             AllOr::Some(valid_indices)
@@ -138,7 +140,7 @@ mod tests {
             taken
                 .validity()
                 .unwrap()
-                .to_mask(taken.len(), &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_mask(taken.len(), &mut LEGACY_SESSION.create_execution_ctx())
                 .unwrap()
                 .indices(),
             AllOr::All
@@ -147,7 +149,7 @@ mod tests {
 
     #[rstest]
     #[case(ConstantArray::new(42i32, 5))]
-    #[case(ConstantArray::new(std::f64::consts::PI, 10))]
+    #[case(ConstantArray::new(f64::consts::PI, 10))]
     #[case(ConstantArray::new(Scalar::from("hello"), 3))]
     #[case(ConstantArray::new(Scalar::null_native::<i64>(), 5))]
     #[case(ConstantArray::new(true, 1))]

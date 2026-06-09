@@ -13,12 +13,12 @@ use arrow_array::RecordBatch;
 use arrow_array::cast::AsArray;
 use arrow_array::ffi_stream::FFI_ArrowArrayStream;
 use arrow_schema::ArrowError;
-use arrow_schema::DataType;
+use arrow_schema::Field;
 use futures::StreamExt;
 use vortex::array::ArrayRef;
 use vortex::array::ExecutionCtx;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::expr::stats::Precision;
 use vortex::array::stream::SendableArrayStream;
 use vortex::buffer::Buffer;
@@ -49,7 +49,11 @@ pub enum VxScan {
     Started(PartitionStream),
     Finished,
 }
-crate::box_wrapper!(VxScan, vx_scan);
+crate::box_wrapper!(
+    /// A scan is a single traversal of a data source with projections and
+    /// filters. A scan can be consumed only once.
+    VxScan,
+    vx_scan);
 
 pub enum VxPartitionScan {
     Pending(Box<dyn Partition>),
@@ -106,16 +110,15 @@ pub struct vx_scan_options {
     pub selection: vx_scan_selection,
     /// Maximum number of rows to return. 0 means no limit.
     pub limit: u64,
-    /// Upper limit for parallelism. 0 means no limit.
-    /// Scan will return at most "max_threads" partitions.
-    pub max_threads: u64,
     /// If true, return in storage order.
     pub ordered: bool,
 }
 
 #[repr(C)]
+#[cfg_attr(test, derive(Debug, PartialEq, Eq, Default))]
 pub enum vx_estimate_type {
     /// No estimate is available.
+    #[cfg_attr(test, default)]
     VX_ESTIMATE_UNKNOWN = 0,
     /// The value in vx_estimate.estimate is exact.
     VX_ESTIMATE_EXACT = 1,
@@ -126,10 +129,11 @@ pub enum vx_estimate_type {
 /// Used for estimating number of partitions in a data source or number of rows
 /// in a partition.
 #[repr(C)]
+#[cfg_attr(test, derive(Default))]
 pub struct vx_estimate {
-    r#type: vx_estimate_type,
+    pub r#type: vx_estimate_type,
     /// Set only when "type" is not VX_ESTIMATE_UNKNOWN.
-    estimate: u64,
+    pub estimate: u64,
 }
 
 fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
@@ -182,20 +186,22 @@ fn scan_request(opts: *const vx_scan_options) -> VortexResult<ScanRequest> {
         selection,
         ordered,
         limit,
+        partition_selection: Selection::All,
+        partition_range: None,
     })
 }
 
-fn write_estimate<T: Into<u64>>(estimate: Option<Precision<T>>, out: &mut vx_estimate) {
+fn write_estimate<T: Into<u64>>(estimate: Precision<T>, out: &mut vx_estimate) {
     match estimate {
-        Some(Precision::Exact(value)) => {
+        Precision::Exact(value) => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_EXACT;
             out.estimate = value.into();
         }
-        Some(Precision::Inexact(value)) => {
+        Precision::Inexact(value) => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_INEXACT;
             out.estimate = value.into();
         }
-        None => {
+        Precision::Absent => {
             out.r#type = vx_estimate_type::VX_ESTIMATE_UNKNOWN;
         }
     }
@@ -225,13 +231,9 @@ pub unsafe extern "C-unwind" fn vx_data_source_scan(
         RUNTIME.block_on(async {
             let scan = vx_data_source::as_ref(data_source).scan(request).await?;
             if !estimate.is_null() {
-                write_estimate(
-                    scan.partition_count().map(|x| match x {
-                        Precision::Exact(v) => Precision::Exact(v as u64),
-                        Precision::Inexact(v) => Precision::Inexact(v as u64),
-                    }),
-                    unsafe { &mut *estimate },
-                );
+                write_estimate(scan.partition_count().map(|v| v as u64), unsafe {
+                    &mut *estimate
+                });
             }
             Ok(vx_scan::new(VxScan::Pending(scan)))
         })
@@ -250,7 +252,7 @@ pub unsafe extern "C-unwind" fn vx_scan_dtype(
 ) -> *const vx_dtype {
     try_or(err, ptr::null(), || {
         let scan = vx_scan::as_ref(scan);
-        let VxScan::Pending(ref scan) = *scan else {
+        let VxScan::Pending(scan) = scan else {
             vortex_bail!("dtype unavailable: scan already started");
         };
         Ok(vx_dtype::new_ref(scan.dtype()))
@@ -295,7 +297,7 @@ pub unsafe extern "C-unwind" fn vx_scan_next_partition(
             }
         };
 
-        let owned = ptr::read(ptr);
+        let owned = ptr::replace(ptr, VxScan::Finished);
         try_or_default(err, || match owned {
             VxScan::Pending(scan) => on_stream(scan.partitions()),
             VxScan::Started(stream) => on_stream(stream),
@@ -325,15 +327,15 @@ pub unsafe extern "C-unwind" fn vx_partition_row_count(
     })
 }
 
-// Scan partition to ArrowArrayStream.
-// Consumes partition fully: subsequent calls to vx_partition_scan_arrow or
-// vx_partition_next are undefined behaviour.
-// This call blocks current thread until underlying stream is fully consumed.
-//
-// Caller must not free partition after calling this function.
-//
-// On success, sets "stream" and returns 0.
-// On error, sets "err" and returns 1, freeing the partition.
+/// Scan partition to ArrowArrayStream.
+/// Consumes partition fully: subsequent calls to vx_partition_scan_arrow or
+/// vx_partition_next are undefined behaviour.
+/// This call blocks current thread until underlying stream is fully consumed.
+///
+/// Caller must not free partition after calling this function.
+///
+/// On success, sets "stream" and returns 0.
+/// On error, sets "err" and returns 1, freeing the partition.
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_partition_scan_arrow(
     session: *const vx_session,
@@ -353,14 +355,16 @@ pub unsafe extern "C-unwind" fn vx_partition_scan_arrow(
 
         let schema = dtype.to_arrow_schema()?;
         let schema = Arc::new(schema);
-        let data_type = DataType::Struct(schema.fields().clone());
+        let target = Field::new_struct("", schema.fields().clone(), false);
 
         let session = vx_session::as_ref(session);
 
         let on_chunk = move |chunk: VortexResult<ArrayRef>| -> VortexResult<RecordBatch> {
             let chunk: ArrayRef = chunk?;
             let mut ctx: ExecutionCtx = session.create_execution_ctx();
-            let arrow = chunk.execute_arrow(Some(&data_type), &mut ctx)?;
+            let arrow = session
+                .arrow()
+                .execute_arrow(chunk, Some(&target), &mut ctx)?;
             Ok(RecordBatch::from(arrow.as_struct().clone()))
         };
 
@@ -412,7 +416,7 @@ pub unsafe extern "C-unwind" fn vx_partition_next(
             }
         };
 
-        let owned = ptr::read(ptr);
+        let owned = ptr::replace(ptr, VxPartitionScan::Finished);
         try_or_default(err, || match owned {
             VxPartitionScan::Pending(partition) => on_stream(partition.execute()?),
             VxPartitionScan::Started(stream) => on_stream(stream),
@@ -432,7 +436,6 @@ mod tests {
 
     use vortex::VortexSessionDefault;
     use vortex::array::arrays::StructArray;
-    use vortex::expr::lit;
     use vortex::session::VortexSession;
     use vortex_array::ExecutionCtx;
     use vortex_array::arrays::struct_::StructArrayExt;
@@ -444,11 +447,13 @@ mod tests {
     use crate::data_source::vx_data_source_new;
     use crate::data_source::vx_data_source_options;
     use crate::expression::vx_binary_operator;
-    use crate::expression::vx_expression;
     use crate::expression::vx_expression_binary;
     use crate::expression::vx_expression_free;
     use crate::expression::vx_expression_get_item;
+    use crate::expression::vx_expression_literal;
     use crate::expression::vx_expression_root;
+    use crate::scalar::vx_scalar_free;
+    use crate::scalar::vx_scalar_new_u64;
     use crate::scan::vx_data_source_scan;
     use crate::scan::vx_estimate;
     use crate::scan::vx_partition_free;
@@ -589,7 +594,11 @@ mod tests {
         unsafe {
             let root = vx_expression_root();
             let age_expr = vx_expression_get_item(c"age".as_ptr(), root);
-            let lit_100 = vx_expression::new(lit(100u64));
+            let value = vx_scalar_new_u64(100, false);
+            let mut error = ptr::null_mut();
+            let lit_100 = vx_expression_literal(value, &raw mut error);
+            assert_no_error(error);
+            vx_scalar_free(value);
             let filter =
                 vx_expression_binary(vx_binary_operator::VX_OPERATOR_GTE, age_expr, lit_100);
 
@@ -614,7 +623,11 @@ mod tests {
         unsafe {
             let root = vx_expression_root();
             let age_expr = vx_expression_get_item(c"age".as_ptr(), root);
-            let lit_100 = vx_expression::new(lit(100u64));
+            let value = vx_scalar_new_u64(100, false);
+            let mut error = ptr::null_mut();
+            let lit_100 = vx_expression_literal(value, &raw mut error);
+            assert_no_error(error);
+            vx_scalar_free(value);
             let filter =
                 vx_expression_binary(vx_binary_operator::VX_OPERATOR_GTE, age_expr, lit_100);
             let projection = vx_expression_get_item(c"age".as_ptr(), root);

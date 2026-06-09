@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::collections::BTreeSet;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
@@ -32,6 +31,8 @@ use vortex_utils::aliases::dash_map::DashMap;
 use super::DictLayout;
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
+use crate::RowSplits;
+use crate::SplitRange;
 use crate::layouts::SharedArrayFuture;
 use crate::segments::SegmentSource;
 
@@ -57,17 +58,21 @@ impl DictReader {
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
         session: VortexSession,
+        ctx: crate::LayoutReaderContext,
     ) -> VortexResult<Self> {
         let values_len = usize::try_from(layout.values.row_count())?;
         let values = layout.values.new_reader(
             format!("{name}.values").into(),
             Arc::clone(&segment_source),
             &session,
+            &ctx,
         )?;
-        let codes =
-            layout
-                .codes
-                .new_reader(format!("{name}.codes").into(), segment_source, &session)?;
+        let codes = layout.codes.new_reader(
+            format!("{name}.codes").into(),
+            segment_source,
+            &session,
+            &ctx,
+        )?;
 
         Ok(Self {
             layout,
@@ -166,10 +171,10 @@ impl LayoutReader for DictReader {
     fn register_splits(
         &self,
         field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        self.codes.register_splits(field_mask, row_range, splits)
+        self.codes.register_splits(field_mask, split_range, splits)
     }
 
     fn pruning_evaluation(
@@ -251,6 +256,10 @@ impl LayoutReader for DictReader {
         }
         .boxed())
     }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
+    }
 }
 
 #[cfg(test)]
@@ -259,6 +268,7 @@ mod tests {
 
     use rstest::rstest;
     use vortex_array::ArrayContext;
+    use vortex_array::Canonical;
     use vortex_array::IntoArray as _;
     use vortex_array::LEGACY_SESSION;
     use vortex_array::MaskFuture;
@@ -364,7 +374,7 @@ mod tests {
             );
             assert!(layout.encoding_id() == LayoutId::new("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &session, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -448,7 +458,7 @@ mod tests {
                 )),
             );
             let mask = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &session, &Default::default())
                 .unwrap()
                 .filter_evaluation(&(0..3), &filter, MaskFuture::new_true(3))
                 .unwrap()
@@ -462,6 +472,7 @@ mod tests {
     #[test]
     fn reading_is_null_works() {
         block_on(|handle| async move {
+            let mut ctx_exec = LEGACY_SESSION.create_execution_ctx();
             let session = session_with_handle(handle);
             let strategy = DictStrategy::new(
                 FlatLayoutStrategy::default(),
@@ -508,7 +519,7 @@ mod tests {
             let expression = is_not_null(root());
             assert_eq!(layout.encoding_id(), LayoutId::new("vortex.dict"));
             let actual = layout
-                .new_reader("".into(), segments, &session)
+                .new_reader("".into(), segments, &session, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -521,12 +532,11 @@ mod tests {
             let expected = array
                 .validity()
                 .unwrap()
-                .to_mask(array.len(), &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_mask(array.len(), &mut ctx_exec)
                 .unwrap()
                 .into_array();
-            #[expect(deprecated)]
             let actual_canonical = actual
-                .to_canonical()
+                .execute::<Canonical>(&mut ctx_exec)
                 .vortex_expect("to_canonical failed")
                 .into_array();
             assert_arrays_eq!(actual_canonical, expected);

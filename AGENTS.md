@@ -50,19 +50,43 @@ cargo build --workspace
 Run tests for the crate or binding you touched before broader checks:
 
 ```bash
-cargo test -p <crate-name>
+cargo nextest run -p <crate-name>
+```
+
+if cargo-nextest is not available you can install it with
+```bash
+cargo install --locked cargo-nextest
 ```
 
 Examples:
 
 ```bash
-cargo test -p vortex-array
+cargo nextest run -p vortex-array
 make -C docs doctest
 uv run --all-packages pytest vortex-python/test
+cargo test --doc
 ```
 
 Run docs doctests from the docs directory with `make -C docs doctest` so the correct Sphinx
 Makefile target is used.
+
+If you touch documentation run doc tests via `cargo test --doc`.
+
+For Python binding changes under `vortex-python/`, run the narrow Python checks that match the
+files touched before broader test suites. Useful checks include:
+
+```bash
+python -m py_compile <changed-python-files>
+uv run --all-packages --reinstall-package vortex-data pytest <changed-python-tests>
+```
+
+If Python docstrings, `docs/api/python/`, or Sphinx configuration change, also run the docs checks
+from a clean Sphinx environment:
+
+```bash
+uv run --all-packages make -C docs clean html
+uv run --all-packages make -C docs clean doctest
+```
 
 ## Linting, Formatting, and Generated Files
 
@@ -72,18 +96,25 @@ with no Rust/API behavior impact. For docs/config-only changes, validate formatt
 or with a targeted doc/config command, and verify symlink or path changes with `ls`, `find`, and
 `git status`.
 
+For Python binding changes under `vortex-python/`, run the relevant Python lint and type checks:
+
+```bash
+uv run basedpyright vortex-python
+uv run ruff check <changed-python-files>
+```
+
+If PyO3 Rust files in `vortex-python/src/` change, include `cargo +nightly fmt --check -p
+vortex-python`. Always finish Python binding work with `git diff --check`.
+
 For Rust code, public API, feature flag, or generated-file changes, run these before stopping:
 
 ```bash
 cargo +nightly fmt --all
-./scripts/public-api.sh
 cargo clippy --all-targets --all-features
 ```
 
 Notes:
 
-- `./scripts/public-api.sh` regenerates all `public-api.lock` files through the `xtask`
-  wrapper. Run it when public Rust APIs may have changed, not for docs-only or agent-only edits.
 - For `.github/` changes, follow `.github/AGENTS.md` and run
   `yamllint --strict -c .yamllint.yaml` on changed workflow files.
 - You can try
@@ -139,9 +170,6 @@ Notes:
 
 Check new and modified lines against this list before finishing:
 
-- Public API changes without doc comments or refreshed `public-api.lock` files.
-- Running `cargo fmt`, `./scripts/public-api.sh`, or workspace clippy for docs-only, agent-only,
-  symlink-only, or other metadata-only changes.
 - Running broad CI-style commands before trying a narrow local repro.
 - Using `unwrap`, `expect`, or panic-oriented assertions in tests where `VortexResult<()>` and
   `?` would be clearer.

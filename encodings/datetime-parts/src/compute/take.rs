@@ -5,8 +5,7 @@ use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
 use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
-#[expect(deprecated)]
-use vortex_array::ToCanonical;
+use vortex_array::arrays::PrimitiveArray;
 use vortex_array::arrays::dict::TakeExecute;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::Nullability;
@@ -17,14 +16,14 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_panic;
 
 use crate::DateTimeParts;
-use crate::array::DateTimePartsArrayExt;
+use crate::array::DateTimePartsArraySlotsExt;
 fn take_datetime_parts(
     array: ArrayView<DateTimeParts>,
     indices: &ArrayRef,
+    ctx: &mut ExecutionCtx,
 ) -> VortexResult<ArrayRef> {
     // we go ahead and canonicalize here to avoid worst-case canonicalizing 3 separate times
-    #[expect(deprecated)]
-    let indices = indices.to_primitive();
+    let indices = indices.clone().execute::<PrimitiveArray>(ctx)?;
 
     let taken_days = array.days().take(indices.clone().into_array())?;
     let taken_seconds = array.seconds().take(indices.clone().into_array())?;
@@ -66,7 +65,7 @@ fn take_datetime_parts(
         .seconds()
         .statistics()
         .get(Stat::Min)
-        .map(|s| s.into_inner())
+        .into_inner()
         .unwrap_or_else(|| Scalar::primitive(0i64, Nullability::NonNullable))
         .cast(array.seconds().dtype())?;
     let taken_seconds = taken_seconds.fill_null(seconds_fill)?;
@@ -75,7 +74,7 @@ fn take_datetime_parts(
         .subseconds()
         .statistics()
         .get(Stat::Min)
-        .map(|s| s.into_inner())
+        .into_inner()
         .unwrap_or_else(|| Scalar::primitive(0i64, Nullability::NonNullable))
         .cast(array.subseconds().dtype())?;
     let taken_subseconds = taken_subseconds.fill_null(subseconds_fill)?;
@@ -87,9 +86,9 @@ impl TakeExecute for DateTimeParts {
     fn take(
         array: ArrayView<'_, Self>,
         indices: &ArrayRef,
-        _ctx: &mut ExecutionCtx,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<ArrayRef>> {
-        take_datetime_parts(array, indices).map(Some)
+        take_datetime_parts(array, indices, ctx).map(Some)
     }
 }
 
@@ -97,6 +96,8 @@ impl TakeExecute for DateTimeParts {
 mod tests {
     use rstest::rstest;
     use vortex_array::IntoArray;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::compute::conformance::take::test_take_conformance;
@@ -117,7 +118,7 @@ mod tests {
         ].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    )).unwrap())]
+    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
     #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         PrimitiveArray::from_option_iter([
             Some(0i64),
@@ -128,12 +129,12 @@ mod tests {
         ]).into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    )).unwrap())]
+    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
     #[case(DateTimeParts::try_from_temporal(TemporalArray::new_timestamp(
         buffer![86_400_000i64].into_array(),
         TimeUnit::Milliseconds,
         Some("UTC".into())
-    )).unwrap())]
+    ), &mut LEGACY_SESSION.create_execution_ctx()).unwrap())]
     fn test_take_datetime_parts_conformance(#[case] array: DateTimePartsArray) {
         test_take_conformance(&array.into_array());
     }

@@ -4,10 +4,10 @@
 import net.ltgt.gradle.errorprone.errorprone
 
 plugins {
-    id("com.diffplug.spotless") version "8.4.0"
+    id("com.diffplug.spotless") version "8.6.0"
     id("com.palantir.git-version") version "5.0.0"
+    id("com.palantir.java-format") version "2.91.0"
     id("net.ltgt.errorprone") version "5.1.0" apply false
-    id("com.google.protobuf") version "0.9.6" apply false
     id("com.vanniktech.maven.publish") version "0.36.0" apply false
 }
 
@@ -39,8 +39,13 @@ allprojects {
 
         spotless {
             java {
-                palantirJavaFormat()
+                palantirJavaFormat().formatJavadoc(true)
                 licenseHeaderFile("${rootProject.projectDir}/.spotless/java-license-header.txt")
+                removeUnusedImports()
+                forbidWildcardImports()
+                importOrder("")
+                trimTrailingWhitespace()
+                leadingTabsToSpaces(4)
                 targetExclude("**/generated/**")
                 targetExcludeIfContentContains("// spotless:disabled")
             }
@@ -49,15 +54,14 @@ allprojects {
         tasks.withType<JavaCompile> {
             options.errorprone.disable("UnusedVariable")
             options.errorprone.disableWarningsInGeneratedCode = true
-            // ignore protobuf generated files
-            options.errorprone.excludedPaths = ".*/build/generated/.*"
             options.release = 17
+            options.compilerArgs.add("-Werror")
 
             options.generatedSourceOutputDirectory = projectDir.resolve("generated_src")
         }
 
         tasks.withType<Javadoc> {
-            (options as StandardJavadocDocletOptions).addStringOption("Xdoclint:-missing")
+            (options as StandardJavadocDocletOptions).addBooleanOption("Xdoclint:-missing", true)
         }
 
         the<JavaPluginExtension>().toolchain {
@@ -74,5 +78,10 @@ allprojects {
         }
     }
 
-    tasks.register("format").get().dependsOn("spotlessApply")
+    if (project.name == "vortex-spark_2.12") {
+        // vortex-spark_2.12 and vortex-spark_2.13 share a projectDir; format from the 2.13 variant only.
+        tasks.register("format") { enabled = false }
+    } else {
+        tasks.register("format").get().dependsOn("spotlessApply")
+    }
 }

@@ -22,6 +22,7 @@ use crate::array::VTable;
 use crate::arrays::varbin::VarBinArrayExt;
 use crate::arrays::varbin::VarBinData;
 use crate::arrays::varbin::array::NUM_SLOTS;
+use crate::arrays::varbin::array::OFFSETS_SLOT;
 use crate::arrays::varbin::array::SLOT_NAMES;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
@@ -38,7 +39,7 @@ use canonical::varbin_to_canonical;
 use kernel::PARENT_KERNELS;
 use vortex_session::VortexSession;
 
-use crate::Precision;
+use crate::EqMode;
 use crate::arrays::varbin::compute::rules::PARENT_RULES;
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
@@ -53,19 +54,19 @@ pub struct VarBinMetadata {
 }
 
 impl ArrayHash for VarBinData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.bytes().array_hash(state, precision);
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
+        self.bytes().array_hash(state, accuracy);
     }
 }
 
 impl ArrayEq for VarBinData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.bytes().array_eq(other.bytes(), precision)
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
+        self.bytes().array_eq(other.bytes(), accuracy)
     }
 }
 
 impl VTable for VarBin {
-    type ArrayData = VarBinData;
+    type TypedArrayData = VarBinData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -90,7 +91,7 @@ impl VTable for VarBin {
             "VarBinArray expected {NUM_SLOTS} slots, found {}",
             slots.len()
         );
-        let offsets = slots[crate::arrays::varbin::array::OFFSETS_SLOT]
+        let offsets = slots[OFFSETS_SLOT]
             .as_ref()
             .vortex_expect("VarBinArray offsets slot");
         vortex_ensure!(

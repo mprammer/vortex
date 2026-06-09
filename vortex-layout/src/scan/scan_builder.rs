@@ -15,12 +15,9 @@ use futures::stream::BoxStream;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
-use vortex_array::dtype::Field;
 use vortex_array::dtype::FieldMask;
-use vortex_array::dtype::FieldName;
-use vortex_array::dtype::FieldPath;
 use vortex_array::expr::Expression;
-use vortex_array::expr::analysis::immediate_access::immediate_scope_access;
+use vortex_array::expr::analysis::referenced_field_paths;
 use vortex_array::expr::root;
 use vortex_array::iter::ArrayIterator;
 use vortex_array::iter::ArrayIteratorAdapter;
@@ -38,6 +35,7 @@ use vortex_io::session::RuntimeSessionExt;
 use vortex_metrics::MetricsRegistry;
 use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
+use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::LayoutReader;
 use crate::LayoutReaderRef;
@@ -266,9 +264,8 @@ impl<A: 'static + Send> ScanBuilder<A> {
             .transpose()?;
 
         // Construct field masks and compute the row splits of the scan.
-        let (filter_mask, projection_mask) =
-            filter_and_projection_masks(&projection, filter.as_ref(), layout_reader.dtype())?;
-        let field_mask: Vec<_> = [filter_mask, projection_mask].concat();
+        let field_mask =
+            referenced_field_masks(&projection, filter.as_ref(), layout_reader.dtype())?;
 
         let splits =
             if let Some(ranges) = attempt_split_ranges(&self.selection, self.row_range.as_ref()) {
@@ -367,9 +364,7 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
                 LazyScanState::Builder(builder) => {
                     let builder = builder.take().vortex_expect("polled after completion");
                     let ordered = builder.ordered;
-                    let num_workers = std::thread::available_parallelism()
-                        .map(|n| n.get())
-                        .unwrap_or(1);
+                    let num_workers = get_available_parallelism().unwrap_or(1);
                     let concurrency = builder.concurrency * num_workers;
                     let handle = builder.session.handle();
                     let task = handle.spawn_blocking(move || {
@@ -413,50 +408,30 @@ impl<A: 'static + Send> Stream for LazyScanStream<A> {
 /// Compute masks of field paths referenced by the projection and filter in the scan.
 ///
 /// Projection and filter must be pre-simplified.
-pub fn filter_and_projection_masks(
+pub fn referenced_field_masks(
     projection: &Expression,
     filter: Option<&Expression>,
     dtype: &DType,
-) -> VortexResult<(Vec<FieldMask>, Vec<FieldMask>)> {
-    let Some(struct_dtype) = dtype.as_struct_fields_opt() else {
-        return Ok(match filter {
-            Some(_) => (vec![FieldMask::All], vec![FieldMask::All]),
-            None => (Vec::new(), vec![FieldMask::All]),
-        });
-    };
-    let projection_mask = immediate_scope_access(projection, struct_dtype);
-    Ok(match filter {
-        None => (
-            Vec::new(),
-            projection_mask.into_iter().map(to_field_mask).collect_vec(),
-        ),
-        Some(f) => {
-            let filter_mask = immediate_scope_access(f, struct_dtype);
-            let only_projection_mask = projection_mask
-                .difference(&filter_mask)
-                .cloned()
-                .map(to_field_mask)
-                .collect_vec();
-            (
-                filter_mask.into_iter().map(to_field_mask).collect_vec(),
-                only_projection_mask,
-            )
-        }
-    })
-}
+) -> VortexResult<Vec<FieldMask>> {
+    if dtype.as_struct_fields_opt().is_none() {
+        return Ok(vec![FieldMask::All]);
+    }
 
-fn to_field_mask(field: FieldName) -> FieldMask {
-    FieldMask::Prefix(FieldPath::from(Field::Name(field)))
+    let mut field_paths = referenced_field_paths(projection, dtype)?;
+    if let Some(filter) = filter {
+        field_paths.extend(referenced_field_paths(filter, dtype)?);
+    }
+    Ok(field_paths.into_iter().map(FieldMask::Prefix).collect_vec())
 }
 
 #[cfg(test)]
 mod test {
-    use std::collections::BTreeSet;
     use std::ops::Range;
     use std::pin::Pin;
     use std::sync::Arc;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
+    use std::sync::mpsc;
     use std::task::Context;
     use std::task::Poll;
     use std::time::Duration;
@@ -465,15 +440,22 @@ mod test {
     use futures::task::noop_waker_ref;
     use parking_lot::Mutex;
     use vortex_array::IntoArray;
+    use vortex_array::LEGACY_SESSION;
     use vortex_array::MaskFuture;
-    #[expect(deprecated)]
-    use vortex_array::ToCanonical;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::FieldMask;
+    use vortex_array::dtype::FieldPath;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::StructFields;
     use vortex_array::expr::Expression;
+    use vortex_array::expr::eq;
+    use vortex_array::expr::get_item;
+    use vortex_array::expr::is_not_null;
+    use vortex_array::expr::lit;
+    use vortex_array::expr::root;
     use vortex_error::VortexResult;
     use vortex_error::vortex_err;
     use vortex_io::runtime::BlockingRuntime;
@@ -481,8 +463,67 @@ mod test {
     use vortex_mask::Mask;
 
     use super::ScanBuilder;
+    use super::referenced_field_masks;
     use crate::ArrayFuture;
     use crate::LayoutReader;
+    use crate::RowSplits;
+    use crate::SplitRange;
+    use crate::scan::test::SCAN_SESSION;
+    use crate::scan::test::session_with_handle;
+
+    fn nested_dtype() -> DType {
+        DType::Struct(
+            StructFields::from_iter([
+                (
+                    "a",
+                    DType::Struct(
+                        StructFields::from_iter([
+                            ("1", DType::Primitive(PType::I32, Nullability::NonNullable)),
+                            ("2", DType::Primitive(PType::I32, Nullability::NonNullable)),
+                        ]),
+                        Nullability::NonNullable,
+                    ),
+                ),
+                ("b", DType::Primitive(PType::I32, Nullability::NonNullable)),
+            ]),
+            Nullability::NonNullable,
+        )
+    }
+
+    #[test]
+    fn nested_projection_preserves_field_path_in_split_mask() -> VortexResult<()> {
+        let projection = get_item("1", get_item("a", root()));
+        let filter = eq(get_item("2", get_item("a", root())), lit(0_i32));
+
+        let field_masks = referenced_field_masks(&projection, Some(&filter), &nested_dtype())?;
+
+        assert_eq!(field_masks.len(), 2);
+        assert!(field_masks.contains(&FieldMask::Prefix(FieldPath::from_name("a").push("1"))));
+        assert!(field_masks.contains(&FieldMask::Prefix(FieldPath::from_name("a").push("2"))));
+        Ok(())
+    }
+
+    #[test]
+    fn filter_path_covers_nested_projection_path() -> VortexResult<()> {
+        let projection = get_item("1", get_item("a", root()));
+        let filter = is_not_null(get_item("a", root()));
+
+        let field_masks = referenced_field_masks(&projection, Some(&filter), &nested_dtype())?;
+
+        assert_eq!(field_masks, [FieldMask::Prefix(FieldPath::from_name("a"))]);
+        Ok(())
+    }
+
+    #[test]
+    fn parent_projection_path_covers_nested_filter_path() -> VortexResult<()> {
+        let projection = get_item("a", root());
+        let filter = is_not_null(get_item("1", get_item("a", root())));
+
+        let field_masks = referenced_field_masks(&projection, Some(&filter), &nested_dtype())?;
+
+        assert_eq!(field_masks, [FieldMask::Prefix(FieldPath::from_name("a"))]);
+        Ok(())
+    }
 
     #[derive(Debug)]
     struct CountingLayoutReader {
@@ -519,11 +560,11 @@ mod test {
         fn register_splits(
             &self,
             _field_mask: &[FieldMask],
-            row_range: &Range<u64>,
-            splits: &mut BTreeSet<u64>,
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
         ) -> VortexResult<()> {
             self.register_splits_calls.fetch_add(1, Ordering::Relaxed);
-            splits.insert(row_range.end);
+            splits.push(split_range.root_row_range().end);
             Ok(())
         }
 
@@ -555,6 +596,10 @@ mod test {
                 unreachable!("scan should not be polled in this test")
             }))
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
@@ -562,7 +607,7 @@ mod test {
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = Arc::new(CountingLayoutReader::new(Arc::clone(&calls)));
 
-        let session = crate::scan::test::SCAN_SESSION.clone();
+        let session = SCAN_SESSION.clone();
 
         let _stream = ScanBuilder::new(session, reader).into_stream().unwrap();
 
@@ -604,12 +649,12 @@ mod test {
         fn register_splits(
             &self,
             _field_mask: &[FieldMask],
-            row_range: &Range<u64>,
-            splits: &mut BTreeSet<u64>,
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
         ) -> VortexResult<()> {
             self.register_splits_calls.fetch_add(1, Ordering::Relaxed);
-            for split in (row_range.start + 1)..=row_range.end {
-                splits.insert(split);
+            for split in (split_range.row_range().start + 1)..=split_range.row_range().end {
+                splits.push(split_range.row_offset() + split);
             }
             Ok(())
         }
@@ -650,23 +695,27 @@ mod test {
             let array = PrimitiveArray::from_iter(values?).into_array();
             Ok(Box::pin(async move { Ok(array) }))
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
     fn into_stream_executes_after_prepare() -> VortexResult<()> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let calls = Arc::new(AtomicUsize::new(0));
         let reader = Arc::new(SplittingLayoutReader::new(Arc::clone(&calls)));
 
         let runtime = SingleThreadRuntime::default();
-        let session = crate::scan::test::session_with_handle(runtime.handle());
+        let session = session_with_handle(runtime.handle());
 
-        let stream = ScanBuilder::new(session, reader).into_stream().unwrap();
+        let stream = ScanBuilder::new(session, reader).into_stream()?;
         let mut iter = runtime.block_on_stream(stream);
 
         let mut values = Vec::new();
         for chunk in &mut iter {
-            #[expect(deprecated)]
-            let prim = chunk?.to_primitive();
+            let prim = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
             values.push(prim.into_buffer::<i32>()[0]);
         }
 
@@ -713,12 +762,12 @@ mod test {
         fn register_splits(
             &self,
             _field_mask: &[FieldMask],
-            row_range: &Range<u64>,
-            splits: &mut BTreeSet<u64>,
+            split_range: &SplitRange,
+            splits: &mut RowSplits,
         ) -> VortexResult<()> {
             self.register_splits_calls.fetch_add(1, Ordering::Relaxed);
             let _guard = self.gate.lock();
-            splits.insert(row_range.end);
+            splits.push(split_range.root_row_range().end);
             Ok(())
         }
 
@@ -750,6 +799,10 @@ mod test {
                 unreachable!("scan should not be polled in this test")
             }))
         }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
     }
 
     #[test]
@@ -764,11 +817,11 @@ mod test {
         ));
 
         let runtime = SingleThreadRuntime::default();
-        let session = crate::scan::test::session_with_handle(runtime.handle());
+        let session = session_with_handle(runtime.handle());
 
         let mut stream = ScanBuilder::new(session, reader).into_stream().unwrap();
 
-        let (send, recv) = std::sync::mpsc::channel::<bool>();
+        let (send, recv) = mpsc::channel::<bool>();
         let join = std::thread::spawn(move || {
             let waker = noop_waker_ref();
             let mut cx = Context::from_waker(waker);
@@ -790,5 +843,31 @@ mod test {
         assert_eq!(calls.load(Ordering::Relaxed), 0);
 
         drop(runtime);
+    }
+
+    #[test]
+    fn into_stream_with_row_range() -> VortexResult<()> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let reader = Arc::new(SplittingLayoutReader::new(Arc::clone(&calls)));
+
+        let runtime = SingleThreadRuntime::default();
+        let session = session_with_handle(runtime.handle());
+
+        let stream = ScanBuilder::new(session, reader)
+            .with_row_range(1..3)
+            .into_stream()?;
+        let mut iter = runtime.block_on_stream(stream);
+
+        let mut values = Vec::new();
+        for chunk in &mut iter {
+            let prim = chunk?.execute::<PrimitiveArray>(&mut ctx)?;
+            values.extend(prim.into_buffer::<i32>().iter().copied());
+        }
+
+        assert_eq!(calls.load(Ordering::Relaxed), 1);
+        assert_eq!(values.as_ref(), [1, 2]);
+
+        Ok(())
     }
 }

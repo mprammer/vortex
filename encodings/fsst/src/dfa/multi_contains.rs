@@ -392,7 +392,9 @@ fn chained_kmp_byte_transitions(
 
     for (k, segment) in segments.iter().enumerate() {
         let base = offsets[k];
-        let failure = kmp_failure_table(segment, case_insensitive);
+        // Multi-contains segments never contain a `_` (rejected by the
+        // parser), so wildcard handling is irrelevant here.
+        let failure = kmp_failure_table(segment, case_insensitive, true);
 
         for local_s in 0..segment.len() {
             let global_s = base + local_s;

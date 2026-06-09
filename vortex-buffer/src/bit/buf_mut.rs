@@ -8,6 +8,7 @@ use bitvec::view::BitView;
 use crate::BitBuffer;
 use crate::BufferMut;
 use crate::ByteBufferMut;
+use crate::bit::collect_bool_words;
 use crate::bit::get_bit_unchecked;
 use crate::bit::ops;
 use crate::bit::set_bit_unchecked;
@@ -16,7 +17,7 @@ use crate::buffer_mut;
 
 /// Sets all bits in the bit-range `[start_bit, end_bit)` of `slice` to `value`.
 #[inline(always)]
-fn fill_bits(slice: &mut [u8], start_bit: usize, end_bit: usize, value: bool) {
+pub(crate) fn fill_bits(slice: &mut [u8], start_bit: usize, end_bit: usize, value: bool) {
     if start_bit >= end_bit {
         return;
     }
@@ -165,46 +166,39 @@ impl BitBufferMut {
     }
 
     /// Create a bit buffer of `len` with `indices` set as true.
-    pub fn from_indices(len: usize, indices: &[usize]) -> BitBufferMut {
-        let mut buf = BitBufferMut::new_unset(len);
-        // TODO(ngates): for dense indices, we can do better by collecting into u64s.
-        indices.iter().for_each(|&idx| buf.set(idx));
-        buf
+    pub fn from_indices(len: usize, indices: impl IntoIterator<Item = usize>) -> BitBufferMut {
+        let mut buffer = BufferMut::<u64>::zeroed(len.div_ceil(64));
+        for idx in indices {
+            assert!(idx < len, "index {idx} exceeds len {len}");
+            buffer.as_mut_slice()[idx / 64] |= 1 << (idx % 64);
+        }
+
+        let mut buffer = buffer.into_byte_buffer();
+        buffer.truncate(len.div_ceil(8));
+
+        Self {
+            buffer,
+            offset: 0,
+            len,
+        }
     }
 
     /// Invokes `f` with indexes `0..len` collecting the boolean results into a new `BitBufferMut`
     #[inline]
-    pub fn collect_bool<F: FnMut(usize) -> bool>(len: usize, mut f: F) -> Self {
-        let mut buffer = BufferMut::with_capacity(len.div_ceil(64) * 8);
+    pub fn collect_bool<F: FnMut(usize) -> bool>(len: usize, f: F) -> Self {
+        let num_words = len.div_ceil(64);
+        let mut buffer: BufferMut<u64> = BufferMut::with_capacity(num_words);
+        // SAFETY: `collect_bool_words` writes every word in `0..num_words` below
+        // before any read; `u64` has no invalid bit patterns and the assignments
+        // inside `collect_bool_words` are pure writes.
+        unsafe { buffer.set_len(num_words) };
+        collect_bool_words(buffer.as_mut_slice(), len, f);
 
-        let chunks = len / 64;
-        let remainder = len % 64;
-        for chunk in 0..chunks {
-            let mut packed = 0;
-            for bit_idx in 0..64 {
-                let i = bit_idx + chunk * 64;
-                packed |= (f(i) as u64) << bit_idx;
-            }
-
-            // SAFETY: Already allocated sufficient capacity
-            unsafe { buffer.push_unchecked(packed) }
-        }
-
-        if remainder != 0 {
-            let mut packed = 0;
-            for bit_idx in 0..remainder {
-                let i = bit_idx + chunks * 64;
-                packed |= (f(i) as u64) << bit_idx;
-            }
-
-            // SAFETY: Already allocated sufficient capacity
-            unsafe { buffer.push_unchecked(packed) }
-        }
-
-        buffer.truncate(len.div_ceil(8));
+        let mut bytes = buffer.into_byte_buffer();
+        bytes.truncate(len.div_ceil(8));
 
         Self {
-            buffer: buffer.into_byte_buffer(),
+            buffer: bytes,
             offset: 0,
             len,
         }
@@ -573,6 +567,13 @@ impl From<&[bool]> for BitBufferMut {
     }
 }
 
+// allow building a buffer from a set of truthy byte values.
+impl From<&[u8]> for BitBufferMut {
+    fn from(value: &[u8]) -> Self {
+        BitBufferMut::collect_bool(value.len(), |i| value[i] > 0)
+    }
+}
+
 impl From<Vec<bool>> for BitBufferMut {
     fn from(value: Vec<bool>) -> Self {
         value.as_slice().into()
@@ -580,6 +581,7 @@ impl From<Vec<bool>> for BitBufferMut {
 }
 
 impl FromIterator<bool> for BitBufferMut {
+    #[inline]
     fn from_iter<T: IntoIterator<Item = bool>>(iter: T) -> Self {
         let mut iter = iter.into_iter();
 

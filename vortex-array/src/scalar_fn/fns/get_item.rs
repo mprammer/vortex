@@ -8,6 +8,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_err;
 use vortex_proto::expr as pb;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 
 use crate::ArrayRef;
 use crate::ExecutionCtx;
@@ -44,7 +45,8 @@ impl ScalarFnVTable for GetItem {
     type Options = FieldName;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.get_item")
+        static ID: CachedId = CachedId::new("vortex.get_item");
+        *ID
     }
 
     fn serialize(&self, instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -258,7 +260,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "apply() has a bug with null propagation from struct validity to non-nullable child fields"]
     fn get_nullable_field() {
         let st = StructArray::try_new(
             FieldNames::from(["a"]),

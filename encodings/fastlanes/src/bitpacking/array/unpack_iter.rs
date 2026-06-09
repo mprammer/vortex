@@ -3,6 +3,7 @@
 
 use std::mem;
 use std::mem::MaybeUninit;
+use std::ops::Range;
 
 use fastlanes::BitPacking;
 use lending_iterator::gat;
@@ -55,12 +56,14 @@ impl<T: PhysicalPType<Physical: BitPacking>> UnpackStrategy<T> for BitPackingStr
 /// #[gat(Item)]
 /// use lending_iterator::prelude::LendingIterator;
 /// use vortex_array::IntoArray;
+/// use vortex_array::VortexSessionExecute;
 /// use vortex_buffer::buffer;
 /// use vortex_fastlanes::BitPackedData;
 /// use vortex_fastlanes::BitPackedArrayExt;
 /// use vortex_fastlanes::unpack_iter::BitUnpackedChunks;
 ///
-/// let array = BitPackedData::encode(&buffer![2, 3, 4, 5].into_array(), 2).unwrap();
+/// let mut ctx = vortex_array::LEGACY_SESSION.create_execution_ctx();
+/// let array = BitPackedData::encode(&buffer![2, 3, 4, 5].into_array(), 2, &mut ctx).unwrap();
 /// let mut unpacked_chunks: BitUnpackedChunks<i32> = array.unpacked_chunks().unwrap();
 ///
 /// if let Some(header) = unpacked_chunks.initial() {
@@ -179,70 +182,142 @@ impl<T: PhysicalPType, S: UnpackStrategy<T>> UnpackedChunks<T, S> {
         })
     }
 
-    /// Decode all chunks (initial, full, and trailer) into the output range.
-    /// This consolidates the logic for handling all three chunk types in one place.
+    /// Decode all chunks (initial, full, and trailer) directly into the output range.
     pub fn decode_into(&mut self, output: &mut [MaybeUninit<T>]) {
+        debug_assert_eq!(output.len(), self.len);
         let mut local_idx = 0;
 
-        // Handle initial partial chunk if present
         if let Some(initial) = self.initial() {
             local_idx = initial.len();
 
-            // TODO(connor): use `maybe_uninit_write_slice` feature when it gets stabilized.
-            // https://github.com/rust-lang/rust/issues/79995
+            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
             // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
             let init_initial: &[MaybeUninit<T>] = unsafe { mem::transmute(initial) };
             output[..local_idx].copy_from_slice(init_initial);
         }
 
-        // Handle full chunks
         local_idx = self.decode_full_chunks_into_at(output, local_idx);
 
-        // Handle trailing partial chunk if present
         if let Some(trailer) = self.trailer() {
-            // TODO(connor): use `maybe_uninit_write_slice` feature when it gets stabilized.
-            // https://github.com/rust-lang/rust/issues/79995
+            // TODO(connor): use maybe_uninit_write_slice when it gets stabilized.
             // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
             let init_trailer: &[MaybeUninit<T>] = unsafe { mem::transmute(trailer) };
             output[local_idx..][..init_trailer.len()].copy_from_slice(init_trailer);
+            local_idx += init_trailer.len();
+        }
+
+        debug_assert_eq!(local_idx, self.len);
+    }
+
+    /// Decode all chunks (initial, full, and trailer), mapping each unpacked value through f.
+    pub(crate) fn decode_map_into<U>(
+        &mut self,
+        output: &mut [MaybeUninit<U>],
+        mut f: impl FnMut(T) -> U,
+    ) {
+        debug_assert_eq!(output.len(), self.len);
+
+        self.for_each_unpacked_chunk(|chunk, range| {
+            write_map(chunk, &mut output[range], &mut f);
+        });
+    }
+
+    /// Walk every unpacked chunk in array order, reusing the internal scratch buffer.
+    pub(crate) fn for_each_unpacked_chunk<F>(&mut self, mut f: F)
+    where
+        F: FnMut(&mut [T], Range<usize>),
+    {
+        let mut local_idx = 0;
+
+        if let Some(initial) = self.initial() {
+            let chunk_len = initial.len();
+            f(initial, local_idx..local_idx + chunk_len);
+            local_idx += chunk_len;
+        }
+
+        if self.num_chunks > 1 {
+            let packed_slice: &[T::Physical] = buffer_as_slice(&self.packed);
+            let elems_per_chunk = self.elems_per_chunk();
+            for i in self.full_chunks_range() {
+                let chunk = &packed_slice[i * elems_per_chunk..][..elems_per_chunk];
+                unsafe {
+                    let dst: &mut [T::Physical] = mem::transmute(&mut self.buffer[..]);
+                    self.strategy.unpack_chunk(self.bit_width, chunk, dst);
+                    let unpacked: &mut [T] = mem::transmute(&mut self.buffer[..]);
+                    f(unpacked, local_idx..local_idx + CHUNK_SIZE);
+                }
+                local_idx += CHUNK_SIZE;
+            }
+        }
+
+        if let Some(trailer) = self.trailer() {
+            let chunk_len = trailer.len();
+            f(trailer, local_idx..local_idx + chunk_len);
+            local_idx += chunk_len;
+        }
+
+        debug_assert_eq!(local_idx, self.len);
+    }
+
+    /// Walk every *packed* chunk in array order, yielding the raw packed FastLanes block and the
+    /// padded bit range it covers, without unpacking it.
+    ///
+    /// Unlike [`Self::for_each_unpacked_chunk`], this does not fill the scratch buffer: it hands
+    /// the still-packed block to the callback so fused kernels (e.g. compare) can unpack and
+    /// consume it in a single pass. Each yielded block holds exactly `elems_per_chunk` packed
+    /// values (the buffer is zero-padded out to a whole final chunk).
+    ///
+    /// The yielded range is in *padded* coordinates: block `c` covers
+    /// `[c * 1024, min((c + 1) * 1024, offset + len))`, so it includes the leading `offset` rows
+    /// that slicing skips. Block starts are therefore always 1024-aligned regardless of `offset`.
+    /// Callers must account for the array's `offset` when mapping a block's rows back to logical
+    /// output positions (e.g. by viewing the output buffer at a bit offset of `offset`).
+    pub(crate) fn for_each_packed_chunk<F>(&self, mut f: F)
+    where
+        F: FnMut(&[T::Physical], Range<usize>),
+    {
+        let packed_slice: &[T::Physical] = buffer_as_slice(&self.packed);
+        let elems_per_chunk = self.elems_per_chunk();
+        let padded_len = self.offset + self.len;
+        for chunk in 0..self.num_chunks {
+            let packed_chunk = &packed_slice[chunk * elems_per_chunk..][..elems_per_chunk];
+            let start = chunk * CHUNK_SIZE;
+            let end = (start + CHUNK_SIZE).min(padded_len);
+            f(packed_chunk, start..end);
         }
     }
 
     /// Unpack full chunks into output range starting at the given index.
-    /// Returns the next local index to write to.
     fn decode_full_chunks_into_at(
         &mut self,
         output: &mut [MaybeUninit<T>],
         start_idx: usize,
     ) -> usize {
-        // If there's only one chunk it has been handled already by `initial` method
         if self.num_chunks == 1 {
-            // Return the start_idx since initial already wrote everything.
             return start_idx;
         }
-
-        let first_chunk_is_sliced = self.first_chunk_is_sliced();
-
-        let last_chunk_is_sliced = self.last_chunk_is_sliced();
-        let full_chunks_range =
-            (first_chunk_is_sliced as usize)..(self.num_chunks - last_chunk_is_sliced as usize);
 
         let mut local_idx = start_idx;
 
         let packed_slice: &[T::Physical] = buffer_as_slice(&self.packed);
         let elems_per_chunk = self.elems_per_chunk();
-        for i in full_chunks_range {
+        for i in self.full_chunks_range() {
             let chunk = &packed_slice[i * elems_per_chunk..][..elems_per_chunk];
 
             unsafe {
                 let uninit_dst = &mut output[local_idx..local_idx + CHUNK_SIZE];
-                // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout
+                // SAFETY: &[T] and &[MaybeUninit<T>] have the same layout.
                 let dst: &mut [T::Physical] = mem::transmute(uninit_dst);
                 self.strategy.unpack_chunk(self.bit_width, chunk, dst);
             }
             local_idx += CHUNK_SIZE;
         }
         local_idx
+    }
+
+    fn full_chunks_range(&self) -> Range<usize> {
+        (self.first_chunk_is_sliced() as usize)
+            ..(self.num_chunks - self.last_chunk_is_sliced() as usize)
     }
 
     /// Access last chunk of the array if the last chunk has fewer than 1024 due to slicing
@@ -336,6 +411,12 @@ fn buffer_as_slice<T>(buffer: &ByteBuffer) -> &[T] {
     //  Unfortunately Rust cannot understand this, so we reconstruct the slice from raw parts
     //  to get it to reinterpret the lifetime.
     unsafe { std::slice::from_raw_parts(packed_ptr, packed_len) }
+}
+
+fn write_map<T: Copy, U>(src: &[T], dst: &mut [MaybeUninit<U>], f: &mut impl FnMut(T) -> U) {
+    for (dst, &src) in dst.iter_mut().zip(src.iter()) {
+        dst.write(f(src));
+    }
 }
 
 pub trait BitPacked: PhysicalPType<Physical: BitPacking> {}

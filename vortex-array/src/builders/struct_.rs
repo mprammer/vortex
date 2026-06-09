@@ -180,10 +180,10 @@ impl ArrayBuilder for StructBuilder {
         }
 
         self.nulls.append_validity_mask(
-            array
+            &array
                 .validity()
                 .vortex_expect("validity_mask")
-                .to_mask(array.len(), &mut LEGACY_SESSION.create_execution_ctx())
+                .execute_mask(array.len(), &mut LEGACY_SESSION.create_execution_ctx())
                 .vortex_expect("Failed to compute validity mask"),
         );
     }
@@ -196,8 +196,7 @@ impl ArrayBuilder for StructBuilder {
     }
 
     unsafe fn set_validity_unchecked(&mut self, validity: Mask) {
-        self.nulls = LazyBitBufferBuilder::new(validity.len());
-        self.nulls.append_validity_mask(validity);
+        self.nulls = LazyBitBufferBuilder::from_validity_mask(validity);
     }
 
     fn finish(&mut self) -> ArrayRef {

@@ -7,7 +7,6 @@
 //! [`DataSourceRef`]: vortex::scan::DataSourceRef
 //! [`TableProvider`]: datafusion_catalog::TableProvider
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -24,6 +23,7 @@ use datafusion_datasource::source::DataSourceExec;
 use datafusion_expr::Expr;
 use datafusion_expr::TableType;
 use datafusion_physical_plan::ExecutionPlan;
+use vortex::expr::stats::Precision as VortexPrecision;
 use vortex::scan::DataSourceRef;
 use vortex::session::VortexSession;
 
@@ -106,10 +106,6 @@ impl VortexTable {
 
 #[async_trait]
 impl TableProvider for VortexTable {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn schema(&self) -> SchemaRef {
         Arc::clone(&self.arrow_schema)
     }
@@ -156,14 +152,14 @@ impl TableProvider for VortexTable {
     //  planning over stats from the physical plan?
     fn statistics(&self) -> Option<Statistics> {
         let num_rows = match self.data_source.row_count() {
-            Some(vortex::expr::stats::Precision::Exact(v)) => {
+            VortexPrecision::Exact(v) => {
                 usize::try_from(v).map(Precision::Exact).unwrap_or_default()
             }
             _ => Precision::Absent,
         };
 
         let total_byte_size = match self.data_source.byte_size() {
-            Some(vortex::expr::stats::Precision::Exact(v)) => {
+            VortexPrecision::Exact(v) => {
                 usize::try_from(v).map(Precision::Exact).unwrap_or_default()
             }
             _ => Precision::Absent,

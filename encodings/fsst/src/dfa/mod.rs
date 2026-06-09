@@ -136,6 +136,8 @@ mod suffix;
 #[cfg(test)]
 mod tests;
 
+use std::borrow::Cow;
+
 use flat_contains::FlatContainsDfa;
 use folded_contains::FoldedContainsDfa;
 use fsst::ESCAPE_CODE;
@@ -206,69 +208,108 @@ impl FsstMatcher {
         };
 
         let ci = case_insensitive;
+        // SQL escapes (`\`) force literal matching: the escape parser emits a
+        // pure-literal needle (any `_` it contains came from `\_`, so it is a
+        // literal byte, not a wildcard). Disable the `_` wildcard sentinel for
+        // those needles so they match `_` exactly.
+        let wildcards = !pattern.contains(&b'\\');
         let inner = match like_kind {
-            LikeKind::Prefix(b"") | LikeKind::Contains(b"") | LikeKind::Suffix(b"") => {
+            LikeKind::Prefix(p) | LikeKind::Contains(p) | LikeKind::Suffix(p) if p.is_empty() => {
                 MatcherInner::MatchAll
             }
             LikeKind::Prefix(prefix) => {
                 if prefix.len() > FlatPrefixDfa::MAX_PREFIX_LEN {
                     return Ok(None);
                 }
-                MatcherInner::Prefix(FlatPrefixDfa::new(symbols, symbol_lengths, prefix, ci)?)
+                let dfa = if wildcards {
+                    FlatPrefixDfa::new(symbols, symbol_lengths, prefix.as_ref(), ci)?
+                } else {
+                    FlatPrefixDfa::new_literal(symbols, symbol_lengths, prefix.as_ref(), ci)?
+                };
+                MatcherInner::Prefix(dfa)
             }
             LikeKind::Suffix(suffix) => {
                 if suffix.len() > SuffixMatcher::MAX_SUFFIX_LEN {
                     return Ok(None);
                 }
-                MatcherInner::Suffix(SuffixMatcher::new(symbols, symbol_lengths, suffix, ci)?)
+                MatcherInner::Suffix(SuffixMatcher::new(
+                    symbols,
+                    symbol_lengths,
+                    suffix.as_ref(),
+                    ci,
+                )?)
             }
             LikeKind::Contains(needle) => {
-                // Prefer Shift-Or for short (≤ 8 byte) needles when (a)
-                // FoldedContains' escape-only `memmem` specialization
-                // doesn't apply (which beats ShiftOr outright on
-                // rare-match corpora) AND (b) FoldedContains would
-                // otherwise fall back to its 1-byte progressing bitset
-                // path or row_loop. The second condition is approximated
-                // by `pair_anchor_likely`: if at least one needle byte
-                // appears as the first byte of some symbol expansion,
-                // FoldedContains will likely build a Teddy-2 bucketed
-                // pair scan that beats ShiftOr's per-byte inner loop on
-                // throughput, so we keep FoldedContains.
-                //
-                // This conservative gate keeps the ShiftOr variant
-                // active (its `matches()` is still exercised whenever the
-                // matcher's row-level dispatcher is called) without
-                // regressing any existing `fsst_contains` bench that
-                // today routes through Teddy-2.
-                let escape_only_eligible = !ci
-                    && needle.len() >= 2
-                    && needle_is_literal(needle)
-                    && needle_bytes_absent_from_all_symbols(symbols, symbol_lengths, needle);
-                let pair_anchor_likely = !escape_only_eligible
-                    && first_byte_present_in_any_symbol(symbols, symbol_lengths, needle);
-                if !escape_only_eligible
-                    && !pair_anchor_likely
-                    && needle.len() <= shift_or::MAX_NEEDLE_LEN
-                    && needle_len_safe_for_shift_or(needle, ci)
-                    && let Ok(dfa) = ShiftOrDfa::new(symbols, symbol_lengths, needle, ci)
-                {
-                    MatcherInner::ShiftOr(dfa)
-                } else if needle.len() <= FoldedContainsDfa::MAX_NEEDLE_LEN {
-                    MatcherInner::FoldedContains(FoldedContainsDfa::new(
-                        symbols,
-                        symbol_lengths,
-                        needle,
-                        ci,
-                    )?)
-                } else if needle.len() <= FlatContainsDfa::MAX_NEEDLE_LEN {
-                    MatcherInner::Contains(FlatContainsDfa::new(
-                        symbols,
-                        symbol_lengths,
-                        needle,
-                        ci,
-                    )?)
+                let needle: &[u8] = needle.as_ref();
+                if !wildcards {
+                    // SQL-escaped literal needle: match every byte literally
+                    // (the `_` wildcard sentinel is disabled). Skip the ShiftOr
+                    // / escape-only routing, which all assume wildcard `_`.
+                    if needle.len() <= FoldedContainsDfa::MAX_NEEDLE_LEN {
+                        MatcherInner::FoldedContains(FoldedContainsDfa::new_literal(
+                            symbols,
+                            symbol_lengths,
+                            needle,
+                            ci,
+                        )?)
+                    } else if needle.len() <= FlatContainsDfa::MAX_NEEDLE_LEN {
+                        MatcherInner::Contains(FlatContainsDfa::new_literal(
+                            symbols,
+                            symbol_lengths,
+                            needle,
+                            ci,
+                        )?)
+                    } else {
+                        return Ok(None);
+                    }
                 } else {
-                    return Ok(None);
+                    // Prefer Shift-Or for short (≤ 8 byte) needles when (a)
+                    // FoldedContains' escape-only `memmem` specialization
+                    // doesn't apply (which beats ShiftOr outright on
+                    // rare-match corpora) AND (b) FoldedContains would
+                    // otherwise fall back to its 1-byte progressing bitset
+                    // path or row_loop. The second condition is approximated
+                    // by `pair_anchor_likely`: if at least one needle byte
+                    // appears as the first byte of some symbol expansion,
+                    // FoldedContains will likely build a Teddy-2 bucketed
+                    // pair scan that beats ShiftOr's per-byte inner loop on
+                    // throughput, so we keep FoldedContains.
+                    //
+                    // This conservative gate keeps the ShiftOr variant
+                    // active (its `matches()` is still exercised whenever the
+                    // matcher's row-level dispatcher is called) without
+                    // regressing any existing `fsst_contains` bench that
+                    // today routes through Teddy-2.
+                    let escape_only_eligible = !ci
+                        && needle.len() >= 2
+                        && needle_is_literal(needle)
+                        && needle_bytes_absent_from_all_symbols(symbols, symbol_lengths, needle);
+                    let pair_anchor_likely = !escape_only_eligible
+                        && first_byte_present_in_any_symbol(symbols, symbol_lengths, needle);
+                    if !escape_only_eligible
+                        && !pair_anchor_likely
+                        && needle.len() <= shift_or::MAX_NEEDLE_LEN
+                        && needle_len_safe_for_shift_or(needle, ci)
+                        && let Ok(dfa) = ShiftOrDfa::new(symbols, symbol_lengths, needle, ci)
+                    {
+                        MatcherInner::ShiftOr(dfa)
+                    } else if needle.len() <= FoldedContainsDfa::MAX_NEEDLE_LEN {
+                        MatcherInner::FoldedContains(FoldedContainsDfa::new(
+                            symbols,
+                            symbol_lengths,
+                            needle,
+                            ci,
+                        )?)
+                    } else if needle.len() <= FlatContainsDfa::MAX_NEEDLE_LEN {
+                        MatcherInner::Contains(FlatContainsDfa::new(
+                            symbols,
+                            symbol_lengths,
+                            needle,
+                            ci,
+                        )?)
+                    } else {
+                        return Ok(None);
+                    }
                 }
             }
             LikeKind::MultiContains(segments) => {
@@ -483,8 +524,12 @@ impl MultiNeedleMatcher {
                 LikeKind::Contains(needle)
                     if !needle.is_empty() && needle.len() <= FoldedContainsDfa::MAX_NEEDLE_LEN =>
                 {
-                    let dfa =
-                        FoldedContainsDfa::new(symbols, symbol_lengths, needle, case_insensitive)?;
+                    let dfa = FoldedContainsDfa::new(
+                        symbols,
+                        symbol_lengths,
+                        needle.as_ref(),
+                        case_insensitive,
+                    )?;
                     fat_teddy_dfas.push(dfa);
                 }
                 _ => {
@@ -667,24 +712,37 @@ fn first_byte_present_in_any_symbol(
 /// The subset of LIKE patterns we can handle without decompression.
 enum LikeKind<'a> {
     /// `prefix%`
-    Prefix(&'a [u8]),
+    Prefix(Cow<'a, [u8]>),
     /// `%suffix`
-    Suffix(&'a [u8]),
+    Suffix(Cow<'a, [u8]>),
     /// `%needle%`
-    Contains(&'a [u8]),
+    Contains(Cow<'a, [u8]>),
     /// `%seg1%seg2%...%segN%`
     MultiContains(Vec<&'a [u8]>),
 }
 
 impl<'a> LikeKind<'a> {
     fn parse(pattern: &'a [u8]) -> Option<Self> {
+        // SQL escape codes (`\`) present: match the repo's escape-aware
+        // behaviour. Only `prefix%` / `%needle%` shapes are handled, with
+        // `\x` unescaped to the literal byte `x` (including `\_` → a literal
+        // underscore and `\%` → a literal percent). The matcher is built in
+        // literal mode for these needles (see `try_new_with`), so any `_` is
+        // matched exactly rather than as the `_` wildcard.
+        if pattern.contains(&b'\\') {
+            return Self::parse_escaped_prefix(pattern)
+                .or_else(|| Self::parse_escaped_contains(pattern));
+        }
+
+        // No escapes: `_` is the single-byte wildcard.
+
         // `prefix%` (including just `%` where prefix is empty).
         // `_` in the prefix is the single-byte wildcard (anchored from
         // the row start, no KMP fallback ambiguity).
         if let Some(prefix) = pattern.strip_suffix(b"%")
             && !prefix.contains(&b'%')
         {
-            return Some(LikeKind::Prefix(prefix));
+            return Some(LikeKind::Prefix(Cow::Borrowed(prefix)));
         }
 
         // `%suffix` (no trailing %); `_` allowed in suffix (anchored
@@ -692,7 +750,7 @@ impl<'a> LikeKind<'a> {
         if let Some(suffix) = pattern.strip_prefix(b"%")
             && !suffix.contains(&b'%')
         {
-            return Some(LikeKind::Suffix(suffix));
+            return Some(LikeKind::Suffix(Cow::Borrowed(suffix)));
         }
 
         // `%needle%`. We reject `_` in unanchored contains for now —
@@ -703,7 +761,7 @@ impl<'a> LikeKind<'a> {
         // tracked as a follow-up.
         let inner = pattern.strip_prefix(b"%")?.strip_suffix(b"%")?;
         if !inner.contains(&b'%') && !inner.contains(&b'_') {
-            return Some(LikeKind::Contains(inner));
+            return Some(LikeKind::Contains(Cow::Borrowed(inner)));
         }
 
         // `%seg1%seg2%...%segN%`. Same wildcard limitation: any
@@ -717,6 +775,67 @@ impl<'a> LikeKind<'a> {
             return Some(LikeKind::MultiContains(segments));
         }
 
+        None
+    }
+
+    /// `prefix%` with SQL escape handling (see [`Self::parse`]).
+    fn parse_escaped_prefix(pattern: &'a [u8]) -> Option<Self> {
+        Self::parse_escaped_literal_until_final_percent(pattern, 0).map(LikeKind::Prefix)
+    }
+
+    /// `%needle%` with SQL escape handling (see [`Self::parse`]).
+    fn parse_escaped_contains(pattern: &'a [u8]) -> Option<Self> {
+        if !pattern.starts_with(b"%") {
+            return None;
+        }
+        Self::parse_escaped_literal_until_final_percent(pattern, 1).map(LikeKind::Contains)
+    }
+
+    /// Parse `pattern[literal_start..]` as a literal terminated by a single
+    /// trailing unescaped `%`, honouring SQL `\` escapes.
+    ///
+    /// `literal` stays `None` until an escape forces us to materialize bytes;
+    /// from then on we push into the owned `Vec`. Otherwise we return a
+    /// borrowed slice straight from `pattern`. Returns `None` on a non-final
+    /// unescaped `%` or an unescaped `_`. Escaped bytes (`\x`, including `\_`
+    /// and `\%`) are emitted literally; the caller builds the matcher in
+    /// literal mode so a literal `_` is matched exactly.
+    fn parse_escaped_literal_until_final_percent(
+        pattern: &'a [u8],
+        literal_start: usize,
+    ) -> Option<Cow<'a, [u8]>> {
+        let mut literal: Option<Vec<u8>> = None;
+        let mut idx = literal_start;
+        while idx < pattern.len() {
+            match pattern[idx] {
+                b'\\' => {
+                    // Trailing `\` is treated as a literal backslash. The
+                    // escaped byte is always literal, including `\_` (a literal
+                    // underscore): the matcher is built in literal mode for
+                    // escaped patterns, so `_` is matched exactly rather than
+                    // as a wildcard.
+                    let escaped = pattern.get(idx + 1).copied().unwrap_or(b'\\');
+                    literal
+                        .get_or_insert_with(|| pattern[literal_start..idx].to_vec())
+                        .push(escaped);
+                    idx = (idx + 2).min(pattern.len());
+                }
+                b'%' if idx + 1 == pattern.len() => {
+                    return Some(match literal {
+                        Some(buf) => Cow::Owned(buf),
+                        None => Cow::Borrowed(&pattern[literal_start..idx]),
+                    });
+                }
+                b'%' | b'_' => return None,
+                byte => {
+                    // No-op on the borrowed path; only push once we've started copying.
+                    if let Some(literal) = &mut literal {
+                        literal.push(byte);
+                    }
+                    idx += 1;
+                }
+            }
+        }
         None
     }
 }
@@ -971,8 +1090,8 @@ fn ascii_to_lower(b: u8) -> u8 {
 /// `true` if `a` or `b` is the [`WILDCARD`] byte, or both bytes are
 /// equal. When `ci` is true, ASCII letter case is ignored.
 #[inline]
-fn pattern_eq(a: u8, b: u8, ci: bool) -> bool {
-    if a == WILDCARD || b == WILDCARD {
+fn pattern_eq(a: u8, b: u8, ci: bool, wildcards: bool) -> bool {
+    if wildcards && (a == WILDCARD || b == WILDCARD) {
         return true;
     }
     if ci {
@@ -1029,17 +1148,17 @@ fn set_advance(table: &mut [u8], row_start: usize, needle_byte: u8, new_state: u
 ///
 /// This is one 256-byte memcpy + a single override per state, instead
 /// of running the KMP fallback loop at every cell.
-fn kmp_byte_transitions(needle: &[u8], ci: bool) -> Vec<u8> {
+fn kmp_byte_transitions(needle: &[u8], ci: bool, wildcards: bool) -> Vec<u8> {
     let n_states = u8::try_from(needle.len() + 1)
         .vortex_expect("kmp_byte_transitions: must have needle.len() ≤ 255");
     let accept = n_states - 1;
-    let failure = kmp_failure_table(needle, ci);
+    let failure = kmp_failure_table(needle, ci, wildcards);
 
     let mut table = vec![0u8; usize::from(n_states) * 256];
 
     // State 0: either `needle[0]` (literal) or every byte (wildcard) advances.
     if let Some(&first) = needle.first() {
-        if first == WILDCARD {
+        if wildcards && first == WILDCARD {
             table[0..256].fill(1);
         } else {
             set_advance(&mut table, 0, first, 1, ci);
@@ -1056,7 +1175,7 @@ fn kmp_byte_transitions(needle: &[u8], ci: bool) -> Vec<u8> {
         // failure-state would land on that byte.
         table.copy_within(fail_row..fail_row + 256, state_row);
         // Override the advancing entries.
-        if needle[s] == WILDCARD {
+        if wildcards && needle[s] == WILDCARD {
             // Wildcard at position s: every byte advances.
             table[state_row..state_row + 256].fill(state + 1);
         } else {
@@ -1073,14 +1192,14 @@ fn kmp_byte_transitions(needle: &[u8], ci: bool) -> Vec<u8> {
     table
 }
 
-fn kmp_failure_table(needle: &[u8], ci: bool) -> Vec<u8> {
+fn kmp_failure_table(needle: &[u8], ci: bool, wildcards: bool) -> Vec<u8> {
     let mut failure = vec![0u8; needle.len()];
     let mut k = 0u8;
     for i in 1..needle.len() {
-        while k > 0 && !pattern_eq(needle[usize::from(k)], needle[i], ci) {
+        while k > 0 && !pattern_eq(needle[usize::from(k)], needle[i], ci, wildcards) {
             k = failure[usize::from(k) - 1];
         }
-        if pattern_eq(needle[usize::from(k)], needle[i], ci) {
+        if pattern_eq(needle[usize::from(k)], needle[i], ci, wildcards) {
             k += 1;
         }
         failure[i] = k;

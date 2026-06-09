@@ -17,10 +17,10 @@ use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
 use vortex_array::ArrayRef;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
-use vortex_array::Precision;
 use vortex_array::TypedArrayRef;
 use vortex_array::arrays::DecimalArray;
 use vortex_array::arrays::PrimitiveArray;
@@ -33,6 +33,7 @@ use vortex_array::scalar::DecimalValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::smallvec::smallvec;
 use vortex_array::vtable::OperationsVTable;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityChild;
@@ -52,11 +53,11 @@ use crate::decimal_byte_parts::rules::PARENT_RULES;
 pub type DecimalBytePartsArray = Array<DecimalByteParts>;
 
 impl ArrayHash for DecimalBytePartsData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for DecimalBytePartsData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
@@ -70,7 +71,7 @@ pub struct DecimalBytesPartsMetadata {
 }
 
 impl VTable for DecimalByteParts {
-    type ArrayData = DecimalBytePartsData;
+    type TypedArrayData = DecimalBytePartsData;
 
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
@@ -82,7 +83,7 @@ impl VTable for DecimalByteParts {
 
     fn validate(
         &self,
-        _data: &Self::ArrayData,
+        _data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -144,7 +145,7 @@ impl VTable for DecimalByteParts {
             "lower_part_count > 0 not currently supported"
         );
 
-        let slots = vec![Some(msp.clone())];
+        let slots = smallvec![Some(msp.clone())];
         let data = DecimalBytePartsData::try_new(msp.dtype(), msp.len(), *decimal_dtype)?;
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
@@ -262,7 +263,7 @@ impl DecimalByteParts {
     ) -> VortexResult<DecimalBytePartsArray> {
         let len = msp.len();
         let dtype = DType::Decimal(decimal_dtype, msp.dtype().nullability());
-        let slots = vec![Some(msp.clone())];
+        let slots = smallvec![Some(msp.clone())];
         let data = DecimalBytePartsData::try_new(msp.dtype(), msp.len(), decimal_dtype)?;
         Ok(unsafe {
             Array::from_parts_unchecked(

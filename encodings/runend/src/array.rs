@@ -15,11 +15,11 @@ use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::LEGACY_SESSION;
-use vortex_array::Precision;
 use vortex_array::TypedArrayRef;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::Primitive;
@@ -32,6 +32,7 @@ use vortex_array::scalar::PValue;
 use vortex_array::search_sorted::SearchSorted;
 use vortex_array::search_sorted::SearchSortedSide;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::smallvec::smallvec;
 use vortex_array::validity::Validity;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTable;
@@ -64,19 +65,19 @@ pub struct RunEndMetadata {
 }
 
 impl ArrayHash for RunEndData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.offset.hash(state);
     }
 }
 
 impl ArrayEq for RunEndData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.offset == other.offset
     }
 }
 
 impl VTable for RunEnd {
-    type ArrayData = RunEndData;
+    type TypedArrayData = RunEndData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -88,7 +89,7 @@ impl VTable for RunEnd {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -99,7 +100,9 @@ impl VTable for RunEnd {
         let values = slots[VALUES_SLOT]
             .as_ref()
             .vortex_expect("RunEndArray values slot");
-        RunEndData::validate_parts(ends, values, data.offset, len)?;
+        // TODO(ctx): trait fixes - VTable::validate has a fixed signature.
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        RunEndData::validate_parts(ends, values, data.offset, len, &mut ctx)?;
         vortex_ensure!(
             values.dtype() == dtype,
             "expected dtype {}, got {}",
@@ -152,7 +155,7 @@ impl VTable for RunEnd {
 
         let values = children.get(1, dtype, runs)?;
         let offset = usize::try_from(metadata.offset).vortex_expect("Offset must be a valid usize");
-        let slots = vec![Some(ends), Some(values)];
+        let slots = smallvec![Some(ends), Some(values)];
         let data = RunEndData::new(offset);
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
@@ -256,9 +259,7 @@ impl RunEnd {
         length: usize,
     ) -> RunEndArray {
         let dtype = values.dtype().clone();
-        let slots = vec![Some(ends.clone()), Some(values.clone())];
-        RunEndData::validate_parts(&ends, &values, offset, length)
-            .vortex_expect("RunEndArray validation failed");
+        let slots = smallvec![Some(ends), Some(values)];
         let data = unsafe { RunEndData::new_unchecked(offset) };
         unsafe {
             Array::from_parts_unchecked(
@@ -268,10 +269,15 @@ impl RunEnd {
     }
 
     /// Build a new [`RunEndArray`] from ends and values.
-    pub fn try_new(ends: ArrayRef, values: ArrayRef) -> VortexResult<RunEndArray> {
-        let len = RunEndData::logical_len_from_ends(&ends)?;
+    pub fn try_new(
+        ends: ArrayRef,
+        values: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<RunEndArray> {
+        let len = RunEndData::logical_len_from_ends(&ends, ctx)?;
+        RunEndData::validate_parts(&ends, &values, 0, len, ctx)?;
         let dtype = values.dtype().clone();
-        let slots = vec![Some(ends), Some(values)];
+        let slots = smallvec![Some(ends), Some(values)];
         let data = RunEndData::new(0);
         Array::try_from_parts(ArrayParts::new(RunEnd, dtype, len, data).with_slots(slots))
     }
@@ -282,26 +288,28 @@ impl RunEnd {
         values: ArrayRef,
         offset: usize,
         length: usize,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<RunEndArray> {
+        RunEndData::validate_parts(&ends, &values, offset, length, ctx)?;
         let dtype = values.dtype().clone();
-        let slots = vec![Some(ends), Some(values)];
+        let slots = smallvec![Some(ends), Some(values)];
         let data = RunEndData::new(offset);
         Array::try_from_parts(ArrayParts::new(RunEnd, dtype, length, data).with_slots(slots))
     }
 
     /// Build a new [`RunEndArray`] from ends and values (panics on invalid input).
-    pub fn new(ends: ArrayRef, values: ArrayRef) -> RunEndArray {
-        Self::try_new(ends, values).vortex_expect("RunEndData is always valid")
+    pub fn new(ends: ArrayRef, values: ArrayRef, ctx: &mut ExecutionCtx) -> RunEndArray {
+        Self::try_new(ends, values, ctx).vortex_expect("RunEndData is always valid")
     }
 
     /// Run the array through run-end encoding.
-    pub fn encode(array: ArrayRef) -> VortexResult<RunEndArray> {
+    pub fn encode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<RunEndArray> {
         if let Some(parray) = array.as_opt::<Primitive>() {
-            let (ends, values) = runend_encode(parray);
+            let (ends, values) = runend_encode(parray, ctx);
             let ends = ends.into_array();
             let len = array.len();
             let dtype = values.dtype().clone();
-            let slots = vec![Some(ends), Some(values)];
+            let slots = smallvec![Some(ends), Some(values)];
             let data = unsafe { RunEndData::new_unchecked(0) };
             Array::try_from_parts(ArrayParts::new(RunEnd, dtype, len, data).with_slots(slots))
         } else {
@@ -311,13 +319,11 @@ impl RunEnd {
 }
 
 impl RunEndData {
-    fn logical_len_from_ends(ends: &ArrayRef) -> VortexResult<usize> {
+    fn logical_len_from_ends(ends: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<usize> {
         if ends.is_empty() {
             Ok(0)
         } else {
-            usize::try_from(
-                &ends.execute_scalar(ends.len() - 1, &mut LEGACY_SESSION.create_execution_ctx())?,
-            )
+            usize::try_from(&ends.execute_scalar(ends.len() - 1, ctx)?)
         }
     }
 
@@ -326,6 +332,7 @@ impl RunEndData {
         values: &ArrayRef,
         offset: usize,
         length: usize,
+        ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
         // DType validation
         vortex_ensure!(
@@ -359,10 +366,9 @@ impl RunEndData {
             // Run ends must be strictly sorted for binary search to work correctly.
             let pre_validation = ends.statistics().to_owned();
 
-            let mut ctx = LEGACY_SESSION.create_execution_ctx();
             let is_sorted = ends
                 .statistics()
-                .compute_is_strict_sorted(&mut ctx)
+                .compute_is_strict_sorted(ctx)
                 .unwrap_or(false);
 
             // Preserve the original statistics since compute_is_strict_sorted may have mutated them.
@@ -378,17 +384,13 @@ impl RunEndData {
 
         // Validate the offset and length are valid for the given ends and values
         if offset != 0 && length != 0 {
-            let first_run_end = usize::try_from(
-                &ends.execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())?,
-            )?;
+            let first_run_end = usize::try_from(&ends.execute_scalar(0, ctx)?)?;
             if first_run_end < offset {
                 vortex_bail!("First run end {first_run_end} must be >= offset {offset}");
             }
         }
 
-        let last_run_end = usize::try_from(
-            &ends.execute_scalar(ends.len() - 1, &mut LEGACY_SESSION.create_execution_ctx())?,
-        )?;
+        let last_run_end = usize::try_from(&ends.execute_scalar(ends.len() - 1, ctx)?)?;
         let min_required_end = offset + length;
         if last_run_end < min_required_end {
             vortex_bail!("Last run end {last_run_end} must be >= offset+length {min_required_end}");
@@ -414,12 +416,12 @@ impl RunEndData {
     /// # use vortex_error::VortexResult;
     /// # use vortex_runend::RunEnd;
     /// # fn main() -> VortexResult<()> {
+    /// let mut ctx = LEGACY_SESSION.create_execution_ctx();
     /// let ends = buffer![2u8, 3u8].into_array();
     /// let values = BoolArray::from_iter([false, true]).into_array();
-    /// let run_end = RunEnd::new(ends, values);
+    /// let run_end = RunEnd::new(ends, values, &mut ctx);
     ///
     /// // Array encodes
-    /// let mut ctx = LEGACY_SESSION.create_execution_ctx();
     /// assert_eq!(run_end.execute_scalar(0, &mut ctx)?, false.into());
     /// assert_eq!(run_end.execute_scalar(1, &mut ctx)?, false.into());
     /// assert_eq!(run_end.execute_scalar(2, &mut ctx)?, true.into());
@@ -444,9 +446,9 @@ impl RunEndData {
     }
 
     /// Run the array through run-end encoding.
-    pub fn encode(array: ArrayRef) -> VortexResult<Self> {
+    pub fn encode(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
         if let Some(parray) = array.as_opt::<Primitive>() {
-            let (_ends, _values) = runend_encode(parray);
+            let (_ends, _values) = runend_encode(parray, ctx);
             // SAFETY: runend_encode handles this
             unsafe { Ok(Self::new_unchecked(0)) }
         } else {
@@ -490,18 +492,18 @@ pub(super) fn run_end_canonicalize(
     Ok(match array.dtype() {
         DType::Bool(_) => {
             let bools = array.values().clone().execute_as("values", ctx)?;
-            runend_decode_bools(pends, bools, array.offset(), array.len())?
+            runend_decode_bools(pends, bools, array.offset(), array.len(), ctx)?
         }
         DType::Primitive(..) => {
             let pvalues = array.values().clone().execute_as("values", ctx)?;
-            runend_decode_primitive(pends, pvalues, array.offset(), array.len())?.into_array()
+            runend_decode_primitive(pends, pvalues, array.offset(), array.len(), ctx)?.into_array()
         }
         DType::Utf8(_) | DType::Binary(_) => {
             let values = array
                 .values()
                 .clone()
                 .execute_as::<VarBinViewArray>("values", ctx)?;
-            runend_decode_varbinview(pends, values, array.offset(), array.len())?.into_array()
+            runend_decode_varbinview(pends, values, array.offset(), array.len(), ctx)?.into_array()
         }
         _ => vortex_bail!("Unsupported RunEnd value type: {}", array.dtype()),
     })
@@ -509,22 +511,32 @@ pub(super) fn run_end_canonicalize(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use vortex_array::IntoArray;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::DictArray;
     use vortex_array::arrays::VarBinViewArray;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::session::ArraySession;
     use vortex_buffer::buffer;
+    use vortex_session::VortexSession;
 
     use crate::RunEnd;
 
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+
     #[test]
     fn test_runend_constructor() {
+        let mut ctx = SESSION.create_execution_ctx();
         let arr = RunEnd::new(
             buffer![2u32, 5, 10].into_array(),
             buffer![1i32, 2, 3].into_array(),
+            &mut ctx,
         );
         assert_eq!(arr.len(), 10);
         assert_eq!(
@@ -541,8 +553,9 @@ mod tests {
 
     #[test]
     fn test_runend_utf8() {
+        let mut ctx = SESSION.create_execution_ctx();
         let values = VarBinViewArray::from_iter_str(["a", "b", "c"]).into_array();
-        let arr = RunEnd::new(buffer![2u32, 5, 10].into_array(), values);
+        let arr = RunEnd::new(buffer![2u32, 5, 10].into_array(), values, &mut ctx);
         assert_eq!(arr.len(), 10);
         assert_eq!(arr.dtype(), &DType::Utf8(Nullability::NonNullable));
 
@@ -554,11 +567,17 @@ mod tests {
 
     #[test]
     fn test_runend_dict() {
+        let mut ctx = SESSION.create_execution_ctx();
         let dict_values = VarBinViewArray::from_iter_str(["x", "y", "z"]).into_array();
         let dict_codes = buffer![0u32, 1, 2].into_array();
         let dict = DictArray::try_new(dict_codes, dict_values).unwrap();
 
-        let arr = RunEnd::try_new(buffer![2u32, 5, 10].into_array(), dict.into_array()).unwrap();
+        let arr = RunEnd::try_new(
+            buffer![2u32, 5, 10].into_array(),
+            dict.into_array(),
+            &mut ctx,
+        )
+        .unwrap();
         assert_eq!(arr.len(), 10);
 
         let expected =

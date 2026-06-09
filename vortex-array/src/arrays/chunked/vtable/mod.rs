@@ -4,6 +4,7 @@
 use std::hash::Hasher;
 
 use itertools::Itertools;
+use smallvec::SmallVec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -17,10 +18,10 @@ use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::Precision;
 #[expect(deprecated)]
 use crate::ToCanonical as _;
 use crate::array::Array;
@@ -44,6 +45,7 @@ use crate::serde::ArrayChildren;
 mod canonical;
 mod operations;
 mod validity;
+
 /// A [`Chunked`]-encoded Vortex array.
 pub type ChunkedArray = Array<Chunked>;
 
@@ -51,22 +53,22 @@ pub type ChunkedArray = Array<Chunked>;
 pub struct Chunked;
 
 impl ArrayHash for ChunkedData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {
         // Chunk offsets are cached derived data. Slot 0 already stores the logical offsets array,
-        // and ArrayInner hashing includes every slot before ArrayData.
+        // and ArrayData hashing includes every slot before TypedArrayData.
     }
 }
 
 impl ArrayEq for ChunkedData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         // Chunk offsets are cached derived data. Slot 0 already stores the logical offsets array,
-        // and ArrayInner equality compares every slot before ArrayData.
+        // and ArrayData equality compares every slot before TypedArrayData.
         true
     }
 }
 
 impl VTable for Chunked {
-    type ArrayData = ChunkedData;
+    type TypedArrayData = ChunkedData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -197,7 +199,7 @@ impl VTable for Chunked {
                     .map_err(|_| vortex_err!("chunk offset {offset} exceeds usize range"))
             })
             .collect::<VortexResult<Vec<_>>>()?;
-        let mut slots = Vec::with_capacity(children.len());
+        let mut slots = SmallVec::with_capacity(children.len());
         slots.push(Some(chunk_offsets));
         for (idx, (start, end)) in chunk_offsets_usize
             .iter()
@@ -213,9 +215,7 @@ impl VTable for Chunked {
             self.clone(),
             dtype.clone(),
             len,
-            ChunkedData {
-                chunk_offsets: chunk_offsets_usize,
-            },
+            ChunkedData::new(chunk_offsets_usize),
         )
         .with_slots(slots))
     }
@@ -239,7 +239,28 @@ impl VTable for Chunked {
     }
 
     fn execute(array: Array<Self>, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
-        Ok(ExecutionResult::done(_canonicalize(array.as_view(), ctx)?))
+        match array.dtype() {
+            // Struct, List, FixedSizeList, and Variant need child swizzling that the builder path
+            // cannot express.
+            DType::Struct(..) | DType::List(..) | DType::FixedSizeList(..) | DType::Variant(..) => {
+                // TODO(joe)[#7674]: iterative execution here too
+                Ok(ExecutionResult::done(_canonicalize(array.as_view(), ctx)?))
+            }
+            // For all other types, use the builder path via AppendChild.
+            _ => {
+                let slot_idx = array.next_builder_slot.max(CHUNKS_OFFSET);
+                if slot_idx < array.slots().len() {
+                    Ok(ExecutionResult::append_child(
+                        array.with_next_builder_slot(slot_idx + 1),
+                        slot_idx,
+                    ))
+                } else {
+                    Ok(ExecutionResult::done(
+                        Canonical::empty(array.dtype()).into_array(),
+                    ))
+                }
+            }
+        }
     }
 
     fn execute_parent(

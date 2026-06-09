@@ -77,52 +77,25 @@ where
 
 #[cfg(test)]
 mod test {
+    use rstest::rstest;
     use vortex_array::IntoArray;
-    #[expect(deprecated)]
-    use vortex_array::ToCanonical;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::VortexSessionExecute;
     use vortex_array::assert_arrays_eq;
 
     use super::*;
     use crate::ZigZag;
 
-    #[test]
-    fn test_compress_i8() {
-        let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i8..100).as_view())
-            .unwrap()
-            .into_array();
+    #[rstest]
+    #[case::i8(PrimitiveArray::from_iter(-100_i8..100))]
+    #[case::i16(PrimitiveArray::from_iter(-100_i16..100))]
+    #[case::i32(PrimitiveArray::from_iter(-100_i32..100))]
+    #[case::i64(PrimitiveArray::from_iter(-100_i64..100))]
+    fn test_compress(#[case] input: PrimitiveArray) {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let compressed = zigzag_encode(input.as_view()).unwrap().into_array();
         assert!(compressed.is::<ZigZag>());
-        #[expect(deprecated)]
-        let decompressed = compressed.to_primitive();
-        assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(-100_i8..100));
-    }
-    #[test]
-    fn test_compress_i16() {
-        let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i16..100).as_view())
-            .unwrap()
-            .into_array();
-        assert!(compressed.is::<ZigZag>());
-        #[expect(deprecated)]
-        let decompressed = compressed.to_primitive();
-        assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(-100_i16..100));
-    }
-    #[test]
-    fn test_compress_i32() {
-        let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i32..100).as_view())
-            .unwrap()
-            .into_array();
-        assert!(compressed.is::<ZigZag>());
-        #[expect(deprecated)]
-        let decompressed = compressed.to_primitive();
-        assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(-100_i32..100));
-    }
-    #[test]
-    fn test_compress_i64() {
-        let compressed = zigzag_encode(PrimitiveArray::from_iter(-100_i64..100).as_view())
-            .unwrap()
-            .into_array();
-        assert!(compressed.is::<ZigZag>());
-        #[expect(deprecated)]
-        let decompressed = compressed.to_primitive();
-        assert_arrays_eq!(decompressed, PrimitiveArray::from_iter(-100_i64..100));
+        let decompressed = compressed.execute::<PrimitiveArray>(&mut ctx).unwrap();
+        assert_arrays_eq!(decompressed, input);
     }
 }

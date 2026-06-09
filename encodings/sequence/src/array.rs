@@ -8,6 +8,7 @@ use std::hash::Hasher;
 
 use num_traits::cast::FromPrimitive;
 use prost::Message;
+use smallvec::smallvec;
 use vortex_array::Array;
 use vortex_array::ArrayEq;
 use vortex_array::ArrayHash;
@@ -15,9 +16,9 @@ use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
-use vortex_array::Precision;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::NativePType;
@@ -213,20 +214,20 @@ impl SequenceData {
 }
 
 impl ArrayHash for SequenceData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.base.hash(state);
         self.multiplier.hash(state);
     }
 }
 
 impl ArrayEq for SequenceData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.base == other.base && self.multiplier == other.multiplier
     }
 }
 
 impl VTable for Sequence {
-    type ArrayData = SequenceData;
+    type TypedArrayData = SequenceData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -238,7 +239,7 @@ impl VTable for Sequence {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         _slots: &[Option<ArrayRef>],
@@ -383,7 +384,7 @@ impl Sequence {
 
         // SAFETY: we don't have duplicate stats.
         unsafe {
-            StatsSet::new_unchecked(vec![
+            StatsSet::new_unchecked(smallvec![
                 (Stat::IsSorted, StatPrecision::Exact(is_sorted.into())),
                 (
                     Stat::IsStrictSorted,
@@ -518,12 +519,12 @@ mod tests {
         let is_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsSorted));
-        assert_eq!(is_sorted, Some(StatPrecision::Exact(true)));
+        assert_eq!(is_sorted, StatPrecision::Exact(true));
 
         let is_strict_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsStrictSorted));
-        assert_eq!(is_strict_sorted, Some(StatPrecision::Exact(true)));
+        assert_eq!(is_strict_sorted, StatPrecision::Exact(true));
         Ok(())
     }
 
@@ -534,12 +535,12 @@ mod tests {
         let is_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsSorted));
-        assert_eq!(is_sorted, Some(StatPrecision::Exact(true)));
+        assert_eq!(is_sorted, StatPrecision::Exact(true));
 
         let is_strict_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsStrictSorted));
-        assert_eq!(is_strict_sorted, Some(StatPrecision::Exact(false)));
+        assert_eq!(is_strict_sorted, StatPrecision::Exact(false));
         Ok(())
     }
 
@@ -550,12 +551,12 @@ mod tests {
         let is_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsSorted));
-        assert_eq!(is_sorted, Some(StatPrecision::Exact(false)));
+        assert_eq!(is_sorted, StatPrecision::Exact(false));
 
         let is_strict_sorted = arr
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsStrictSorted));
-        assert_eq!(is_strict_sorted, Some(StatPrecision::Exact(false)));
+        assert_eq!(is_strict_sorted, StatPrecision::Exact(false));
         Ok(())
     }
 
@@ -574,8 +575,8 @@ mod tests {
             .statistics()
             .with_typed_stats_set(|s| s.get_as::<bool>(Stat::IsStrictSorted));
 
-        assert_eq!(is_sorted, Some(StatPrecision::Exact(true)));
-        assert_eq!(is_strict_sorted, Some(StatPrecision::Exact(true)));
+        assert_eq!(is_sorted, StatPrecision::Exact(true));
+        assert_eq!(is_strict_sorted, StatPrecision::Exact(true));
 
         Ok(())
     }

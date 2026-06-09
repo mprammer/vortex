@@ -77,7 +77,7 @@ fn is_sorted_impl(array: &ArrayRef, strict: bool, ctx: &mut ExecutionCtx) -> Vor
     };
 
     // Short-circuit using cached array statistics.
-    if let Some(Precision::Exact(value)) = array.statistics().get_as::<bool>(stat) {
+    if let Precision::Exact(value) = array.statistics().get_as::<bool>(stat) {
         return Ok(value);
     }
 
@@ -242,22 +242,34 @@ impl AggregateFnVTable for IsSorted {
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         match input_dtype {
             DType::Null
-            | DType::Struct(..)
             | DType::List(..)
             | DType::FixedSizeList(..)
-            | DType::Variant(..) => None,
-            _ => Some(DType::Bool(Nullability::NonNullable)),
+            | DType::Struct(..)
+            | DType::Union(_)
+            | DType::Variant(..)
+            | DType::Extension(_) => None,
+            DType::Bool(_)
+            | DType::Primitive(..)
+            | DType::Decimal(..)
+            | DType::Utf8(_)
+            | DType::Binary(_) => Some(DType::Bool(Nullability::NonNullable)),
         }
     }
 
     fn partial_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
         match input_dtype {
             DType::Null
-            | DType::Struct(..)
             | DType::List(..)
             | DType::FixedSizeList(..)
-            | DType::Variant(..) => None,
-            _ => Some(make_is_sorted_partial_dtype(input_dtype)),
+            | DType::Struct(..)
+            | DType::Union(_)
+            | DType::Variant(..)
+            | DType::Extension(_) => None,
+            DType::Bool(_)
+            | DType::Primitive(..)
+            | DType::Decimal(..)
+            | DType::Utf8(_)
+            | DType::Binary(_) => Some(make_is_sorted_partial_dtype(input_dtype)),
         }
     }
 
@@ -304,8 +316,8 @@ impl AggregateFnVTable for IsSorted {
         }
 
         // Check boundary: self.last_value vs other.first_value
-        if let Some(ref self_last) = partial.last_value
-            && let Some(ref other_first_val) = other_first
+        if let Some(self_last) = &partial.last_value
+            && let Some(other_first_val) = &other_first
         {
             if !self_last.is_null() && !other_first_val.is_null() {
                 let boundary_ok = if partial.strict {
@@ -404,7 +416,7 @@ impl AggregateFnVTable for IsSorted {
                 }
 
                 // Check boundary with previous chunk.
-                if let Some(ref self_last) = partial.last_value {
+                if let Some(self_last) = &partial.last_value {
                     if !self_last.is_null() && !value.is_null() {
                         let boundary_ok = if partial.strict {
                             *self_last < value
@@ -436,7 +448,7 @@ impl AggregateFnVTable for IsSorted {
 
                 // Check boundary with previous chunk.
                 let first_value = array_ref.execute_scalar(0, ctx)?.into_nullable();
-                if let Some(ref self_last) = partial.last_value {
+                if let Some(self_last) = &partial.last_value {
                     if !self_last.is_null() && !first_value.is_null() {
                         let boundary_ok = if partial.strict {
                             *self_last < first_value
@@ -662,10 +674,8 @@ mod tests {
 
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let dtype = DecimalDType::new(19, 2);
-        let i100 =
-            parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale()).unwrap();
-        let i200 =
-            parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale()).unwrap();
+        let i100 = parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale())?;
+        let i200 = parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale())?;
 
         let sorted = buffer![i100, i200, i200];
         let unsorted = buffer![i200, i100, i200];
@@ -689,12 +699,9 @@ mod tests {
 
         let mut ctx = LEGACY_SESSION.create_execution_ctx();
         let dtype = DecimalDType::new(19, 2);
-        let i100 =
-            parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale()).unwrap();
-        let i200 =
-            parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale()).unwrap();
-        let i300 =
-            parse_decimal::<Decimal128Type>("300.00", dtype.precision(), dtype.scale()).unwrap();
+        let i100 = parse_decimal::<Decimal128Type>("100.00", dtype.precision(), dtype.scale())?;
+        let i200 = parse_decimal::<Decimal128Type>("200.00", dtype.precision(), dtype.scale())?;
+        let i300 = parse_decimal::<Decimal128Type>("300.00", dtype.precision(), dtype.scale())?;
 
         let strict_sorted = buffer![i100, i200, i300];
         let sorted = buffer![i100, i200, i200];

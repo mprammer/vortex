@@ -13,6 +13,7 @@ use vortex_session::VortexSession;
 
 use crate::Array;
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::ExecutionResult;
 use crate::IntoArray;
 use crate::array::ArrayId;
@@ -48,24 +49,24 @@ impl Display for ForeignArrayData {
 }
 
 impl ArrayHash for ForeignArrayData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: crate::Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: crate::EqMode) {
         self.metadata.hash(state);
         self.buffers.len().hash(state);
         for buffer in &self.buffers {
-            buffer.array_hash(state, precision);
+            buffer.array_hash(state, accuracy);
         }
     }
 }
 
 impl ArrayEq for ForeignArrayData {
-    fn array_eq(&self, other: &Self, precision: crate::Precision) -> bool {
+    fn array_eq(&self, other: &Self, accuracy: crate::EqMode) -> bool {
         self.metadata == other.metadata
             && self.buffers.len() == other.buffers.len()
             && self
                 .buffers
                 .iter()
                 .zip(other.buffers.iter())
-                .all(|(lhs, rhs)| lhs.array_eq(rhs, precision))
+                .all(|(lhs, rhs)| lhs.array_eq(rhs, accuracy))
     }
 }
 
@@ -89,7 +90,7 @@ impl ValidityVTable<ForeignArray> for ForeignValidityVTable {
 }
 
 impl VTable for ForeignArray {
-    type ArrayData = ForeignArrayData;
+    type TypedArrayData = ForeignArrayData;
     type OperationsVTable = NotSupported;
     type ValidityVTable = ForeignValidityVTable;
 
@@ -99,7 +100,7 @@ impl VTable for ForeignArray {
 
     fn validate(
         &self,
-        _data: &Self::ArrayData,
+        _data: &Self::TypedArrayData,
         _dtype: &DType,
         _len: usize,
         _slots: &[Option<ArrayRef>],
@@ -136,8 +137,8 @@ impl VTable for ForeignArray {
         _session: &VortexSession,
     ) -> VortexResult<ArrayParts<Self>> {
         let child_arrays = (0..children.len())
-            .map(|idx| children.get(idx, dtype, len))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .map(|idx| children.get(idx, dtype, len).map(Some))
+            .collect::<VortexResult<ArraySlots>>()?;
 
         Ok(ArrayParts::new(
             self.clone(),
@@ -145,7 +146,7 @@ impl VTable for ForeignArray {
             len,
             ForeignArrayData::new(metadata.to_vec(), buffers.to_vec()),
         )
-        .with_slots(child_arrays.into_iter().map(Some).collect()))
+        .with_slots(child_arrays))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -166,7 +167,7 @@ pub fn new_foreign_array(
     len: usize,
     metadata: Vec<u8>,
     buffers: Vec<BufferHandle>,
-    children: Vec<ArrayRef>,
+    children: ArraySlots,
 ) -> VortexResult<ArrayRef> {
     Ok(Array::<ForeignArray>::try_from_parts(
         ArrayParts::new(
@@ -175,7 +176,7 @@ pub fn new_foreign_array(
             len,
             ForeignArrayData::new(metadata, buffers),
         )
-        .with_slots(children.into_iter().map(Some).collect()),
+        .with_slots(children),
     )?
     .into_array())
 }

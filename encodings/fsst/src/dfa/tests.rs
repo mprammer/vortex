@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::borrow::Cow;
 use std::sync::LazyLock;
 
 use fsst::ESCAPE_CODE;
@@ -8,6 +9,7 @@ use fsst::Symbol;
 use rstest::rstest;
 use vortex_array::ArrayRef;
 use vortex_array::Canonical;
+use vortex_array::ExecutionCtx;
 use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
 use vortex_array::arrays::BoolArray;
@@ -52,22 +54,53 @@ fn escaped(bytes: &[u8]) -> Vec<u8> {
     codes
 }
 
+fn assert_borrowed_prefix(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Prefix(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected borrowed prefix pattern");
+    };
+    assert!(matches!(actual, Cow::Borrowed(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_owned_prefix(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Prefix(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected owned prefix pattern");
+    };
+    assert!(matches!(actual, Cow::Owned(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_borrowed_contains(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Contains(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected borrowed contains pattern");
+    };
+    assert!(matches!(actual, Cow::Borrowed(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
+fn assert_owned_contains(pattern: &[u8], expected: &[u8]) {
+    let Some(LikeKind::Contains(actual)) = LikeKind::parse(pattern) else {
+        panic!("expected owned contains pattern");
+    };
+    assert!(matches!(actual, Cow::Owned(_)));
+    assert_eq!(actual.as_ref(), expected);
+}
+
 #[test]
-fn test_like_kind_parse() {
-    assert!(matches!(
-        LikeKind::parse(b"http%"),
-        Some(LikeKind::Prefix(b"http"))
-    ));
-    assert!(matches!(
-        LikeKind::parse(b"%needle%"),
-        Some(LikeKind::Contains(b"needle"))
-    ));
-    assert!(matches!(LikeKind::parse(b"%"), Some(LikeKind::Prefix(b""))));
+fn test_like_kind_parse_plain_patterns() {
+    assert_borrowed_prefix(b"http%", b"http");
+    assert_borrowed_contains(b"%needle%", b"needle");
+    assert_borrowed_prefix(b"%", b"");
+}
+
+#[test]
+fn test_like_kind_parse_shapes() {
+    // `%suffix` and multi-contains are pushdown shapes this branch adds on
+    // top of the repo's prefix/contains handling.
     assert!(matches!(
         LikeKind::parse(b"%suffix"),
-        Some(LikeKind::Suffix(b"suffix"))
+        Some(LikeKind::Suffix(s)) if s.as_ref() == b"suffix"
     ));
-    // Multi-contains
     assert!(matches!(
         LikeKind::parse(b"%abc%def%"),
         Some(LikeKind::MultiContains(_))
@@ -76,29 +109,44 @@ fn test_like_kind_parse() {
         LikeKind::parse(b"%a%b%c%"),
         Some(LikeKind::MultiContains(_))
     ));
-    // Consecutive %% in multi-contains is fine (empty segments filtered out)
+    // Consecutive %% in multi-contains is fine (empty segments filtered out).
     assert!(matches!(
         LikeKind::parse(b"%abc%%def%"),
         Some(LikeKind::MultiContains(_))
     ));
-    // Underscore in any segment rejects
-    // `_` is now accepted in anchored shapes (prefix, suffix), where
-    // there's no KMP failure ambiguity.
+    // `_` is accepted in anchored shapes (prefix, suffix), where there's no
+    // KMP failure ambiguity.
     assert!(matches!(
         LikeKind::parse(b"a_c%"),
-        Some(LikeKind::Prefix(b"a_c"))
+        Some(LikeKind::Prefix(p)) if p.as_ref() == b"a_c"
     ));
     assert!(matches!(
         LikeKind::parse(b"%a_c"),
-        Some(LikeKind::Suffix(b"a_c"))
+        Some(LikeKind::Suffix(s)) if s.as_ref() == b"a_c"
     ));
-    // `_` in an unanchored contains is rejected pending a proper
-    // wildcard automaton (KMP failure with wildcards is unsound).
+    // `_` in an unanchored contains is rejected pending a proper wildcard
+    // automaton (KMP failure with wildcards is unsound).
     assert!(LikeKind::parse(b"%a_c%").is_none());
     assert!(LikeKind::parse(b"%abc%d_f%").is_none());
-    // Anchored patterns without a bookend `%` are still unsupported
-    // (mixed-anchor work is a separate item).
+}
+
+#[test]
+fn test_like_kind_parse_escaped_patterns() {
+    assert_owned_prefix(br"\%%", b"%");
+    assert_owned_prefix(br"\_%", b"_");
+    assert_owned_prefix(br"\\%", b"\\");
+    assert_owned_prefix(br"has\%middle%", b"has%middle");
+    assert_owned_contains(br"%\%%", b"%");
+    assert_owned_contains(br"%\_%", b"_");
+    assert_owned_contains(br"%\\%", b"\\");
+    assert_owned_contains(br"%has\%middle%", b"has%middle");
+}
+
+#[test]
+fn test_like_kind_parse_unsupported_patterns() {
     assert!(LikeKind::parse(b"a_c").is_none());
+    assert!(LikeKind::parse(br"%\%").is_none());
+    assert!(LikeKind::parse(br"foo\%bar").is_none());
 }
 
 /// No symbols — all bytes escaped. Simplest case to see the two tables.
@@ -1191,7 +1239,13 @@ fn make_fsst_str(strings: &[Option<&str>]) -> FSSTArray {
     let compressor = fsst_train_compressor(&varbin);
     let len = varbin.len();
     let dtype = varbin.dtype().clone();
-    fsst_compress(varbin, len, &dtype, &compressor)
+    fsst_compress(
+        varbin,
+        len,
+        &dtype,
+        &compressor,
+        &mut SESSION.create_execution_ctx(),
+    )
 }
 
 fn run_like(array: FSSTArray, pattern_arr: ArrayRef) -> VortexResult<BoolArray> {
@@ -1331,7 +1385,7 @@ fn test_random_needles_match_naive_contains() -> VortexResult<()> {
     const N_NEEDLES: usize = 32;
 
     let urls = generate_clickbench_urls(N_STRINGS);
-    let fsst = make_fsst_clickbench_urls(N_STRINGS);
+    let fsst = make_fsst_clickbench_urls(N_STRINGS, &mut SESSION.create_execution_ctx());
 
     let mut rng = StdRng::seed_from_u64(0xCAFE_BABE);
 
@@ -1528,7 +1582,7 @@ fn test_fat_teddy_random_needles_equals_or_of_singles() -> VortexResult<()> {
     const ROUNDS: usize = 8;
 
     let urls = generate_clickbench_urls(N_STRINGS);
-    let fsst = make_fsst_clickbench_urls(N_STRINGS);
+    let fsst = make_fsst_clickbench_urls(N_STRINGS, &mut SESSION.create_execution_ctx());
 
     let mut rng = StdRng::seed_from_u64(0xFADE_C0DE);
     const URL_BYTES: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789-./";
@@ -1576,7 +1630,7 @@ fn test_fat_teddy_equals_or_of_single_matchers() -> VortexResult<()> {
     use crate::test_utils::make_fsst_clickbench_urls;
 
     const N_STRINGS: usize = 1_000;
-    let fsst = make_fsst_clickbench_urls(N_STRINGS);
+    let fsst = make_fsst_clickbench_urls(N_STRINGS, &mut SESSION.create_execution_ctx());
 
     let symbols = fsst.symbols();
     let symbol_lengths = fsst.symbol_lengths();
@@ -1743,7 +1797,7 @@ fn test_planner_matches_legacy_cascade() -> VortexResult<()> {
     //  - `fsst_contains` parametric corpora + needles
     //  - `fsst_contains_{htt,ear,https}_*` short-needle stress benches
     //  - `fsst_not_contains_*` negated benches (negation doesn't affect routing).
-    type CorpusBuilder = fn(usize) -> FSSTArray;
+    type CorpusBuilder = fn(usize, &mut ExecutionCtx) -> FSSTArray;
     let cases: Vec<(&str, CorpusBuilder, &[u8])> = vec![
         ("urls/%google%", make_fsst_short_urls, b"google"),
         ("cb/%yandex%", make_fsst_clickbench_urls, b"yandex"),
@@ -1764,7 +1818,7 @@ fn test_planner_matches_legacy_cascade() -> VortexResult<()> {
     ];
 
     for (label, builder, needle) in cases {
-        let fsst = builder(N_STRINGS);
+        let fsst = builder(N_STRINGS, &mut SESSION.create_execution_ctx());
         let symbols = fsst.symbols();
         let lengths = fsst.symbol_lengths();
         let dfa = FoldedContainsDfa::new(symbols.as_slice(), lengths.as_slice(), needle, false)?;

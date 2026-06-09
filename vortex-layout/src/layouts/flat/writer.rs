@@ -81,8 +81,8 @@ fn truncate_scalar_stat<F: Fn(Scalar) -> Option<(Scalar, bool)>>(
     stat: Stat,
     truncation: F,
 ) {
-    if let Some(sv) = statistics.get(stat) {
-        if let Some((truncated_value, truncated)) = truncation(sv.into_inner()) {
+    if let Some(sv) = statistics.get(stat).into_inner() {
+        if let Some((truncated_value, truncated)) = truncation(sv) {
             if truncated && let Some(v) = truncated_value.into_value() {
                 statistics.set(stat, Precision::Inexact(v));
             }
@@ -201,8 +201,6 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::LEGACY_SESSION;
     use vortex_array::MaskFuture;
-    #[expect(deprecated)]
-    use vortex_array::ToCanonical;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::BoolArray;
     use vortex_array::arrays::Dict;
@@ -262,7 +260,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -275,7 +273,7 @@ mod tests {
 
             assert_eq!(
                 result.statistics().get_as::<bool>(Stat::IsSorted),
-                Some(Precision::Exact(true))
+                Precision::Exact(true)
             );
         })
     }
@@ -313,7 +311,7 @@ mod tests {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -327,16 +325,16 @@ mod tests {
             assert_eq!(
                 result.statistics().get_as::<String>(Stat::Min),
                 // The typo is correct, we need this to be truncated.
-                Some(Precision::Inexact(
+                Precision::Inexact(
                     // spellchecker:ignore-next-line
                     "Another string that's meant to be smaller than the previous valu".to_string()
-                ))
+                )
             );
             assert_eq!(
                 result.statistics().get_as::<String>(Stat::Max),
-                Some(Precision::Inexact(
+                Precision::Inexact(
                     "Long value to test that the statistics are actually truncated, j".to_string()
-                ))
+                )
             );
         })
     }
@@ -344,6 +342,7 @@ mod tests {
     #[test]
     fn struct_array_round_trip() {
         block_on(|handle| async {
+            let mut ctx_exec = LEGACY_SESSION.create_execution_ctx();
             let session = SESSION.clone().with_handle(handle);
             let mut validity_builder = BitBufferMut::with_capacity(2);
             validity_builder.append(true);
@@ -385,7 +384,7 @@ mod tests {
 
             // We should be able to read the array we just wrote.
             let result: ArrayRef = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -400,26 +399,29 @@ mod tests {
                 result
                     .validity()
                     .unwrap()
-                    .to_mask(result.len(), &mut LEGACY_SESSION.create_execution_ctx())
+                    .execute_mask(result.len(), &mut ctx_exec)
                     .unwrap()
                     .bit_buffer(),
                 AllOr::Some(&validity_boolean_buffer)
             );
-            #[expect(deprecated)]
-            let result_struct = result.to_struct();
-            #[expect(deprecated)]
+            let result_struct = result
+                .clone()
+                .execute::<StructArray>(&mut ctx_exec)
+                .unwrap();
             let field_a = result_struct
                 .unmasked_field_by_name("a")
                 .unwrap()
-                .to_primitive();
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx_exec)
+                .unwrap();
             assert_eq!(field_a.as_slice::<u64>(), &[1, 2]);
-            #[expect(deprecated)]
-            let result_struct_b = result.to_struct();
-            #[expect(deprecated)]
+            let result_struct_b = result.execute::<StructArray>(&mut ctx_exec).unwrap();
             let field_b = result_struct_b
                 .unmasked_field_by_name("b")
                 .unwrap()
-                .to_primitive();
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx_exec)
+                .unwrap();
             assert_eq!(field_b.as_slice::<u64>(), &[3, 4]);
         })
     }

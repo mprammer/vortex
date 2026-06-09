@@ -12,25 +12,26 @@ use vortex_array::arrays::fixed_size_list::FixedSizeListArrayExt;
 use vortex_error::VortexResult;
 
 use super::*;
+use crate::encodings::turboquant::centroids::compute_or_get_centroids;
 
-/// Verify that the centroids stored in the DictArray match what `get_centroids()` computes.
+/// Verify that the centroids stored in the DictArray match what `compute_or_get_centroids()` computes.
 #[test]
 fn stored_centroids_match_computed() -> VortexResult<()> {
     let fsl = make_fsl(10, 128, 42);
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 3,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     let (_codes, centroids, _norms) = unwrap_codes_centroids_norms(&encoded, &mut ctx)?;
     let stored = centroids.as_slice::<f32>();
 
     // padded_dim for dim=128 is 128.
-    let computed = crate::encodings::turboquant::centroids::get_centroids(128, 3)?;
+    let computed = compute_or_get_centroids(128, 3)?;
 
     assert_eq!(stored.len(), computed.len());
     for i in 0..stored.len() {
@@ -46,13 +47,13 @@ fn seed_deterministic_rotation_produces_correct_decode() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 4,
     };
 
     // Encode twice with the same seed → should produce identical results.
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded1 = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded1 = turboquant_encode(ext.clone(), &config, &mut ctx)?;
     let decoded1 = encoded1.execute::<ExtensionArray>(&mut ctx)?;
     let fsl1 = decoded1
         .storage_array()
@@ -64,7 +65,7 @@ fn seed_deterministic_rotation_produces_correct_decode() -> VortexResult<()> {
         .execute::<PrimitiveArray>(&mut ctx)?;
 
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded2 = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded2 = turboquant_encode(ext, &config, &mut ctx)?;
     let decoded2 = encoded2.execute::<ExtensionArray>(&mut ctx)?;
     let fsl2 = decoded2
         .storage_array()
@@ -90,11 +91,11 @@ fn encoded_dtype_is_vector_extension() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 2,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     assert!(
         encoded.dtype().is_extension(),
@@ -115,11 +116,11 @@ fn cosine_similarity_quantized_accuracy() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 4,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 3,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     let input_prim = fsl.elements().clone().execute::<PrimitiveArray>(&mut ctx)?;
     let input_f32 = input_prim.as_slice::<f32>();
@@ -172,11 +173,11 @@ fn dot_product_quantized_accuracy() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 8,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 3,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     let input_prim = fsl.elements().clone().execute::<PrimitiveArray>(&mut ctx)?;
     let input_f32 = input_prim.as_slice::<f32>();
@@ -223,20 +224,20 @@ fn dot_product_quantized_accuracy() -> VortexResult<()> {
     reason = "test uses known small dimensions"
 )]
 fn sorf_transform_roundtrip_isolation() -> VortexResult<()> {
+    use vortex_array::EmptyMetadata;
     use vortex_array::IntoArray;
     use vortex_array::arrays::dict::DictArray;
     use vortex_array::dtype::extension::ExtDType;
-    use vortex_array::extension::EmptyMetadata;
     use vortex_array::validity::Validity;
     use vortex_buffer::BufferMut;
 
     use crate::encodings::turboquant::centroids::compute_centroid_boundaries;
+    use crate::encodings::turboquant::centroids::compute_or_get_centroids;
     use crate::encodings::turboquant::centroids::find_nearest_centroid;
-    use crate::encodings::turboquant::centroids::get_centroids;
     use crate::scalar_fns::sorf_transform::SorfMatrix;
     use crate::scalar_fns::sorf_transform::SorfOptions;
     use crate::scalar_fns::sorf_transform::SorfTransform;
-    use crate::vector::Vector;
+    use crate::types::vector::Vector;
 
     let dim = 128usize;
     let seed = 99u64;
@@ -259,9 +260,9 @@ fn sorf_transform_roundtrip_isolation() -> VortexResult<()> {
     }
 
     // Forward transform + quantize (mimicking what turboquant_quantize_core does).
-    let rotation = SorfMatrix::try_new(seed, dim, num_rounds as usize)?;
-    let padded_dim = rotation.padded_dim();
-    let centroids = get_centroids(padded_dim as u32, 8)?;
+    let padded_dim = dim.next_power_of_two();
+    let rotation = SorfMatrix::try_new_padded(padded_dim, num_rounds as usize, seed)?;
+    let centroids = compute_or_get_centroids(padded_dim as u32, 8)?;
     let boundaries = compute_centroid_boundaries(&centroids);
 
     let mut all_indices = BufferMut::<u8>::with_capacity(num_rows * padded_dim);
@@ -299,7 +300,7 @@ fn sorf_transform_roundtrip_isolation() -> VortexResult<()> {
     let sorf_options = SorfOptions {
         seed,
         num_rounds,
-        dimension: dim as u32,
+        dimensions: dim as u32,
         element_ptype: vortex_array::dtype::PType::F32,
     };
     let sorf_array =

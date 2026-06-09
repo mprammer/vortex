@@ -1,13 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::collections::BTreeSet;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
 
 use futures::FutureExt;
 use futures::future::BoxFuture;
+use tracing::trace;
 use vortex_array::ArrayRef;
 use vortex_array::MaskFuture;
 use vortex_array::VortexSessionExecute;
@@ -20,9 +20,11 @@ use vortex_error::VortexResult;
 use vortex_mask::Mask;
 use vortex_session::VortexSession;
 
-use crate::LayoutReader;
 use crate::layouts::SharedArrayFuture;
 use crate::layouts::flat::FlatLayout;
+use crate::reader::LayoutReader;
+use crate::reader::RowSplits;
+use crate::reader::SplitRange;
 use crate::segments::SegmentSource;
 
 /// The threshold of mask density below which we will evaluate the expression only over the
@@ -102,10 +104,11 @@ impl LayoutReader for FlatReader {
     fn register_splits(
         &self,
         _field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        splits.insert(row_range.start + self.layout.row_count);
+        split_range.check_bounds(self.layout.row_count)?;
+        splits.push(split_range.root_row_range().end);
         Ok(())
     }
 
@@ -164,7 +167,7 @@ impl LayoutReader for FlatReader {
                 mask.bitand(&array_mask)
             };
 
-            tracing::debug!(
+            trace!(
                 "Flat mask evaluation {} - {} (mask = {}) => {}",
                 name,
                 expr,
@@ -191,7 +194,7 @@ impl LayoutReader for FlatReader {
         let expr = expr.clone();
 
         Ok(async move {
-            tracing::debug!("Flat array evaluation {} - {}", name, expr);
+            trace!("Flat array evaluation {} - {}", name, expr);
 
             let mut array = array.clone().await?;
             let mask = mask.await?;
@@ -215,6 +218,10 @@ impl LayoutReader for FlatReader {
             Ok(array)
         }
         .boxed())
+    }
+
+    fn as_any(&self) -> &dyn std::any::Any {
+        self
     }
 }
 
@@ -269,7 +276,7 @@ mod test {
             );
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)?
+                .new_reader("".into(), segments, &SESSION, &Default::default())?
                 .projection_evaluation(
                     &(0..layout.row_count()),
                     &root(),
@@ -306,7 +313,7 @@ mod test {
 
             let expr = gt(root(), lit(3i32));
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(
                     &(0..layout.row_count()),
@@ -343,7 +350,7 @@ mod test {
                 .unwrap();
 
             let result = layout
-                .new_reader("".into(), segments, &SESSION)
+                .new_reader("".into(), segments, &SESSION, &Default::default())
                 .unwrap()
                 .projection_evaluation(&(2..4), &root(), MaskFuture::new_true(2))
                 .unwrap()

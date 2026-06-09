@@ -77,6 +77,28 @@ impl FlatContainsDfa {
         needle: &[u8],
         case_insensitive: bool,
     ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, needle, case_insensitive, true)
+    }
+
+    /// Like [`Self::new`] but matches every needle byte literally — the `_`
+    /// wildcard sentinel is disabled. Used for SQL-escaped needles where a
+    /// literal underscore (`\_`) must match only `_`.
+    pub(crate) fn new_literal(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        needle: &[u8],
+        case_insensitive: bool,
+    ) -> VortexResult<Self> {
+        Self::build(symbols, symbol_lengths, needle, case_insensitive, false)
+    }
+
+    fn build(
+        symbols: &[Symbol],
+        symbol_lengths: &[u8],
+        needle: &[u8],
+        case_insensitive: bool,
+        wildcards: bool,
+    ) -> VortexResult<Self> {
         if needle.len() > Self::MAX_NEEDLE_LEN {
             vortex_bail!(
                 "needle length {} exceeds maximum {} for flat contains DFA",
@@ -90,7 +112,7 @@ impl FlatContainsDfa {
         let n_states = accept_state + 1;
         let sentinel = n_states;
 
-        let byte_table = kmp_byte_transitions(needle, case_insensitive);
+        let byte_table = kmp_byte_transitions(needle, case_insensitive, wildcards);
         let sym_trans =
             build_symbol_transitions(symbols, symbol_lengths, &byte_table, n_states, accept_state);
         let transitions = build_fused_table(&sym_trans, symbols.len(), n_states, |_| sentinel, 0);

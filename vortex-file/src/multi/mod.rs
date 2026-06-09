@@ -22,8 +22,8 @@ use vortex_scan::DataSource;
 use vortex_session::VortexSession;
 
 use crate::OpenOptionsSessionExt;
+use crate::VortexFile;
 use crate::VortexOpenOptions;
-use crate::v2::FileStatsLayoutReader;
 
 /// A builder that discovers multiple Vortex files from glob patterns and constructs a
 /// [`MultiLayoutDataSource`] to scan them as a single data source.
@@ -77,9 +77,20 @@ impl MultiFileDataSource {
     ///
     /// The glob path should be relative to the filesystem's base URL. Pass `None` for the
     /// filesystem to use the local filesystem (auto-created in [`Self::build`]).
+    ///
+    /// Relative paths are resolved against the process working directory.
     pub fn with_glob(mut self, glob: impl Into<String>, fs: Option<FileSystemRef>) -> Self {
-        let glob_str = glob.into().trim_start_matches('/').to_string();
-        self.glob_sources.push((glob_str, fs));
+        let glob = glob.into();
+        let glob = if fs.is_none() && std::path::Path::new(&glob).is_relative() {
+            std::env::current_dir()
+                .map(|cwd| cwd.join(&glob).to_string_lossy().into_owned())
+                .unwrap_or(glob)
+                .trim_start_matches('/')
+                .to_string()
+        } else {
+            glob.trim_start_matches('/').to_string()
+        };
+        self.glob_sources.push((glob, fs));
         self
     }
 
@@ -98,7 +109,7 @@ impl MultiFileDataSource {
     ///
     /// Discovers files via glob, opens the first file eagerly to determine the schema,
     /// and creates lazy factories for the remaining files.
-    pub async fn build(self) -> VortexResult<impl DataSource> {
+    pub async fn build(self) -> VortexResult<MultiLayoutDataSource> {
         if self.glob_sources.is_empty() {
             vortex_bail!("MultiFileDataSource requires at least one glob pattern");
         }
@@ -140,14 +151,9 @@ impl MultiFileDataSource {
 
         // Open first file eagerly for dtype.
         let (first_file_listing, first_fs) = &all_files[0];
-        let first_file = open_file(
-            first_fs,
-            first_file_listing,
-            &self.session,
-            self.open_options_fn.as_ref(),
-        )
-        .await?;
-        let first_reader = layout_reader_with_stats(&first_file)?;
+        let open_fn = self.open_options_fn.as_ref();
+        let first_file = open_file(first_fs, first_file_listing, &self.session, open_fn).await?;
+        let first_reader = first_file.layout_reader()?;
 
         let factories: Vec<Arc<dyn LayoutReaderFactory>> = all_files[1..]
             .iter()
@@ -197,8 +203,8 @@ async fn open_file(
     file: &FileListing,
     session: &VortexSession,
     open_options_fn: &(dyn Fn(VortexOpenOptions) -> VortexOpenOptions + Send + Sync),
-) -> VortexResult<crate::VortexFile> {
-    debug!(path = %file.path, "opening vortex file");
+) -> VortexResult<VortexFile> {
+    tracing::trace!(path = %file.path, "opening vortex file");
 
     // Open the reader first so we can use its URI as the cache key.
     // The URI includes the full path (with any filesystem prefix), making it unique
@@ -231,20 +237,6 @@ async fn open_file(
     Ok(vortex_file)
 }
 
-/// Creates a layout reader from a VortexFile, wrapping with `FileStatsLayoutReader` when
-/// file-level statistics are available.
-fn layout_reader_with_stats(file: &crate::VortexFile) -> VortexResult<LayoutReaderRef> {
-    let mut reader = file.layout_reader()?;
-    if let Some(stats) = file.file_stats().cloned() {
-        reader = Arc::new(FileStatsLayoutReader::new(
-            reader,
-            stats,
-            file.session.clone(),
-        ));
-    }
-    Ok(reader)
-}
-
 /// A [`LayoutReaderFactory`] that lazily opens a single Vortex file and returns its layout reader.
 struct VortexFileReaderFactory {
     fs: FileSystemRef,
@@ -263,6 +255,7 @@ impl LayoutReaderFactory for VortexFileReaderFactory {
             self.open_options_fn.as_ref(),
         )
         .await?;
-        Ok(Some(layout_reader_with_stats(&file)?))
+
+        Ok(Some(file.layout_reader()?))
     }
 }

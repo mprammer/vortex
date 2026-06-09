@@ -95,12 +95,12 @@ impl DataSource for LayoutReaderDataSource {
         self.reader.dtype()
     }
 
-    fn row_count(&self) -> Option<Precision<u64>> {
-        Some(Precision::exact(self.reader.row_count()))
+    fn row_count(&self) -> Precision<u64> {
+        Precision::exact(self.reader.row_count())
     }
 
-    fn byte_size(&self) -> Option<Precision<u64>> {
-        None
+    fn byte_size(&self) -> Precision<u64> {
+        Precision::Absent
     }
 
     fn deserialize_partition(
@@ -139,7 +139,7 @@ impl DataSource for LayoutReaderDataSource {
 
         // Check file-level pruning: if the filter can be proven false for the entire row range
         // using file-level statistics (e.g. via FileStatsLayoutReader), skip the scan entirely.
-        if let Some(ref filter) = scan_request.filter {
+        if let Some(filter) = &scan_request.filter {
             let mask = Mask::new_true(
                 usize::try_from(row_range.end - row_range.start).unwrap_or(usize::MAX),
             );
@@ -198,12 +198,12 @@ impl DataSourceScan for LayoutReaderScan {
         &self.dtype
     }
 
-    fn partition_count(&self) -> Option<Precision<usize>> {
+    fn partition_count(&self) -> Precision<usize> {
         let (lower, upper) = self.size_hint();
         match upper {
-            Some(u) if u == lower => Some(Precision::exact(lower)),
-            Some(u) => Some(Precision::inexact(u)),
-            None => Some(Precision::inexact(lower)),
+            Some(u) if u == lower => Precision::exact(lower),
+            Some(u) => Precision::inexact(u),
+            None => Precision::inexact(lower),
         }
     }
 
@@ -289,20 +289,26 @@ impl Partition for LayoutReaderSplit {
         self
     }
 
-    fn row_count(&self) -> Option<Precision<u64>> {
+    #[expect(clippy::cast_possible_truncation)]
+    fn index(&self) -> usize {
+        // Row range is unique per split
+        self.row_range.start as usize
+    }
+
+    fn row_count(&self) -> Precision<u64> {
         let row_count = self.row_range.end - self.row_range.start;
         let row_count = self.selection.row_count(row_count);
         let row_count = self.limit.map_or(row_count, |limit| row_count.min(limit));
 
-        Some(if self.filter.is_some() {
+        if self.filter.is_some() {
             Precision::inexact(row_count)
         } else {
             Precision::exact(row_count)
-        })
+        }
     }
 
-    fn byte_size(&self) -> Option<Precision<u64>> {
-        None
+    fn byte_size(&self) -> Precision<u64> {
+        Precision::Absent
     }
 
     fn execute(self: Box<Self>) -> VortexResult<SendableArrayStream> {
@@ -337,8 +343,8 @@ impl DataSourceScan for Empty {
         &self.dtype
     }
 
-    fn partition_count(&self) -> Option<Precision<usize>> {
-        Some(Precision::exact(1usize))
+    fn partition_count(&self) -> Precision<usize> {
+        Precision::exact(1usize)
     }
 
     fn partitions(self: Box<Self>) -> PartitionStream {
@@ -351,12 +357,16 @@ impl Partition for Empty {
         self
     }
 
-    fn row_count(&self) -> Option<Precision<u64>> {
-        Some(Precision::exact(self.row_count))
+    fn index(&self) -> usize {
+        0
     }
 
-    fn byte_size(&self) -> Option<Precision<u64>> {
-        Some(Precision::exact(0u64))
+    fn row_count(&self) -> Precision<u64> {
+        Precision::exact(self.row_count)
+    }
+
+    fn byte_size(&self) -> Precision<u64> {
+        Precision::exact(0u64)
     }
 
     fn execute(mut self: Box<Self>) -> VortexResult<SendableArrayStream> {

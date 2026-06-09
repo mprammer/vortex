@@ -16,14 +16,15 @@ use vortex_session::registry::CachedId;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::fixed_size_list::FixedSizeListData;
+use crate::arrays::fixed_size_list::array::ELEMENTS_SLOT;
 use crate::arrays::fixed_size_list::array::NUM_SLOTS;
 use crate::arrays::fixed_size_list::array::SLOT_NAMES;
 use crate::arrays::fixed_size_list::compute::rules::PARENT_RULES;
@@ -42,21 +43,19 @@ pub type FixedSizeListArray = Array<FixedSizeList>;
 pub struct FixedSizeList;
 
 impl ArrayHash for FixedSizeListData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        let _precision = precision;
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.degenerate_len.hash(state);
     }
 }
 
 impl ArrayEq for FixedSizeListData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        let _precision = precision;
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.degenerate_len == other.degenerate_len
     }
 }
 
 impl VTable for FixedSizeList {
-    type ArrayData = FixedSizeListData;
+    type TypedArrayData = FixedSizeListData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -116,7 +115,7 @@ impl VTable for FixedSizeList {
         let DType::FixedSizeList(_, list_size, nullability) = dtype else {
             vortex_bail!("Expected `DType::FixedSizeList`, got {dtype:?}");
         };
-        let elements = slots[crate::arrays::fixed_size_list::array::ELEMENTS_SLOT]
+        let elements = slots[ELEMENTS_SLOT]
             .as_ref()
             .vortex_expect("FixedSizeListArray elements slot");
         vortex_ensure!(

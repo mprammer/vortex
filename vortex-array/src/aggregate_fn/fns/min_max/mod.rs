@@ -46,14 +46,8 @@ static NAMES: LazyLock<FieldNames> = LazyLock::new(|| FieldNames::from(["min", "
 /// This will update the stats set of the array as a side effect.
 pub fn min_max(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<MinMaxResult>> {
     // Short-circuit using cached array statistics.
-    let cached_min = array
-        .statistics()
-        .get(Stat::Min)
-        .and_then(Precision::as_exact);
-    let cached_max = array
-        .statistics()
-        .get(Stat::Max)
-        .and_then(Precision::as_exact);
+    let cached_min = array.statistics().get(Stat::Min).as_exact();
+    let cached_max = array.statistics().get(Stat::Max).as_exact();
     if let Some((min, max)) = cached_min.zip(cached_max) {
         let non_nullable_dtype = array.dtype().as_nonnullable();
         return Ok(Some(MinMaxResult {
@@ -67,8 +61,8 @@ pub fn min_max(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<
         return Ok(None);
     }
 
-    // Short-circuit for unsupported dtypes.
-    if MinMax.return_dtype(&EmptyOptions, array.dtype()).is_none() {
+    // Short-circuit for dtypes this helper cannot currently compute.
+    if !minmax_compute_supported_dtype(array.dtype()) {
         return Ok(None);
     }
 
@@ -79,7 +73,7 @@ pub fn min_max(array: &ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Option<
     let result = MinMaxResult::from_scalar(result_scalar)?;
 
     // Cache the computed min/max as statistics.
-    if let Some(ref r) = result {
+    if let Some(r) = &result {
         if let Some(min_value) = r.min.value() {
             array
                 .statistics()
@@ -168,6 +162,37 @@ pub fn make_minmax_dtype(element_dtype: &DType) -> DType {
     )
 }
 
+fn minmax_supported_dtype(input_dtype: &DType) -> bool {
+    match input_dtype {
+        DType::Bool(_)
+        | DType::Primitive(..)
+        | DType::Decimal(..)
+        | DType::Utf8(..)
+        | DType::Binary(..)
+        | DType::Extension(..) => true,
+        DType::List(element_dtype, _) => minmax_supported_dtype(element_dtype),
+        DType::FixedSizeList(element_dtype, ..) => minmax_supported_dtype(element_dtype),
+        _ => false,
+    }
+}
+
+/// Returns whether [`min_max`] can currently compute extrema for this logical dtype.
+///
+/// This is intentionally narrower than [`minmax_supported_dtype`]. List and fixed-size-list
+/// extrema have a defined output dtype for aggregate expression lowering, but the accumulator does
+/// not yet implement lexicographic list comparison.
+fn minmax_compute_supported_dtype(input_dtype: &DType) -> bool {
+    matches!(
+        input_dtype,
+        DType::Bool(_)
+            | DType::Primitive(..)
+            | DType::Decimal(..)
+            | DType::Utf8(..)
+            | DType::Binary(..)
+            | DType::Extension(..)
+    )
+}
+
 impl AggregateFnVTable for MinMax {
     type Options = EmptyOptions;
     type Partial = MinMaxPartial;
@@ -177,19 +202,11 @@ impl AggregateFnVTable for MinMax {
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
-        unimplemented!("MinMax is not yet serializable");
+        Ok(None)
     }
 
     fn return_dtype(&self, _options: &Self::Options, input_dtype: &DType) -> Option<DType> {
-        match input_dtype {
-            DType::Bool(_)
-            | DType::Primitive(..)
-            | DType::Decimal(..)
-            | DType::Utf8(..)
-            | DType::Binary(..)
-            | DType::Extension(..) => Some(make_minmax_dtype(input_dtype)),
-            _ => None,
-        }
+        minmax_supported_dtype(input_dtype).then(|| make_minmax_dtype(input_dtype))
     }
 
     fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
@@ -284,6 +301,8 @@ impl AggregateFnVTable for MinMax {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use vortex_buffer::BitBuffer;
     use vortex_buffer::buffer;
     use vortex_error::VortexExpect;
@@ -298,11 +317,14 @@ mod tests {
     use crate::aggregate_fn::EmptyOptions;
     use crate::aggregate_fn::fns::min_max::MinMax;
     use crate::aggregate_fn::fns::min_max::MinMaxResult;
+    use crate::aggregate_fn::fns::min_max::make_minmax_dtype;
     use crate::aggregate_fn::fns::min_max::min_max;
     use crate::arrays::BoolArray;
     use crate::arrays::ChunkedArray;
     use crate::arrays::ConstantArray;
     use crate::arrays::DecimalArray;
+    use crate::arrays::FixedSizeListArray;
+    use crate::arrays::ListArray;
     use crate::arrays::NullArray;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::VarBinArray;
@@ -324,6 +346,32 @@ mod tests {
             Some(MinMaxResult {
                 min: 1.into(),
                 max: 3.into()
+            })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_prim_min_max_multiple_null_runs() -> VortexResult<()> {
+        // Several disjoint valid runs separated by nulls exercise the per-run fold; the extrema
+        // (min 1, max 9) fall in different runs.
+        let p = PrimitiveArray::from_option_iter([
+            Some(5i32),
+            Some(3),
+            None,
+            None,
+            Some(9),
+            None,
+            Some(1),
+            Some(7),
+        ])
+        .into_array();
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        assert_eq!(
+            min_max(&p, &mut ctx)?,
+            Some(MinMaxResult {
+                min: 1.into(),
+                max: 9.into()
             })
         );
         Ok(())
@@ -451,7 +499,7 @@ mod tests {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         let mut state = MinMax.empty_partial(&EmptyOptions, &dtype)?;
 
-        let struct_dtype = crate::aggregate_fn::fns::min_max::make_minmax_dtype(&dtype);
+        let struct_dtype = make_minmax_dtype(&dtype);
         let scalar1 = Scalar::struct_(
             struct_dtype.clone(),
             vec![Scalar::from(5i32), Scalar::from(15i32)],
@@ -549,6 +597,47 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn list_and_fixed_size_list_return_dtype() {
+        let element_dtype = DType::Primitive(PType::I32, Nullability::Nullable);
+        let list_dtype = DType::List(Arc::new(element_dtype.clone()), Nullability::Nullable);
+        let fixed_size_list_dtype =
+            DType::FixedSizeList(Arc::new(element_dtype), 1, Nullability::Nullable);
+
+        assert_eq!(
+            MinMax.return_dtype(&EmptyOptions, &list_dtype),
+            Some(make_minmax_dtype(&list_dtype))
+        );
+        assert_eq!(
+            MinMax.return_dtype(&EmptyOptions, &fixed_size_list_dtype),
+            Some(make_minmax_dtype(&fixed_size_list_dtype))
+        );
+    }
+
+    #[test]
+    fn list_and_fixed_size_list_min_max_returns_none() -> VortexResult<()> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+
+        let list_array = ListArray::try_new(
+            buffer![1i32, 2, 3].into_array(),
+            buffer![0u32, 2, 3].into_array(),
+            Validity::NonNullable,
+        )?
+        .into_array();
+        assert_eq!(min_max(&list_array, &mut ctx)?, None);
+
+        let fixed_size_list_array = FixedSizeListArray::try_new(
+            buffer![1i32, 2, 3, 4].into_array(),
+            2,
+            Validity::NonNullable,
+            2,
+        )?
+        .into_array();
+        assert_eq!(min_max(&fixed_size_list_array, &mut ctx)?, None);
+
+        Ok(())
+    }
+
     use crate::dtype::half::f16;
 
     #[test]
@@ -634,6 +723,35 @@ mod tests {
             Some(MinMaxResult {
                 min: Scalar::bool(true, Nullability::NonNullable),
                 max: Scalar::bool(true, Nullability::NonNullable),
+            })
+        );
+        Ok(())
+    }
+
+    /// Regression test for <https://github.com/vortex-data/vortex/issues/8145>.
+    ///
+    /// A chunked array whose first chunk is an *empty* constant array — as produced by
+    /// `fill_null` on an empty all-null chunk — returned `max = u32::MAX` because
+    /// `ChunkedArrayAggregate` accumulated the empty chunk, folding its fill scalar into the
+    /// running min/max. Empty chunks are now skipped during chunked aggregation.
+    #[test]
+    fn test_chunked_with_empty_constant_chunk() -> VortexResult<()> {
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+
+        let empty = ConstantArray::new(Scalar::primitive(u32::MAX, Nullability::NonNullable), 0)
+            .into_array();
+        let chunk1 = PrimitiveArray::new(buffer![7631471u32], Validity::NonNullable).into_array();
+        let chunk2 = PrimitiveArray::new(buffer![0u32], Validity::NonNullable).into_array();
+        let chunked = ChunkedArray::try_new(
+            vec![empty, chunk1, chunk2],
+            DType::Primitive(PType::U32, Nullability::NonNullable),
+        )?;
+
+        assert_eq!(
+            min_max(&chunked.into_array(), &mut ctx)?,
+            Some(MinMaxResult {
+                min: Scalar::primitive(0u32, Nullability::NonNullable),
+                max: Scalar::primitive(7631471u32, Nullability::NonNullable),
             })
         );
         Ok(())

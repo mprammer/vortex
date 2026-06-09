@@ -16,6 +16,7 @@ mod file;
 mod log;
 mod macros;
 mod ptype;
+mod scalar;
 mod scan;
 mod session;
 mod sink;
@@ -46,15 +47,6 @@ static RUNTIME: LazyLock<CurrentThreadRuntime> = LazyLock::new(CurrentThreadRunt
 pub(crate) unsafe fn to_string(ptr: *const c_char) -> String {
     let c_str = unsafe { CStr::from_ptr(ptr) };
     c_str.to_string_lossy().into_owned()
-}
-
-pub(crate) unsafe fn to_string_vec(ptr: *const *const c_char, len: usize) -> Vec<String> {
-    #[expect(clippy::expect_used)]
-    (0..len)
-        .map(|i: usize| unsafe {
-            to_string(*ptr.offset(i.try_into().expect("pointer offset overflow")))
-        })
-        .collect()
 }
 
 /// SAFETY: name must be a non-NULL pointer

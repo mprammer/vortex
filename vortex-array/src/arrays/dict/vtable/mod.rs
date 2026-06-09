@@ -5,7 +5,7 @@ use std::hash::Hasher;
 
 use kernel::PARENT_KERNELS;
 use prost::Message;
-use vortex_error::VortexExpect;
+use smallvec::smallvec;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -16,17 +16,19 @@ use vortex_session::registry::CachedId;
 
 use super::DictData;
 use super::DictMetadata;
+use super::DictOwnedExt;
+use super::DictParts;
 use super::array::DictSlots;
 use super::array::DictSlotsView;
-use super::take_canonical;
 use crate::AnyCanonical;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::Canonical;
-use crate::Precision;
+use crate::EqMode;
 use crate::array::Array;
 use crate::array::ArrayId;
+use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::ConstantArray;
@@ -34,6 +36,7 @@ use crate::arrays::Primitive;
 use crate::arrays::dict::DictArrayExt;
 use crate::arrays::dict::DictArraySlotsExt;
 use crate::arrays::dict::compute::rules::PARENT_RULES;
+use crate::arrays::dict::execute::take_canonical;
 use crate::buffer::BufferHandle;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
@@ -43,6 +46,8 @@ use crate::executor::ExecutionResult;
 use crate::require_child;
 use crate::scalar::Scalar;
 use crate::serde::ArrayChildren;
+use crate::validity::Validity;
+
 mod kernel;
 mod operations;
 mod validity;
@@ -54,17 +59,17 @@ pub type DictArray = Array<Dict>;
 pub struct Dict;
 
 impl ArrayHash for DictData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for DictData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
 
 impl VTable for Dict {
-    type ArrayData = DictData;
+    type TypedArrayData = DictData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -132,11 +137,10 @@ impl VTable for Dict {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = DictMetadata::decode(metadata)?;
         if children.len() != 2 {
             vortex_bail!(
@@ -155,12 +159,10 @@ impl VTable for Dict {
         let values = children.get(1, dtype, metadata.values_len as usize)?;
         let all_values_referenced = metadata.all_values_referenced.unwrap_or(false);
 
-        Ok(
-            crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, unsafe {
-                DictData::new_unchecked().set_all_values_referenced(all_values_referenced)
-            })
-            .with_slots(vec![Some(codes), Some(values)]),
-        )
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, unsafe {
+            DictData::new_unchecked().set_all_values_referenced(all_values_referenced)
+        })
+        .with_slots(smallvec![Some(codes), Some(values)]))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {
@@ -177,10 +179,7 @@ impl VTable for Dict {
 
         let array = require_child!(array, array.codes(), DictSlots::CODES => Primitive);
 
-        // TODO(joe): use stat get instead computing.
-        // Also not the check to do here it take value validity using code validity, but this approx
-        // is correct.
-        if array.codes().all_invalid(ctx)? {
+        if matches!(array.codes().validity()?, Validity::AllInvalid) {
             return Ok(ExecutionResult::done(ConstantArray::new(
                 Scalar::null(array.dtype().as_nullable()),
                 array.codes().len(),
@@ -189,18 +188,13 @@ impl VTable for Dict {
 
         let array = require_child!(array, array.values(), DictSlots::VALUES => AnyCanonical);
 
-        let codes = array
-            .codes()
-            .clone()
-            .try_downcast::<Primitive>()
-            .ok()
-            .vortex_expect("must be primitive");
-        let values = array.values().clone();
-        debug_assert!(values.is_canonical());
-        // TODO: add canonical owned cast.
-        let values = values.execute::<Canonical>(ctx)?;
+        let DictParts { values, codes, .. } = array.into_parts();
 
-        Ok(ExecutionResult::done(take_canonical(values, &codes, ctx)?))
+        Ok(ExecutionResult::done(take_canonical(
+            values.as_::<AnyCanonical>(),
+            &codes.downcast::<Primitive>(),
+            ctx,
+        )?))
     }
 
     fn reduce_parent(

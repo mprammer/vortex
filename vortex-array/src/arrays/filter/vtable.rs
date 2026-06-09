@@ -18,8 +18,8 @@ use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
 use crate::Canonical;
+use crate::EqMode;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
 use crate::array::ArrayView;
@@ -32,6 +32,7 @@ use crate::arrays::filter::array::FilterData;
 use crate::arrays::filter::array::SLOT_NAMES;
 use crate::arrays::filter::execute::execute_filter;
 use crate::arrays::filter::execute::execute_filter_fast_paths;
+use crate::arrays::filter::kernel::PARENT_KERNELS;
 use crate::arrays::filter::rules::PARENT_RULES;
 use crate::arrays::filter::rules::RULES;
 use crate::buffer::BufferHandle;
@@ -50,19 +51,19 @@ pub type FilterArray = Array<Filter>;
 pub struct Filter;
 
 impl ArrayHash for FilterData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.mask.array_hash(state, precision);
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
+        self.mask.array_hash(state, accuracy);
     }
 }
 
 impl ArrayEq for FilterData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.mask.array_eq(&other.mask, precision)
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
+        self.mask.array_eq(&other.mask, accuracy)
     }
 }
 
 impl VTable for Filter {
-    type ArrayData = FilterData;
+    type TypedArrayData = FilterData;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
     fn id(&self) -> ArrayId {
@@ -72,7 +73,7 @@ impl VTable for Filter {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -168,6 +169,15 @@ impl VTable for Filter {
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         PARENT_RULES.evaluate(array, parent, child_idx)
+    }
+
+    fn execute_parent(
+        array: ArrayView<'_, Self>,
+        parent: &ArrayRef,
+        child_idx: usize,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<Option<ArrayRef>> {
+        PARENT_KERNELS.execute(array, parent, child_idx, ctx)
     }
 
     fn reduce(array: ArrayView<'_, Self>) -> VortexResult<Option<ArrayRef>> {

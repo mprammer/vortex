@@ -6,6 +6,7 @@ use std::fmt::Formatter;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use smallvec::smallvec;
 use vortex_buffer::Alignment;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
@@ -16,7 +17,9 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
-use crate::ArrayRef;
+use crate::ArraySlots;
+use crate::LEGACY_SESSION;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
@@ -124,8 +127,8 @@ impl VarBinViewData {
     }
 
     /// Build the slots vector for this array.
-    pub(super) fn make_slots(validity: &Validity, len: usize) -> Vec<Option<ArrayRef>> {
-        vec![validity_to_child(validity, len)]
+    pub(super) fn make_slots(validity: &Validity, len: usize) -> ArraySlots {
+        smallvec![validity_to_child(validity, len)]
     }
 
     /// Creates a new `VarBinViewArray`.
@@ -315,11 +318,7 @@ impl VarBinViewData {
     where
         F: Fn(&[u8]) -> bool,
     {
-        for (idx, &view) in views.iter().enumerate() {
-            if validity.is_null(idx)? {
-                continue;
-            }
-
+        let validate_view = |idx: usize, view: &BinaryView| -> VortexResult<()> {
             if view.is_inlined() {
                 // Validate the inline bytestring
                 let bytes = &view.as_inlined().data[..view.len() as usize];
@@ -362,6 +361,30 @@ impl VarBinViewData {
                     validator(bytes),
                     InvalidArgument: "view at index {idx}: outlined bytes fails utf-8 validation"
                 );
+            }
+            Ok(())
+        };
+
+        match validity {
+            // Array-backed validity is the only variant that needs an execution context: execute it
+            // into a mask once and zip it with the views, validating only the valid (non-null)
+            // entries.
+            Validity::Array(_) => {
+                let mut ctx = LEGACY_SESSION.create_execution_ctx();
+                let mask = validity.execute_mask(views.len(), &mut ctx)?;
+                for ((idx, view), valid) in views.iter().enumerate().zip(mask.iter()) {
+                    if valid {
+                        validate_view(idx, view)?;
+                    }
+                }
+            }
+            // Every entry is null, so there is nothing to validate.
+            Validity::AllInvalid => {}
+            // No nulls: validate every view.
+            Validity::NonNullable | Validity::AllValid => {
+                for (idx, view) in views.iter().enumerate() {
+                    validate_view(idx, view)?;
+                }
             }
         }
 
@@ -541,18 +564,17 @@ pub trait VarBinViewArrayExt: TypedArrayRef<VarBinView> {
     }
 
     fn varbinview_validity(&self) -> Validity {
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], self.dtype_parts().1)
+        child_to_validity(
+            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.dtype_parts().1,
+        )
     }
 }
 impl<T: TypedArrayRef<VarBinView>> VarBinViewArrayExt for T {}
 
 impl Array<VarBinView> {
     #[inline]
-    fn from_prevalidated_data(
-        dtype: DType,
-        data: VarBinViewData,
-        slots: Vec<Option<ArrayRef>>,
-    ) -> Self {
+    fn from_prevalidated_data(dtype: DType, data: VarBinViewData, slots: ArraySlots) -> Self {
         let len = data.len();
         unsafe {
             Array::from_parts_unchecked(

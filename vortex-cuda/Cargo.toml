@@ -24,6 +24,7 @@ unstable_encodings = ["vortex/unstable_encodings"]
 
 [dependencies]
 arc-swap = { workspace = true }
+arrow-schema = { workspace = true, features = ["ffi"] }
 async-trait = { workspace = true }
 bytes = { workspace = true }
 cudarc = { workspace = true, features = ["f16"] }
@@ -50,6 +51,7 @@ rstest = { workspace = true }
 tokio = { workspace = true, features = ["rt", "macros"] }
 vortex-array = { workspace = true, features = ["_test-harness"] }
 vortex-cuda = { path = ".", features = ["_test-harness"] }
+vortex-fsst = { workspace = true, features = ["_test-harness"] }
 
 [build-dependencies]
 bindgen = { workspace = true }
@@ -84,9 +86,25 @@ name = "bitpacked_cuda"
 harness = false
 
 [[bench]]
+name = "alp_cuda"
+harness = false
+
+[[bench]]
 name = "dynamic_dispatch_cuda"
 harness = false
 
 [[bench]]
 name = "throughput_cuda"
+harness = false
+
+[[bench]]
+name = "core_primitives"
+harness = false
+
+[[bench]]
+name = "fsst_cuda"
+harness = false
+
+[[bench]]
+name = "list_view_cuda"
 harness = false

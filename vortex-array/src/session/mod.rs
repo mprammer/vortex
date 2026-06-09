@@ -1,12 +1,14 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::Any;
 use std::sync::Arc;
 
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionVar;
 use vortex_session::registry::Registry;
 
 use crate::ArrayRef;
@@ -23,7 +25,6 @@ use crate::arrays::List;
 use crate::arrays::ListView;
 use crate::arrays::Masked;
 use crate::arrays::Null;
-use crate::arrays::Patched;
 use crate::arrays::Primitive;
 use crate::arrays::Struct;
 use crate::arrays::VarBin;
@@ -80,10 +81,19 @@ impl Default for ArraySession {
         this.register(Dict);
         this.register(List);
         this.register(Masked);
-        this.register(Patched);
         this.register(VarBin);
 
         this
+    }
+}
+
+impl SessionVar for ArraySession {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

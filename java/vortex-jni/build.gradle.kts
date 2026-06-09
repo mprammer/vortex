@@ -7,8 +7,7 @@ import org.gradle.kotlin.dsl.support.serviceOf
 plugins {
     `java-library`
     `jvm-test-suite`
-    id("com.google.protobuf")
-    id("com.gradleup.shadow") version "9.4.1"
+    id("com.gradleup.shadow") version "9.4.2"
 }
 
 dependencies {
@@ -26,9 +25,9 @@ dependencies {
     errorprone(libs.nopen.checker)
 
     implementation(libs.guava)
-    implementation(libs.protobuf.java)
     compileOnly(libs.errorprone.annotations)
     compileOnly(libs.nopen.annotations)
+    api(libs.roaringbitmap)
 
     // Logging
     implementation(libs.slf4j.api)
@@ -50,7 +49,9 @@ mavenPublishing {
     coordinates(groupId = "dev.vortex", artifactId = "vortex-jni", version = "${rootProject.version}")
     publishToMavenCentral()
 
-    signAllPublications()
+    if (!project.hasProperty("skip.signing")) {
+        signAllPublications()
+    }
 
     pom {
         name = "vortex-jni"
@@ -91,15 +92,8 @@ tasks.withType<Test>().all {
     )
 }
 
-protobuf {
-    protoc {
-        artifact = "com.google.protobuf:protoc:${libs.versions.protobuf.get()}"
-    }
-}
-
-// shade guava and protobuf dependencies
+// shade guava and arrow dependencies
 tasks.withType<ShadowJar> {
-    relocate("com.google.protobuf", "dev.vortex.relocated.com.google.protobuf")
     relocate("com.google.common", "dev.vortex.relocated.com.google.common")
     relocate("org.apache.arrow", "dev.vortex.relocated.org.apache.arrow") {
         // exclude C Data Interface since JNI cannot be relocated
@@ -121,32 +115,45 @@ tasks.register("makeTestFiles") {
     description = "Generate files used by unit tests"
     group = "verification"
 
+    // The publish workflow places release, cross-compiled libs for every supported
+    // architecture before invoking shadowJar; rebuilding the host-arch debug lib
+    // here would overwrite them (linux-aarch64 ends up holding a linux-amd64 .so).
+    onlyIf { System.getenv("VORTEX_SKIP_MAKE_TEST_FILES") != "true" }
+
     doLast {
         println("makeTestFiles executed")
 
         val execOps = serviceOf<ExecOperations>()
 
-        // Build the JNI lib
+        // Build the JNI lib for the host architecture only.
         execOps.exec {
             workingDir = rootProject.projectDir.absoluteFile.parentFile
             executable = "cargo"
             args("build", "--package", "vortex-jni")
         }
 
-        copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.so")
-            into("$projectDir/src/main/resources/native/linux-amd64")
-        }
+        val osName = System.getProperty("os.name").lowercase()
+        val osArch = System.getProperty("os.arch").lowercase()
+        val osShortName =
+            when {
+                osName.contains("mac") -> "darwin"
+                osName.contains("nix") || osName.contains("nux") -> "linux"
+                osName.contains("win") -> "win"
+                else -> throw GradleException("Unsupported OS for makeTestFiles: $osName")
+            }
+        val libExt =
+            when (osShortName) {
+                "darwin" -> ".dylib"
+                "linux" -> ".so"
+                "win" -> ".dll"
+                else -> throw GradleException("Unsupported OS short name: $osShortName")
+            }
 
+        // Only populate the host-arch directory so cross-compiled libs for other
+        // architectures (placed by the publish workflow) are preserved.
         copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni.dylib")
-            into("$projectDir/src/main/resources/native/darwin-aarch64")
-        }
-
-        execOps.exec {
-            workingDir = rootProject.projectDir.absoluteFile.parentFile
-            executable = "cargo"
-            args("xtask", "java-test-files")
+            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni$libExt")
+            into("$projectDir/src/main/resources/native/$osShortName-$osArch")
         }
     }
 }

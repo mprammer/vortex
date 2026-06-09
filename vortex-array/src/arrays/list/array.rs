@@ -6,6 +6,7 @@ use std::fmt::Formatter;
 use std::sync::Arc;
 
 use num_traits::AsPrimitive;
+use smallvec::smallvec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
@@ -13,6 +14,9 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
+use crate::Canonical;
+use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::LEGACY_SESSION;
 use crate::VortexSessionExecute;
@@ -117,8 +121,8 @@ impl ListData {
         offsets: &ArrayRef,
         validity: &Validity,
         len: usize,
-    ) -> Vec<Option<ArrayRef>> {
-        vec![
+    ) -> ArraySlots {
+        smallvec![
             Some(elements.clone()),
             Some(offsets.clone()),
             validity_to_child(validity, len),
@@ -285,7 +289,10 @@ pub trait ListArrayExt: TypedArrayRef<List> {
     }
 
     fn list_validity(&self) -> Validity {
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], self.nullability())
+        child_to_validity(
+            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.nullability(),
+        )
     }
 
     fn offset_at(&self, index: usize) -> VortexResult<usize> {
@@ -324,21 +331,24 @@ pub trait ListArrayExt: TypedArrayRef<List> {
         self.elements().dtype()
     }
 
-    fn reset_offsets(&self, recurse: bool) -> VortexResult<Array<List>> {
+    fn reset_offsets(&self, recurse: bool, ctx: &mut ExecutionCtx) -> VortexResult<Array<List>> {
         let mut elements = self.sliced_elements()?;
         if recurse && elements.is_canonical() {
-            #[expect(deprecated)]
-            let compacted = elements.to_canonical()?.compact()?.into_array();
+            let compacted = elements
+                .clone()
+                .execute::<Canonical>(ctx)?
+                .compact(ctx)?
+                .into_array();
             elements = compacted;
         } else if recurse && let Some(child_list_array) = elements.as_opt::<List>() {
             elements = child_list_array
                 .into_owned()
-                .reset_offsets(recurse)?
+                .reset_offsets(recurse, ctx)?
                 .into_array();
         }
 
         let offsets = self.offsets();
-        let first_offset = offsets.execute_scalar(0, &mut LEGACY_SESSION.create_execution_ctx())?;
+        let first_offset = offsets.execute_scalar(0, ctx)?;
         let adjusted_offsets = offsets.clone().binary(
             ConstantArray::new(first_offset, offsets.len()).into_array(),
             Operator::Sub,

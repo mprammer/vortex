@@ -53,11 +53,12 @@ impl CompareKernel for Patched {
             .execute::<Canonical>(ctx)?
             .into_bool();
 
-        let validity = child_to_validity(&result.slots()[0], result.dtype().nullability());
+        let validity = child_to_validity(result.slots()[0].as_ref(), result.dtype().nullability());
         let len = result.len();
-        let BoolDataParts { bits, offset, len } = result.into_data().into_parts(len);
+        let BoolDataParts { bits, meta } = result.into_data().into_parts(len);
 
-        let mut bits = BitBufferMut::from_buffer(bits.unwrap_host().into_mut(), offset, len);
+        let mut bits =
+            BitBufferMut::from_buffer(bits.unwrap_host().into_mut(), meta.offset(), meta.len());
 
         let lane_offsets = lhs.lane_offsets().clone().execute::<PrimitiveArray>(ctx)?;
         let indices = lhs.patch_indices().clone().execute::<PrimitiveArray>(ctx)?;
@@ -160,6 +161,7 @@ impl<V: NativePType> ApplyPatches<'_, V> {
 mod tests {
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
 
     use crate::ExecutionCtx;
     use crate::IntoArray;
@@ -261,7 +263,7 @@ mod tests {
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx)?
             .into_array()
             .try_downcast::<Patched>()
-            .unwrap();
+            .map_err(|_| vortex_err!("expected patched array"))?;
 
         let rhs = ConstantArray::new(subnormal, 512).into_array();
 
@@ -271,7 +273,7 @@ mod tests {
             CompareOperator::Eq,
             &mut ctx,
         )?
-        .unwrap();
+        .ok_or_else(|| vortex_err!("expected compare result"))?;
 
         let expected = BoolArray::from_indices(512, [510], Validity::NonNullable).into_array();
 
@@ -295,7 +297,7 @@ mod tests {
         let lhs = Patched::from_array_and_patches(lhs, &patches, &mut ctx)?
             .into_array()
             .try_downcast::<Patched>()
-            .unwrap();
+            .map_err(|_| vortex_err!("expected patched array"))?;
 
         let rhs = ConstantArray::new(0.0f32, 10).into_array();
 
@@ -305,7 +307,7 @@ mod tests {
             CompareOperator::Eq,
             &mut ctx,
         )?
-        .unwrap();
+        .ok_or_else(|| vortex_err!("expected compare result"))?;
 
         let expected = BoolArray::from_indices(10, [7], Validity::NonNullable).into_array();
 

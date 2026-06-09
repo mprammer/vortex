@@ -17,11 +17,11 @@ pub(super) fn check_bool_sorted(
     match array
         .as_ref()
         .validity()?
-        .to_mask(array.as_ref().len(), ctx)?
+        .execute_mask(array.as_ref().len(), ctx)?
     {
         Mask::AllFalse(_) => Ok(!strict),
         Mask::AllTrue(_) => {
-            let values = array.to_bit_buffer();
+            let values = array.bit_buffer_view();
             Ok(if strict {
                 values.iter().is_strict_sorted()
             } else {
@@ -31,7 +31,7 @@ pub(super) fn check_bool_sorted(
         Mask::Values(mask_values) => {
             if strict {
                 let validity_buffer = mask_values.bit_buffer();
-                let values = array.to_bit_buffer();
+                let values = array.bit_buffer_view();
                 Ok(validity_buffer
                     .iter()
                     .zip(values.iter())
@@ -39,7 +39,7 @@ pub(super) fn check_bool_sorted(
                     .is_strict_sorted())
             } else {
                 let set_indices = mask_values.bit_buffer().set_indices();
-                let values = array.to_bit_buffer();
+                let values = array.bit_buffer_view();
                 let values_iter = set_indices.map(|idx|
                     // Safety:
                     // All idxs are in-bounds for the array.

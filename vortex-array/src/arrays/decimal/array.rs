@@ -5,6 +5,7 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 
 use itertools::Itertools;
+use smallvec::smallvec;
 use vortex_buffer::Alignment;
 use vortex_buffer::BitBufferMut;
 use vortex_buffer::Buffer;
@@ -16,6 +17,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::array::Array;
@@ -26,6 +28,7 @@ use crate::array::validity_to_child;
 use crate::arrays::Decimal;
 use crate::arrays::DecimalArray;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::buffer::BufferHandle;
 use crate::dtype::BigCast;
 use crate::dtype::DType;
@@ -35,7 +38,7 @@ use crate::dtype::IntegerPType;
 use crate::dtype::NativeDecimalType;
 use crate::dtype::Nullability;
 use crate::match_each_decimal_value_type;
-use crate::match_each_integer_ptype;
+use crate::match_each_unsigned_integer_ptype;
 use crate::patches::Patches;
 use crate::validity::Validity;
 
@@ -145,7 +148,10 @@ pub trait DecimalArrayExt: TypedArrayRef<Decimal> {
     }
 
     fn validity(&self) -> Validity {
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], self.nullability())
+        child_to_validity(
+            self.as_ref().slots()[VALIDITY_SLOT].as_ref(),
+            self.nullability(),
+        )
     }
 
     fn values_type(&self) -> DecimalType {
@@ -172,8 +178,8 @@ impl<T: TypedArrayRef<Decimal>> DecimalArrayExt for T {}
 
 impl DecimalData {
     /// Build the slots vector for this array.
-    pub(super) fn make_slots(validity: &Validity, len: usize) -> Vec<Option<ArrayRef>> {
-        vec![validity_to_child(validity, len)]
+    pub(super) fn make_slots(validity: &Validity, len: usize) -> ArraySlots {
+        smallvec![validity_to_child(validity, len)]
     }
 
     /// Creates a new [`DecimalArray`] using a host-native buffer.
@@ -551,8 +557,12 @@ impl Array<Decimal> {
         assert_eq!(self.decimal_dtype(), patch_values.decimal_dtype());
 
         let data = self.into_data();
-        let data = match_each_integer_ptype!(patch_indices.ptype(), |I| {
-            let patch_indices = patch_indices.as_slice::<I>();
+        // Patch indices are non-negative; reinterpret to unsigned so this dispatches over 4 widths
+        // instead of 8 (the decimal value-type dimensions are unaffected).
+        let patch_indices_unsigned =
+            patch_indices.reinterpret_cast(patch_indices.ptype().to_unsigned());
+        let data = match_each_unsigned_integer_ptype!(patch_indices_unsigned.ptype(), |I| {
+            let patch_indices = patch_indices_unsigned.as_slice::<I>();
             match_each_decimal_value_type!(patch_values.values_type(), |PatchDVT| {
                 let patch_values = patch_values.buffer::<PatchDVT>();
                 match_each_decimal_value_type!(data.values_type(), |ValuesDVT| {

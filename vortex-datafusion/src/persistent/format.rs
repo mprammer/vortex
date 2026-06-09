@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -14,13 +13,14 @@ use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::GetExt;
 use datafusion_common::Result as DFResult;
+use datafusion_common::ScalarValue as DFScalarValue;
 use datafusion_common::Statistics;
 use datafusion_common::config::ConfigField;
 use datafusion_common::config_namespace;
 use datafusion_common::internal_datafusion_err;
 use datafusion_common::not_impl_err;
 use datafusion_common::parsers::CompressionTypeVariant;
-use datafusion_common::stats::Precision;
+use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_common_runtime::SpawnedTask;
 use datafusion_datasource::TableSchema;
 use datafusion_datasource::file::FileSource;
@@ -43,15 +43,15 @@ use futures::stream;
 use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use vortex::VortexSessionDefault;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::memory::MemorySessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
-use vortex::expr::stats;
+use vortex::expr::stats::Precision;
 use vortex::expr::stats::Stat;
 use vortex::file::EOF_SIZE;
 use vortex::file::MAX_POSTSCRIPT_SIZE;
@@ -60,6 +60,7 @@ use vortex::file::VORTEX_FILE_EXTENSION;
 use vortex::io::object_store::ObjectStoreReadAt;
 use vortex::io::session::RuntimeSessionExt;
 use vortex::scalar::Scalar;
+use vortex::scalar::ScalarValue as VortexScalarValue;
 use vortex::session::VortexSession;
 
 use super::cache::CachedVortexMetadata;
@@ -67,6 +68,7 @@ use super::sink::VortexSink;
 use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::TryToDataFusion;
+use crate::convert::stats::is_constant_to_distinct_count;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 
@@ -296,10 +298,6 @@ impl FileFormatFactory for VortexFormatFactory {
     fn default(&self) -> Arc<dyn FileFormat> {
         Arc::new(VortexFormat::new(self.session.clone()))
     }
-
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
 }
 
 impl VortexFormat {
@@ -327,10 +325,6 @@ impl VortexFormat {
 
 #[async_trait]
 impl FileFormat for VortexFormat {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn compression_type(&self) -> Option<FileCompressionType> {
         None
     }
@@ -375,7 +369,9 @@ impl FileFormat for VortexFormat {
                             .as_any()
                             .downcast_ref::<CachedVortexMetadata>()
                     {
-                        let inferred_schema = cached_vortex.footer().dtype().to_arrow_schema()?;
+                        let inferred_schema = session
+                            .arrow()
+                            .to_arrow_schema(cached_vortex.footer().dtype())?;
                         return VortexResult::Ok((object.location, inferred_schema));
                     }
 
@@ -399,7 +395,7 @@ impl FileFormat for VortexFormat {
                     let entry = CachedFileMetadataEntry::new(object.clone(), cached_metadata);
                     cache.put(&object.location, entry);
 
-                    let inferred_schema = vxf.dtype().to_arrow_schema()?;
+                    let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
                 })
                 .map(|f| f.vortex_expect("Failed to spawn infer_schema"))
@@ -494,17 +490,19 @@ impl FileFormat for VortexFormat {
             let Some(file_stats) = file_stats else {
                 // If the file has no column stats, the best we can do is return a row count.
                 return Ok(Statistics {
-                    num_rows: Precision::Exact(
+                    num_rows: DFPrecision::Exact(
                         usize::try_from(row_count)
                             .map_err(|_| vortex_err!("Row count overflow"))
                             .vortex_expect("Row count overflow"),
                     ),
-                    total_byte_size: Precision::Absent,
-                    column_statistics: vec![ColumnStatistics::default(); struct_dtype.nfields()],
+                    total_byte_size: DFPrecision::Absent,
+                    column_statistics: vec![
+                        ColumnStatistics::default();
+                        table_schema.fields().len()
+                    ],
                 });
             };
 
-            let mut sum_of_column_byte_sizes = stats::Precision::exact(0_usize);
             let mut column_statistics = Vec::with_capacity(table_schema.fields().len());
 
             for field in table_schema.fields().iter() {
@@ -518,55 +516,32 @@ impl FileFormat for VortexFormat {
                 let (stats_set, stats_dtype) = file_stats.get(col_idx);
 
                 // Update the total size in bytes.
-                let column_size = stats_set
-                    .get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into())
-                    .unwrap_or_else(|| stats::Precision::inexact(0_usize));
-                sum_of_column_byte_sizes = sum_of_column_byte_sizes
-                    .zip(column_size)
-                    .map(|(acc, size)| acc + size);
+                let column_size =
+                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
 
-                // TODO(connor): There's a lot that can go wrong here, should probably handle this
-                // more gracefully...
-                // Find the min statistic.
-                let min = stats_set.get(Stat::Min).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            // Because of DataFusion's Schema evolution, it is possible that the
-                            // type of the min/max stat has changed. Thus we construct the stat as
-                            // the file datatype first and only then do we cast accordingly.
-                            Scalar::try_new(
-                                Stat::Min
-                                    .dtype(stats_dtype)
-                                    .vortex_expect("must have a valid dtype"),
-                                Some(stat_val),
-                            )
-                            .vortex_expect("`Stat::Min` somehow had an incompatible `DType`")
-                            .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
-                            .try_to_df()
-                            .ok()
-                        })
-                        .transpose()
-                });
+                let target_dtype =
+                    session
+                        .arrow()
+                        .from_arrow_field(field.as_ref())
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to derive Vortex DType for field {}: {e}",
+                                field.name()
+                            ))
+                        })?;
+                let min = scalar_stat_to_df(
+                    Stat::Min,
+                    stats_set.get(Stat::Min),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
-                // Find the max statistic.
-                let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
-                    pstat_val
-                        .map(|stat_val| {
-                            Scalar::try_new(
-                                Stat::Max
-                                    .dtype(stats_dtype)
-                                    .vortex_expect("must have a valid dtype"),
-                                Some(stat_val),
-                            )
-                            .vortex_expect("`Stat::Max` somehow had an incompatible `DType`")
-                            .cast(&DType::from_arrow(field.as_ref()))
-                            .vortex_expect("Unable to cast to target type that DataFusion wants")
-                            .try_to_df()
-                            .ok()
-                        })
-                        .transpose()
-                });
+                let max = scalar_stat_to_df(
+                    Stat::Max,
+                    stats_set.get(Stat::Max),
+                    stats_dtype,
+                    &target_dtype,
+                );
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -574,20 +549,23 @@ impl FileFormat for VortexFormat {
                     null_count: null_count.to_df(),
                     min_value: min.to_df(),
                     max_value: max.to_df(),
-                    sum_value: Precision::Absent,
-                    distinct_count: stats_set
-                        .get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable))
-                        .and_then(|is_constant| is_constant.as_exact().map(|_| Precision::Exact(1)))
-                        .unwrap_or(Precision::Absent),
-                    // TODO(connor): Is this correct?
+                    sum_value: DFPrecision::Absent,
+                    distinct_count: is_constant_to_distinct_count(
+                        stats_set.get_as::<bool>(
+                            Stat::IsConstant,
+                            &DType::Bool(Nullability::NonNullable),
+                        ),
+                    ),
                     byte_size: column_size.to_df(),
                 })
             }
 
-            let total_byte_size = sum_of_column_byte_sizes.to_df();
+            let total_byte_size = column_statistics
+                .iter()
+                .fold(DFPrecision::Exact(0), |acc, cs| acc.add(&cs.byte_size));
 
             Ok(Statistics {
-                num_rows: Precision::Exact(
+                num_rows: DFPrecision::Exact(
                     usize::try_from(row_count)
                         .map_err(|_| vortex_err!("Row count overflow"))
                         .vortex_expect("Row count overflow"),
@@ -607,7 +585,6 @@ impl FileFormat for VortexFormat {
     ) -> DFResult<Arc<dyn ExecutionPlan>> {
         let mut source = file_scan_config
             .file_source()
-            .as_any()
             .downcast_ref::<VortexSource>()
             .cloned()
             .ok_or_else(|| internal_datafusion_err!("Expected VortexSource"))?;
@@ -649,6 +626,26 @@ impl FileFormat for VortexFormat {
 
         Arc::new(source) as _
     }
+}
+
+fn scalar_stat_to_df(
+    stat: Stat,
+    value: Precision<VortexScalarValue>,
+    stats_dtype: &DType,
+    target_dtype: &DType,
+) -> Precision<DFScalarValue> {
+    let Some(stat_dtype) = stat.dtype(stats_dtype) else {
+        return Precision::Absent;
+    };
+
+    value
+        .map(|stat_value| {
+            Scalar::try_new(stat_dtype, Some(stat_value))?
+                .cast(target_dtype)?
+                .try_to_df()
+        })
+        .transpose()
+        .unwrap_or(Precision::Absent)
 }
 
 #[cfg(test)]

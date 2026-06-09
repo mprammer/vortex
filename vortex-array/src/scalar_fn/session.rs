@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
+use std::any::Any;
 use std::sync::Arc;
 
 use vortex_session::Ref;
 use vortex_session::SessionExt;
+use vortex_session::SessionVar;
 use vortex_session::registry::Registry;
 
 use crate::scalar_fn::ScalarFnPluginRef;
@@ -24,8 +26,9 @@ use crate::scalar_fn::fns::not::Not;
 use crate::scalar_fn::fns::pack::Pack;
 use crate::scalar_fn::fns::root::Root;
 use crate::scalar_fn::fns::select::Select;
+use crate::scalar_fn::fns::stat::StatFn;
+use crate::scalar_fn::fns::variant_get::VariantGet;
 
-/// Registry of scalar function vtables.
 /// Registry of scalar function vtables.
 pub type ScalarFnRegistry = Registry<ScalarFnPluginRef>;
 
@@ -69,8 +72,20 @@ impl Default for ScalarFnSession {
         this.register(Pack);
         this.register(Root);
         this.register(Select);
+        this.register(StatFn);
+        this.register(VariantGet);
 
         this
+    }
+}
+
+impl SessionVar for ScalarFnSession {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    fn as_any_mut(&mut self) -> &mut dyn Any {
+        self
     }
 }
 

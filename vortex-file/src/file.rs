@@ -12,7 +12,9 @@ use std::sync::Arc;
 use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::Columnar;
+use vortex_array::IntoArray;
 use vortex_array::VortexSessionExecute;
+use vortex_array::arrays::ConstantArray;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Field;
 use vortex_array::dtype::FieldMask;
@@ -20,6 +22,7 @@ use vortex_array::dtype::FieldPath;
 use vortex_array::dtype::FieldPathSet;
 use vortex_array::expr::Expression;
 use vortex_array::expr::pruning::checked_pruning_expr;
+use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex_error::VortexResult;
 use vortex_layout::LayoutReader;
 use vortex_layout::scan::layout::LayoutReaderDataSource;
@@ -43,14 +46,27 @@ use crate::v2::FileStatsLayoutReader;
 #[derive(Clone)]
 pub struct VortexFile {
     /// The footer of the Vortex file, containing metadata and layout information.
-    pub(crate) footer: Footer,
+    footer: Footer,
     /// The segment source used to read segments from this file.
-    pub(crate) segment_source: Arc<dyn SegmentSource>,
-    /// The Vortex session used to open this file
-    pub(crate) session: VortexSession,
+    segment_source: Arc<dyn SegmentSource>,
+    /// The Vortex session used to open this file.
+    session: VortexSession,
 }
 
 impl VortexFile {
+    /// Creates a new `VortexFile` from the given footer, segment source, and session.
+    pub fn new(
+        footer: Footer,
+        segment_source: Arc<dyn SegmentSource>,
+        session: VortexSession,
+    ) -> Self {
+        Self {
+            footer,
+            segment_source,
+            session,
+        }
+    }
+
     /// Returns a reference to the file's footer, which contains metadata and layout information.
     pub fn footer(&self) -> &Footer {
         &self.footer
@@ -81,13 +97,37 @@ impl VortexFile {
         Arc::clone(&self.segment_source)
     }
 
+    /// Returns a reference to the Vortex session used to open this file.
+    pub fn session(&self) -> &VortexSession {
+        &self.session
+    }
+
     /// Create a new layout reader for the file.
+    ///
+    /// Wraps the root layout in a [`FileStatsLayoutReader`] if file stats are available.
     pub fn layout_reader(&self) -> VortexResult<Arc<dyn LayoutReader>> {
         let segment_source = self.segment_source();
-        self.footer
+
+        let root_reader = self
+            .footer
             .layout()
             // TODO(ngates): we may want to allow the user pass in a name here?
-            .new_reader("".into(), segment_source, &self.session)
+            .new_reader(
+                "".into(),
+                segment_source,
+                &self.session,
+                &Default::default(),
+            )?;
+
+        Ok(if let Some(stats) = self.file_stats().cloned() {
+            Arc::new(FileStatsLayoutReader::new(
+                root_reader,
+                stats,
+                self.session.clone(),
+            ))
+        } else {
+            root_reader
+        })
     }
 
     /// Create a [`DataSource`](vortex_scan::DataSource) from this file for scanning.
@@ -95,14 +135,8 @@ impl VortexFile {
     /// Wraps the file's layout reader with [`FileStatsLayoutReader`] (when file-level
     /// statistics are available) and [`LayoutReaderDataSource`].
     pub fn data_source(&self) -> VortexResult<DataSourceRef> {
-        let mut reader = self.layout_reader()?;
-        if let Some(stats) = self.file_stats().cloned() {
-            reader = Arc::new(FileStatsLayoutReader::new(
-                reader,
-                stats,
-                self.session.clone(),
-            ));
-        }
+        let reader = self.layout_reader()?;
+
         Ok(Arc::new(LayoutReaderDataSource::new(
             reader,
             self.session.clone(),
@@ -117,7 +151,11 @@ impl VortexFile {
         ))
     }
 
-    /// Returns true if the expression will never match any rows in the file.
+    /// Returns `true` if file-level statistics prove the expression cannot
+    /// match any rows in this file.
+    ///
+    /// Row-count-aware pruning predicates are evaluated with the file's total
+    /// row count as their scope.
     pub fn can_prune(&self, filter: &Expression) -> VortexResult<bool> {
         let Some((stats, fields)) = self
             .footer
@@ -162,16 +200,18 @@ impl VortexFile {
             return Ok(false);
         };
 
+        // Apply the predicate, then substitute any row_count placeholders in the resulting array
+        // tree with a ConstantArray carrying the file-level row count.
+        let applied = file_stats.apply(&predicate)?;
+        let row_count_replacement =
+            ConstantArray::new(self.footer.row_count(), applied.len()).into_array();
+        let applied = substitute_row_count(applied, &row_count_replacement)?;
+
         let mut ctx = self.session.create_execution_ctx();
-        Ok(
-            match file_stats
-                .apply(&predicate)?
-                .execute::<Columnar>(&mut ctx)?
-            {
-                Columnar::Constant(s) => s.scalar().as_bool().value() == Some(true),
-                Columnar::Canonical(_) => false,
-            },
-        )
+        Ok(match applied.execute::<Columnar>(&mut ctx)? {
+            Columnar::Constant(s) => s.scalar().as_bool().value() == Some(true),
+            Columnar::Canonical(_) => false,
+        })
     }
 
     pub fn splits(&self) -> VortexResult<Vec<Range<u64>>> {

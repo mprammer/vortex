@@ -56,7 +56,7 @@ impl CudaExecute for FoRExecutor {
         if let Some(bitpacked) = array.encoded().as_opt::<BitPacked>() {
             match_each_integer_ptype!(bitpacked.ptype(bitpacked.dtype()), |P| {
                 let reference: P = array.reference_scalar().try_into()?;
-                return decode_bitpacked(bitpacked.into_owned(), reference, ctx).await;
+                return decode_bitpacked(bitpacked.into_owned(), reference, None, ctx).await;
             })
         }
 
@@ -67,7 +67,7 @@ impl CudaExecute for FoRExecutor {
             let slice_range = slice_array.slice_range().clone();
             let unpacked = match_each_integer_ptype!(bitpacked.ptype(bitpacked.dtype()), |P| {
                 let reference: P = array.reference_scalar().try_into()?;
-                decode_bitpacked(bitpacked.into_owned(), reference, ctx).await?
+                decode_bitpacked(bitpacked.into_owned(), reference, None, ctx).await?
             });
 
             return unpacked
@@ -139,6 +139,8 @@ mod tests {
     use vortex::error::VortexExpect;
     use vortex::scalar::Scalar;
     use vortex::session::VortexSession;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::VortexSessionExecute;
 
     use super::*;
     use crate::CanonicalCudaExt;
@@ -187,7 +189,9 @@ mod tests {
             .take(1024)
             .collect::<Buffer<_>>()
             .into_array();
-        let packed = BitPacked::encode(&values, 3).unwrap().into_array();
+        let packed = BitPacked::encode(&values, 3, &mut LEGACY_SESSION.create_execution_ctx())
+            .unwrap()
+            .into_array();
         let for_array = FoR::try_new(packed, (-8i8).into()).unwrap();
 
         let cpu_result = crate::canonicalize_cpu(for_array.clone()).unwrap();

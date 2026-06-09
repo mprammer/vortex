@@ -4,20 +4,14 @@
 #include "duckdb_vx.h"
 #include "duckdb_vx/error.hpp"
 
-#include "duckdb_vx/duckdb_diagnostics.h"
-DUCKDB_INCLUDES_BEGIN
 #include <duckdb/common/exception.hpp>
 #include <duckdb/common/file_system.hpp>
 #include <duckdb/common/helper.hpp>
 #include <duckdb/main/client_context.hpp>
-DUCKDB_INCLUDES_END
 
-#include <memory>
-#include <string>
 #include <utility>
 
 using namespace duckdb;
-using vortex::HandleException;
 using vortex::SetError;
 
 extern "C" duckdb_vx_file_handle
@@ -148,6 +142,22 @@ extern "C" duckdb_state duckdb_vx_fs_sync(duckdb_vx_file_handle handle, duckdb_v
 
     try {
         reinterpret_cast<FileHandle *>(handle)->Sync();
+    } catch (const std::exception &e) {
+        return SetError(error_out, e.what());
+    }
+    return DuckDBSuccess;
+}
+
+extern "C" duckdb_state
+duckdb_vx_fs_remove(duckdb_client_context ctx, const char *path, duckdb_vx_error *error_out) {
+    if (!ctx || !path) {
+        return SetError(error_out, "Invalid arguments to fs_remove");
+    }
+
+    auto *client_context = reinterpret_cast<ClientContext *>(ctx);
+
+    try {
+        FileSystem::GetFileSystem(*client_context).RemoveFile(path);
     } catch (const std::exception &e) {
         return SetError(error_out, e.what());
     }

@@ -19,6 +19,8 @@ use jiff::tz::TimeZone;
 use num_traits::AsPrimitive;
 use tempfile::NamedTempFile;
 use vortex::array::IntoArray;
+use vortex::array::LEGACY_SESSION;
+use vortex::array::VortexSessionExecute;
 use vortex::array::arrays::BoolArray;
 use vortex::array::arrays::ConstantArray;
 use vortex::array::arrays::DictArray;
@@ -823,7 +825,9 @@ async fn write_vortex_file_with_encodings() -> NamedTempFile {
     // 4. Run-End
     let run_ends = buffer![3u32, 5];
     let run_values = buffer![100i32, 200];
-    let rle_array = RunEnd::try_new(run_ends.into_array(), run_values.into_array()).unwrap();
+    let mut rle_ctx = LEGACY_SESSION.create_execution_ctx();
+    let rle_array =
+        RunEnd::try_new(run_ends.into_array(), run_values.into_array(), &mut rle_ctx).unwrap();
 
     // 5. Sequence array
     let sequence_array = Sequence::try_new(
@@ -978,8 +982,10 @@ fn test_vortex_encodings_roundtrip() {
     assert_eq!(list_entries[4].offset, 10);
 
     // Get child vector and verify actual values
+    let list_child_len = list_vec.list_vector_get_size();
+    assert_eq!(list_child_len, 10);
     let list_child = list_vec.list_vector_get_child();
-    let child_values = list_child.as_slice_with_len::<i32>(10); // 10 total child elements
+    let child_values = list_child.as_slice_with_len::<i32>(list_child_len.as_());
     assert_eq!(child_values, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
 
     // Verify fixed-size list column (column 9)

@@ -5,11 +5,15 @@ use std::fmt::Display;
 use std::fmt::Formatter;
 use std::sync::Arc;
 
+use smallvec::smallvec;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 use vortex_error::vortex_ensure;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
+use crate::LEGACY_SESSION;
+use crate::VortexSessionExecute;
 use crate::array::Array;
 use crate::array::ArrayParts;
 use crate::array::TypedArrayRef;
@@ -107,12 +111,8 @@ pub struct FixedSizeListDataParts {
 }
 
 impl FixedSizeListData {
-    pub(crate) fn make_slots(
-        elements: &ArrayRef,
-        validity: &Validity,
-        len: usize,
-    ) -> Vec<Option<ArrayRef>> {
-        vec![Some(elements.clone()), validity_to_child(validity, len)]
+    pub(crate) fn make_slots(elements: &ArrayRef, validity: &Validity, len: usize) -> ArraySlots {
+        smallvec![Some(elements.clone()), validity_to_child(validity, len)]
     }
 
     /// Creates a new `FixedSizeListArray`.
@@ -228,7 +228,7 @@ pub trait FixedSizeListArrayExt: TypedArrayRef<FixedSizeList> {
 
     fn fixed_size_list_validity(&self) -> Validity {
         let (_, _, nullability) = self.dtype_parts();
-        child_to_validity(&self.as_ref().slots()[VALIDITY_SLOT], nullability)
+        child_to_validity(self.as_ref().slots()[VALIDITY_SLOT].as_ref(), nullability)
     }
 
     fn fixed_size_list_elements_at(&self, index: usize) -> VortexResult<ArrayRef> {
@@ -238,11 +238,14 @@ pub trait FixedSizeListArrayExt: TypedArrayRef<FixedSizeList> {
             index,
             self.as_ref().len(),
         );
-        debug_assert!(
-            self.fixed_size_list_validity()
-                .is_valid(index)
-                .unwrap_or(false)
-        );
+        #[expect(clippy::debug_assert_with_mut_call)]
+        {
+            debug_assert!(
+                self.fixed_size_list_validity()
+                    .execute_is_valid(index, &mut LEGACY_SESSION.create_execution_ctx())
+                    .unwrap_or(false)
+            );
+        }
 
         let start = self.list_size() as usize * index;
         let end = self.list_size() as usize * (index + 1);

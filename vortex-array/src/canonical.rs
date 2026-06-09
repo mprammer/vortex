@@ -13,6 +13,7 @@ use vortex_error::vortex_ensure;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::Executable;
 use crate::ExecutionCtx;
 use crate::IntoArray;
@@ -194,17 +195,6 @@ impl Canonical {
                     Validity::from(n),
                 )
             }),
-            DType::Struct(struct_dtype, n) => Canonical::Struct(unsafe {
-                StructArray::new_unchecked(
-                    struct_dtype
-                        .fields()
-                        .map(|f| Canonical::empty(&f).into_array())
-                        .collect::<Arc<[_]>>(),
-                    struct_dtype.clone(),
-                    0,
-                    Validity::from(n),
-                )
-            }),
             DType::List(dtype, n) => Canonical::List(unsafe {
                 ListViewArray::new_unchecked(
                     Canonical::empty(dtype).into_array(),
@@ -225,13 +215,25 @@ impl Canonical {
                     0,
                 )
             }),
+            DType::Struct(struct_dtype, n) => Canonical::Struct(unsafe {
+                StructArray::new_unchecked(
+                    struct_dtype
+                        .fields()
+                        .map(|f| Canonical::empty(&f).into_array())
+                        .collect::<Arc<[_]>>(),
+                    struct_dtype.clone(),
+                    0,
+                    Validity::from(n),
+                )
+            }),
+            DType::Union(..) => todo!("TODO(connor)[Union]: unimplemented"),
+            DType::Variant(_) => {
+                vortex_panic!(InvalidArgument: "Canonical empty is not supported for Variant")
+            }
             DType::Extension(ext_dtype) => Canonical::Extension(ExtensionArray::new(
                 ext_dtype.clone(),
                 Canonical::empty(ext_dtype.storage_dtype()).into_array(),
             )),
-            DType::Variant(_) => {
-                vortex_panic!(InvalidArgument: "Canonical empty is not supported for Variant")
-            }
         }
     }
 
@@ -256,11 +258,11 @@ impl Canonical {
     ///
     /// This operation is very expensive and can result in things like allocations, full-scans
     /// and copy operations.
-    pub fn compact(&self) -> VortexResult<Canonical> {
+    pub fn compact(&self, ctx: &mut ExecutionCtx) -> VortexResult<Canonical> {
         match self {
             Canonical::VarBinView(array) => Ok(Canonical::VarBinView(array.compact_buffers()?)),
             Canonical::List(array) => Ok(Canonical::List(
-                array.rebuild(ListViewRebuildMode::TrimElements)?,
+                array.rebuild(ListViewRebuildMode::TrimElements, ctx)?,
             )),
             _ => Ok(self.clone()),
         }
@@ -559,11 +561,16 @@ impl Executable for CanonicalValidity {
         match array.execute::<Canonical>(ctx)? {
             n @ Canonical::Null(_) => Ok(CanonicalValidity(n)),
             Canonical::Bool(b) => {
-                let validity = child_to_validity(&b.slots()[0], b.dtype().nullability());
+                let validity = child_to_validity(b.slots()[0].as_ref(), b.dtype().nullability());
                 let len = b.len();
-                let BoolDataParts { bits, offset, len } = b.into_data().into_parts(len);
+                let BoolDataParts { bits, meta } = b.into_data().into_parts(len);
                 Ok(CanonicalValidity(Canonical::Bool(
-                    BoolArray::try_new_from_handle(bits, offset, len, validity.execute(ctx)?)?,
+                    BoolArray::try_new_from_handle(
+                        bits,
+                        meta.offset(),
+                        meta.len(),
+                        validity.execute(ctx)?,
+                    )?,
                 )))
             }
             Canonical::Primitive(p) => {
@@ -654,14 +661,23 @@ impl Executable for CanonicalValidity {
                 ),
             ))),
             Canonical::Variant(variant) => {
-                Ok(CanonicalValidity(Canonical::Variant(VariantArray::new(
-                    variant
-                        .child()
-                        .clone()
-                        .execute::<CanonicalValidity>(ctx)?
-                        .0
-                        .into_array(),
-                ))))
+                let core_storage = recursively_canonicalize_slots(variant.core_storage(), ctx)?;
+                let shredded = variant
+                    .shredded()
+                    .map(|shredded| {
+                        if shredded.is::<Variant>() {
+                            recursively_canonicalize_slots(shredded, ctx)
+                        } else {
+                            shredded
+                                .clone()
+                                .execute::<CanonicalValidity>(ctx)
+                                .map(|canonical| canonical.0.into_array())
+                        }
+                    })
+                    .transpose()?;
+                Ok(CanonicalValidity(Canonical::Variant(
+                    VariantArray::try_new(core_storage, shredded)?,
+                )))
             }
         }
     }
@@ -673,16 +689,43 @@ impl Executable for CanonicalValidity {
 /// callers should prefer an execution target that's suitable for their use case instead of this one.
 pub struct RecursiveCanonical(pub Canonical);
 
+// TODO: Currently only used for Variant, in the future
+// can probably be used for more canonical types like Struct.
+fn recursively_canonicalize_slots(
+    array: &ArrayRef,
+    ctx: &mut ExecutionCtx,
+) -> VortexResult<ArrayRef> {
+    let slots = array
+        .slots()
+        .iter()
+        .map(|slot| {
+            slot.as_ref()
+                .map(|child| {
+                    child
+                        .clone()
+                        .execute::<RecursiveCanonical>(ctx)
+                        .map(|canonical| canonical.0.into_array())
+                })
+                .transpose()
+        })
+        .collect::<VortexResult<ArraySlots>>()?;
+    array.clone().with_slots(slots)
+}
 impl Executable for RecursiveCanonical {
     fn execute(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
         match array.execute::<Canonical>(ctx)? {
             n @ Canonical::Null(_) => Ok(RecursiveCanonical(n)),
             Canonical::Bool(b) => {
-                let validity = child_to_validity(&b.slots()[0], b.dtype().nullability());
+                let validity = child_to_validity(b.slots()[0].as_ref(), b.dtype().nullability());
                 let len = b.len();
-                let BoolDataParts { bits, offset, len } = b.into_data().into_parts(len);
+                let BoolDataParts { bits, meta } = b.into_data().into_parts(len);
                 Ok(RecursiveCanonical(Canonical::Bool(
-                    BoolArray::try_new_from_handle(bits, offset, len, validity.execute(ctx)?)?,
+                    BoolArray::try_new_from_handle(
+                        bits,
+                        meta.offset(),
+                        meta.len(),
+                        validity.execute(ctx)?,
+                    )?,
                 )))
             }
             Canonical::Primitive(p) => {
@@ -793,14 +836,23 @@ impl Executable for RecursiveCanonical {
                 ),
             ))),
             Canonical::Variant(variant) => {
-                Ok(RecursiveCanonical(Canonical::Variant(VariantArray::new(
-                    variant
-                        .child()
-                        .clone()
-                        .execute::<RecursiveCanonical>(ctx)?
-                        .0
-                        .into_array(),
-                ))))
+                let core_storage = recursively_canonicalize_slots(variant.core_storage(), ctx)?;
+                let shredded = variant
+                    .shredded()
+                    .map(|shredded| {
+                        if shredded.is::<Variant>() {
+                            recursively_canonicalize_slots(shredded, ctx)
+                        } else {
+                            shredded
+                                .clone()
+                                .execute::<RecursiveCanonical>(ctx)
+                                .map(|canonical| canonical.0.into_array())
+                        }
+                    })
+                    .transpose()?;
+                Ok(RecursiveCanonical(Canonical::Variant(
+                    VariantArray::try_new(core_storage, shredded)?,
+                )))
             }
         }
     }
@@ -947,6 +999,21 @@ impl Executable for StructArray {
     }
 }
 
+/// Execute the array to canonical form and unwrap as a [`VariantArray`].
+///
+/// This will panic if the array's dtype is not variant.
+impl Executable for VariantArray {
+    fn execute(array: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<Self> {
+        match array.try_downcast::<Variant>() {
+            Ok(variant_array) => Ok(variant_array),
+            Err(array) => match Canonical::execute(array, ctx)? {
+                Canonical::Variant(variant_array) => Ok(variant_array),
+                canonical => vortex_panic!("Cannot unwrap VariantArray from {:?}", canonical),
+            },
+        }
+    }
+}
+
 /// A view into a canonical array type.
 ///
 /// Uses `ArrayView<V>` because these are obtained by
@@ -1005,6 +1072,7 @@ pub struct AnyCanonical;
 impl Matcher for AnyCanonical {
     type Match<'a> = CanonicalView<'a>;
 
+    #[inline]
     fn matches(array: &ArrayRef) -> bool {
         array.is::<Null>()
             || array.is::<Bool>()
@@ -1016,10 +1084,10 @@ impl Matcher for AnyCanonical {
             || array.is::<VarBinView>()
             || array.is::<Variant>()
             || array.is::<Extension>()
-            || array.is::<Variant>()
     }
 
-    fn try_match<'a>(array: &'a ArrayRef) -> Option<Self::Match<'a>> {
+    #[inline]
+    fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>> {
         if let Some(a) = array.as_opt::<Null>() {
             Some(CanonicalView::Null(a))
         } else if let Some(a) = array.as_opt::<Bool>() {
@@ -1047,6 +1115,7 @@ impl Matcher for AnyCanonical {
 #[cfg(test)]
 mod test {
     use std::sync::Arc;
+    use std::sync::LazyLock;
 
     use arrow_array::Array as ArrowArray;
     use arrow_array::ArrayRef as ArrowArrayRef;
@@ -1064,16 +1133,82 @@ mod test {
     use arrow_schema::DataType;
     use arrow_schema::Field;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
+    use vortex_error::vortex_err;
+    use vortex_session::VortexSession;
 
     use crate::ArrayRef;
+    use crate::Canonical;
+    use crate::CanonicalValidity;
     use crate::IntoArray;
+    use crate::VortexSessionExecute;
+    use crate::arrays::Constant;
     use crate::arrays::ConstantArray;
+    use crate::arrays::Primitive;
+    use crate::arrays::Struct;
+    use crate::arrays::Variant;
+    use crate::arrays::VariantArray;
+    use crate::arrays::struct_::StructArrayExt;
+    use crate::arrays::variant::VariantArrayExt;
+    use crate::arrow::ArrowSessionExt;
     use crate::arrow::FromArrowArray;
-    use crate::arrow::IntoArrowArray;
     use crate::canonical::StructArray;
+    use crate::dtype::Nullability;
+    use crate::scalar::Scalar;
+    use crate::session::ArraySession;
+
+    /// A shared session for these canonical tests, used to create execution contexts.
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
+
+    fn variant_core_storage(len: usize) -> ArrayRef {
+        ConstantArray::new(
+            Scalar::variant(Scalar::primitive(1i32, Nullability::NonNullable)),
+            len,
+        )
+        .into_array()
+    }
+
+    #[test]
+    fn canonical_validity_canonicalizes_variant_shredded_physical_slots() -> VortexResult<()> {
+        let len = 2;
+        let nested_shredded =
+            StructArray::try_from_iter([("value", ConstantArray::new(10i32, len).into_array())])?;
+        let inner_variant = VariantArray::try_new(
+            variant_core_storage(len),
+            Some(nested_shredded.into_array()),
+        )?;
+        let outer_variant =
+            VariantArray::try_new(variant_core_storage(len), Some(inner_variant.into_array()))?;
+
+        let mut ctx = SESSION.create_execution_ctx();
+        let Canonical::Variant(canonical) = outer_variant
+            .into_array()
+            .execute::<CanonicalValidity>(&mut ctx)?
+            .0
+        else {
+            return Err(vortex_err!("expected canonical variant"));
+        };
+
+        let nested_variant = canonical
+            .shredded()
+            .and_then(|shredded| shredded.as_opt::<Variant>())
+            .ok_or_else(|| vortex_err!("expected nested variant shredded child"))?;
+        let nested_struct = nested_variant
+            .shredded()
+            .and_then(|shredded| shredded.as_opt::<Struct>())
+            .ok_or_else(|| vortex_err!("expected nested struct shredded child"))?;
+        let value = nested_struct.unmasked_field_by_name("value")?;
+
+        assert!(value.is::<Primitive>());
+        assert!(!value.is::<Constant>());
+
+        Ok(())
+    }
 
     #[test]
     fn test_canonicalize_nested_struct() {
+        let mut ctx = SESSION.create_execution_ctx();
         // Create a struct array with multiple internal components.
         let nested_struct_array = StructArray::from_fields(&[
             ("a", buffer![1u64].into_array()),
@@ -1093,9 +1228,9 @@ mod test {
         ])
         .unwrap();
 
-        let arrow_struct = nested_struct_array
-            .into_array()
-            .into_arrow_preferred()
+        let arrow_struct = SESSION
+            .arrow()
+            .execute_arrow(nested_struct_array.into_array(), None, &mut ctx)
             .unwrap()
             .as_any()
             .downcast_ref::<ArrowStructArray>()
@@ -1130,6 +1265,7 @@ mod test {
 
     #[test]
     fn roundtrip_struct() {
+        let mut ctx = SESSION.create_execution_ctx();
         let mut nulls = NullBufferBuilder::new(6);
         nulls.append_n_non_nulls(4);
         nulls.append_null();
@@ -1162,15 +1298,16 @@ mod test {
         );
 
         let vortex_struct = ArrayRef::from_arrow(&arrow_struct, true).unwrap();
-
-        assert_eq!(
-            &arrow_struct,
-            vortex_struct.into_arrow_preferred().unwrap().as_struct()
-        );
+        let vortex_struct = SESSION
+            .arrow()
+            .execute_arrow(vortex_struct, None, &mut ctx)
+            .unwrap();
+        assert_eq!(&arrow_struct, vortex_struct.as_struct());
     }
 
     #[test]
     fn roundtrip_list() {
+        let mut ctx = SESSION.create_execution_ctx();
         let names = Arc::new(StringArray::from_iter(vec![
             Some("Joseph"),
             Some("Angela"),
@@ -1184,10 +1321,14 @@ mod test {
             None,
         );
         let list_data_type = arrow_list.data_type();
+        let list_field = Field::new(String::new(), list_data_type.clone(), true);
 
         let vortex_list = ArrayRef::from_arrow(&arrow_list, true).unwrap();
 
-        let rt_arrow_list = vortex_list.into_arrow(list_data_type).unwrap();
+        let rt_arrow_list = SESSION
+            .arrow()
+            .execute_arrow(vortex_list, Some(&list_field), &mut ctx)
+            .unwrap();
 
         assert_eq!(
             (Arc::new(arrow_list.clone()) as ArrowArrayRef).as_ref(),

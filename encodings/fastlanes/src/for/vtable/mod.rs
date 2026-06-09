@@ -12,16 +12,17 @@ use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
-use vortex_array::Precision;
 use vortex_array::arrays::PrimitiveArray;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar::ScalarValue;
 use vortex_array::serde::ArrayChildren;
+use vortex_array::smallvec::smallvec;
 use vortex_array::vtable::VTable;
 use vortex_array::vtable::ValidityVTableFromChild;
 use vortex_error::VortexExpect;
@@ -49,19 +50,19 @@ mod validity;
 pub type FoRArray = Array<FoR>;
 
 impl ArrayHash for FoRData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, _precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, _accuracy: EqMode) {
         self.reference.hash(state);
     }
 }
 
 impl ArrayEq for FoRData {
-    fn array_eq(&self, other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, _accuracy: EqMode) -> bool {
         self.reference == other.reference
     }
 }
 
 impl VTable for FoR {
-    type ArrayData = FoRData;
+    type TypedArrayData = FoRData;
 
     type OperationsVTable = Self;
     type ValidityVTable = ValidityVTableFromChild;
@@ -73,7 +74,7 @@ impl VTable for FoR {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         dtype: &DType,
         len: usize,
         slots: &[Option<ArrayRef>],
@@ -132,7 +133,7 @@ impl VTable for FoR {
         let scalar_value = ScalarValue::from_proto_bytes(metadata, dtype, session)?;
         let reference = Scalar::try_new(dtype.clone(), scalar_value)?;
         let encoded = children.get(0, dtype, len)?;
-        let slots = vec![Some(encoded)];
+        let slots = smallvec![Some(encoded)];
 
         let data = FoRData::try_new(reference)?;
         Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
@@ -173,7 +174,7 @@ impl FoR {
         let reference = reference.cast(&dtype)?;
         let len = encoded.len();
         let data = FoRData::try_new(reference)?;
-        let slots = vec![Some(encoded)];
+        let slots = smallvec![Some(encoded)];
         Array::try_from_parts(ArrayParts::new(FoR, dtype, len, data).with_slots(slots))
     }
 

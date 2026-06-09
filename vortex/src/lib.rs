@@ -12,9 +12,12 @@ use vortex_array::dtype::session::DTypeSession;
 // vortex::expr is in the process of having its dependencies inverted, and will eventually be
 // pulled back out into a vortex_expr crate.
 pub use vortex_array::expr;
+use vortex_array::memory::MemorySession;
+use vortex_array::optimizer::kernels::ArrayKernels;
 pub use vortex_array::scalar_fn;
 use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
+use vortex_array::stats::session::StatsSession;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::session::LayoutSession;
 use vortex_session::VortexSession;
@@ -154,7 +157,8 @@ pub mod encodings {
 
 /// Extension trait to create a default Vortex session.
 pub trait VortexSessionDefault {
-    /// Creates a default Vortex session with the standard arrays, layouts, and expressions.
+    /// Creates a default Vortex session with standard arrays, layouts, scalar functions,
+    /// optimizer kernels, expressions, aggregate functions, and runtime support.
     fn default() -> VortexSession;
 }
 
@@ -165,7 +169,10 @@ impl VortexSessionDefault for VortexSession {
             .with::<ArraySession>()
             .with::<LayoutSession>()
             .with::<ScalarFnSession>()
+            .with::<StatsSession>()
+            .with::<ArrayKernels>()
             .with::<AggregateFnSession>()
+            .with::<MemorySession>()
             .with::<RuntimeSession>();
 
         #[cfg(feature = "files")]
@@ -246,7 +253,11 @@ mod test {
         let array = PrimitiveArray::new(buffer![42u64; 100_000], Validity::NonNullable);
 
         // You can compress an array in-memory with the BtrBlocks compressor
-        let compressed = BtrBlocksCompressor::default().compress(&array.clone().into_array())?;
+        let session = VortexSession::default();
+        let compressed = BtrBlocksCompressor::default().compress(
+            &array.clone().into_array(),
+            &mut session.create_execution_ctx(),
+        )?;
         println!(
             "BtrBlocks size: {} / {}",
             compressed.nbytes(),

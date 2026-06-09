@@ -16,17 +16,20 @@ use vortex_session::registry::CachedId;
 use crate::ArrayEq;
 use crate::ArrayHash;
 use crate::ArrayRef;
+use crate::EqMode;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::IntoArray;
-use crate::Precision;
 use crate::array::Array;
 use crate::array::ArrayId;
+use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
 use crate::arrays::list::ListArrayExt;
 use crate::arrays::list::ListData;
+use crate::arrays::list::array::ELEMENTS_SLOT;
 use crate::arrays::list::array::NUM_SLOTS;
+use crate::arrays::list::array::OFFSETS_SLOT;
 use crate::arrays::list::array::SLOT_NAMES;
 use crate::arrays::list::compute::PARENT_KERNELS;
 use crate::arrays::list::compute::rules::PARENT_RULES;
@@ -51,17 +54,17 @@ pub struct ListMetadata {
 }
 
 impl ArrayHash for ListData {
-    fn array_hash<H: Hasher>(&self, _state: &mut H, _precision: Precision) {}
+    fn array_hash<H: Hasher>(&self, _state: &mut H, _accuracy: EqMode) {}
 }
 
 impl ArrayEq for ListData {
-    fn array_eq(&self, _other: &Self, _precision: Precision) -> bool {
+    fn array_eq(&self, _other: &Self, _accuracy: EqMode) -> bool {
         true
     }
 }
 
 impl VTable for List {
-    type ArrayData = ListData;
+    type TypedArrayData = ListData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -115,10 +118,10 @@ impl VTable for List {
             "ListArray expected {NUM_SLOTS} slots, found {}",
             slots.len()
         );
-        let elements = slots[crate::arrays::list::array::ELEMENTS_SLOT]
+        let elements = slots[ELEMENTS_SLOT]
             .as_ref()
             .vortex_expect("ListArray elements slot");
-        let offsets = slots[crate::arrays::list::array::OFFSETS_SLOT]
+        let offsets = slots[OFFSETS_SLOT]
             .as_ref()
             .vortex_expect("ListArray offsets slot");
         vortex_ensure!(
@@ -148,7 +151,7 @@ impl VTable for List {
         _buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = ListMetadata::decode(metadata)?;
         let validity = if children.len() == 2 {
             Validity::from(dtype.nullability())
@@ -176,7 +179,7 @@ impl VTable for List {
 
         let data = ListData::try_build(elements.clone(), offsets.clone(), validity.clone())?;
         let slots = ListData::make_slots(&elements, &offsets, &validity, len);
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {

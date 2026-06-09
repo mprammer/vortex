@@ -9,6 +9,7 @@ use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
+use vortex::expr::stats::Precision as VortexPrecision;
 use vortex::expr::stats::Stat;
 use vortex::scalar::Scalar;
 
@@ -26,54 +27,42 @@ pub(crate) fn stats_set_to_df(
     // TODO(connor): There's a lot that can go wrong here, should probably handle this
     // more gracefully...
     // Find the min statistic.
-    let min = stats_set.get(Stat::Min).and_then(|pstat_val| {
-        pstat_val
-            .map(|stat_val| {
-                Scalar::try_new(
-                    Stat::Min
-                        .dtype(dtype)
-                        .vortex_expect("must have a valid dtype"),
-                    Some(stat_val),
-                )
-                .vortex_expect("`Stat::Min` somehow had an incompatible `DType`")
-                .try_to_df()
-                .ok()
-            })
-            .transpose()
+    let min = stats_set.get(Stat::Min).and_then(|stat_val| {
+        Scalar::try_new(
+            Stat::Min
+                .dtype(dtype)
+                .vortex_expect("must have a valid dtype"),
+            Some(stat_val),
+        )
+        .vortex_expect("`Stat::Min` somehow had an incompatible `DType`")
+        .try_to_df()
+        .ok()
     });
 
     // Find the max statistic.
-    let max = stats_set.get(Stat::Max).and_then(|pstat_val| {
-        pstat_val
-            .map(|stat_val| {
-                Scalar::try_new(
-                    Stat::Max
-                        .dtype(dtype)
-                        .vortex_expect("must have a valid dtype"),
-                    Some(stat_val),
-                )
-                .vortex_expect("`Stat::Max` somehow had an incompatible `DType`")
-                .try_to_df()
-                .ok()
-            })
-            .transpose()
+    let max = stats_set.get(Stat::Max).and_then(|stat_val| {
+        Scalar::try_new(
+            Stat::Max
+                .dtype(dtype)
+                .vortex_expect("must have a valid dtype"),
+            Some(stat_val),
+        )
+        .vortex_expect("`Stat::Max` somehow had an incompatible `DType`")
+        .try_to_df()
+        .ok()
     });
 
     // Find the sum statistic
-    let sum = stats_set.get(Stat::Sum).and_then(|pstat_val| {
-        pstat_val
-            .map(|stat_val| {
-                Scalar::try_new(
-                    Stat::Sum
-                        .dtype(dtype)
-                        .vortex_expect("must have a valid dtype"),
-                    Some(stat_val),
-                )
-                .vortex_expect("`Stat::Sum` somehow had an incompatible `DType`")
-                .try_to_df()
-                .ok()
-            })
-            .transpose()
+    let sum = stats_set.get(Stat::Sum).and_then(|stat_val| {
+        Scalar::try_new(
+            Stat::Sum
+                .dtype(dtype)
+                .vortex_expect("must have a valid dtype"),
+            Some(stat_val),
+        )
+        .vortex_expect("`Stat::Sum` somehow had an incompatible `DType`")
+        .try_to_df()
+        .ok()
     });
 
     let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
@@ -83,10 +72,40 @@ pub(crate) fn stats_set_to_df(
         min_value: min.to_df(),
         max_value: max.to_df(),
         sum_value: sum.to_df(),
-        distinct_count: stats_set
-            .get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable))
-            .and_then(|is_constant| is_constant.as_exact().map(|_| Precision::Exact(1)))
-            .unwrap_or(Precision::Absent),
+        distinct_count: is_constant_to_distinct_count(
+            stats_set.get_as::<bool>(Stat::IsConstant, &DType::Bool(Nullability::NonNullable)),
+        ),
         byte_size: column_size.to_df(),
     })
+}
+
+pub(crate) fn is_constant_to_distinct_count(
+    is_constant: VortexPrecision<bool>,
+) -> Precision<usize> {
+    match is_constant.as_exact() {
+        Some(true) => Precision::Exact(1),
+        Some(false) | None => Precision::Absent,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use vortex::expr::stats::Precision as VortexPrecision;
+
+    use super::*;
+
+    #[test]
+    fn is_constant_false_does_not_imply_one_distinct_value() -> VortexResult<()> {
+        let false_constant = StatsSet::of(Stat::IsConstant, VortexPrecision::exact(false));
+        let false_stats = stats_set_to_df(&false_constant, &DType::Bool(Nullability::NonNullable))?;
+
+        assert_eq!(false_stats.distinct_count, Precision::Absent);
+
+        let true_constant = StatsSet::of(Stat::IsConstant, VortexPrecision::exact(true));
+        let true_stats = stats_set_to_df(&true_constant, &DType::Bool(Nullability::NonNullable))?;
+
+        assert_eq!(true_stats.distinct_count, Precision::Exact(1));
+
+        Ok(())
+    }
 }

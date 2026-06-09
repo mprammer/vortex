@@ -1,7 +1,6 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::sync::Arc;
 
 use arrow_schema::SchemaRef;
@@ -25,11 +24,8 @@ use futures::StreamExt;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use tokio_stream::wrappers::ReceiverStream;
-use vortex::array::ArrayRef;
-use vortex::array::arrow::FromArrowArray;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::stream::ArrayStreamAdapter;
-use vortex::dtype::DType;
-use vortex::dtype::arrow::FromArrowType;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::file::WriteSummary;
 use vortex::io::VortexWrite;
@@ -72,10 +68,6 @@ impl DisplayAs for VortexSink {
 
 #[async_trait]
 impl DataSink for VortexSink {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn metrics(&self) -> Option<MetricsSet> {
         None
     }
@@ -115,12 +107,23 @@ impl FileSink for VortexSink {
             let session = self.session.clone();
             let object_store = Arc::clone(&object_store);
             let writer_schema = get_writer_schema(&self.config);
-            let dtype = DType::from_arrow(writer_schema);
+            let dtype = session
+                .arrow()
+                .from_arrow_schema(&writer_schema)
+                .map_err(|e| {
+                    exec_datafusion_err!("Failed to derive Vortex DType from writer schema: {e}")
+                })?;
 
             // We need to spawn work because there's a dependency between the different files. If one file has too many batches buffered,
             // the demux task might deadlock itself.
+            let arrow_session = session.clone();
+            let import_schema = Arc::clone(&writer_schema);
             file_write_tasks.spawn(async move {
-                let stream = ReceiverStream::new(rx).map(move |rb| ArrayRef::from_arrow(rb, false));
+                let stream = ReceiverStream::new(rx).map(move |rb| {
+                    arrow_session
+                        .arrow()
+                        .from_arrow_record_batch(rb, &import_schema)
+                });
 
                 let stream_adapter = ArrayStreamAdapter::new(dtype, stream);
 
@@ -189,6 +192,7 @@ mod tests {
     use datafusion::logical_expr::LogicalPlan;
     use datafusion::logical_expr::LogicalPlanBuilder;
     use datafusion::logical_expr::Values;
+    use datafusion::logical_expr::dml::InsertOp;
     use datafusion_common::ScalarValue;
     use datafusion_datasource::file_format::format_as_file_type;
     use futures::TryStreamExt;
@@ -268,7 +272,7 @@ mod tests {
             LogicalPlan::Values(values.clone()),
             "my_tbl",
             Arc::new(DefaultTableSource::new(Arc::clone(&tbl_provider))),
-            datafusion::logical_expr::dml::InsertOp::Append,
+            InsertOp::Append,
         )?
         .build()?;
 

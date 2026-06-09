@@ -22,6 +22,7 @@ pub use executor::*;
 pub use hash::*;
 pub use mask_future::*;
 pub use metadata::*;
+pub use smallvec;
 pub use vortex_array_macros::array_slots;
 use vortex_session::VortexSession;
 use vortex_session::registry::Context;
@@ -32,6 +33,7 @@ pub mod accessor;
 pub mod aggregate_fn;
 #[doc(hidden)]
 pub mod aliases;
+mod arc_swap_map;
 mod array;
 pub mod arrays;
 pub mod arrow;

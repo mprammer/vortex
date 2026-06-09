@@ -8,6 +8,7 @@ use async_trait::async_trait;
 use serde::Deserialize;
 use serde::Serialize;
 use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 
 use crate::clickbench::Flavor;
 
@@ -21,11 +22,33 @@ pub mod tpch_l_comment;
 
 use std::path::PathBuf;
 
+pub(crate) const DEFAULT_BENCHMARK_RUNNER_ID: &str = "unknown";
+
+pub(crate) fn normalize_benchmark_runner_id(benchmark_runner: &str) -> String {
+    let benchmark_runner = benchmark_runner.trim().replace('/', "_");
+    if benchmark_runner.is_empty() {
+        DEFAULT_BENCHMARK_RUNNER_ID.to_string()
+    } else {
+        benchmark_runner
+    }
+}
+
 #[async_trait]
 pub trait Dataset {
     fn name(&self) -> &str;
 
-    async fn to_vortex_array(&self) -> Result<ArrayRef>;
+    /// Map this dataset to the v3 `(dataset, dataset_variant)` pair emitted
+    /// in `compression_*` records.
+    ///
+    /// Default: `(name(), None)`. Override only when a suite needs a
+    /// different dataset name on the wire than its `name()` returns. The
+    /// query-side equivalent is documented on
+    /// [`crate::v3::benchmark_dataset_dims`].
+    fn v3_dataset_dims(&self) -> (&str, Option<&str>) {
+        (self.name(), None)
+    }
+
+    async fn to_vortex_array(&self, ctx: &mut ExecutionCtx) -> Result<ArrayRef>;
 
     /// Get the path to the parquet file for this dataset.
     ///
@@ -36,6 +59,8 @@ pub trait Dataset {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BenchmarkDataset {
+    #[serde(rename = "appian")]
+    Appian,
     #[serde(rename = "tpch")]
     TpcH { scale_factor: String },
     #[serde(rename = "tpcds")]
@@ -57,6 +82,7 @@ pub enum BenchmarkDataset {
 impl BenchmarkDataset {
     pub fn name(&self) -> &str {
         match self {
+            BenchmarkDataset::Appian => "appian",
             BenchmarkDataset::TpcH { .. } => "tpch",
             BenchmarkDataset::TpcDS { .. } => "tpcds",
             BenchmarkDataset::ClickBench { .. } => "clickbench",
@@ -72,6 +98,7 @@ impl BenchmarkDataset {
 impl Display for BenchmarkDataset {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            BenchmarkDataset::Appian => write!(f, "appian"),
             BenchmarkDataset::TpcH { scale_factor } => write!(f, "tpch(sf={scale_factor})"),
             BenchmarkDataset::TpcDS { scale_factor } => write!(f, "tpcds(sf={scale_factor})"),
             BenchmarkDataset::ClickBench { flavor, .. } => match flavor {
@@ -89,9 +116,22 @@ impl Display for BenchmarkDataset {
     }
 }
 
+const APPIAN_TABLES: &[&str] = &[
+    "addressview",
+    "categoryview",
+    "creditcardview",
+    "customerview",
+    "orderitemnovelty_update",
+    "orderitemview",
+    "orderview",
+    "productview",
+    "taxrecordview",
+];
+
 impl BenchmarkDataset {
     pub fn tables(&self) -> &[&'static str] {
         match self {
+            BenchmarkDataset::Appian => APPIAN_TABLES,
             BenchmarkDataset::TpcDS { .. } => &[
                 "call_center",
                 "catalog_sales",

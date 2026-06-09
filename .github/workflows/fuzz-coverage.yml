@@ -11,11 +11,6 @@ env:
 jobs:
   coverage:
     name: "Coverage: ${{ matrix.fuzz_target }}"
-    env:
-      AWS_ACCESS_KEY_ID: ${{ secrets.R2_FUZZ_ACCESS_KEY_ID }}
-      AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_FUZZ_SECRET_ACCESS_KEY }}
-      AWS_REGION: "us-east-1"
-      AWS_ENDPOINT_URL: "https://01e9655179bbec953276890b183039bc.r2.cloudflarestorage.com"
     strategy:
       fail-fast: false
       matrix:
@@ -31,7 +26,7 @@ jobs:
         with:
           sccache: s3
 
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10  # v6
 
       - uses: ./.github/actions/setup-rust
         with:
@@ -45,11 +40,14 @@ jobs:
             rustup component add llvm-tools-preview --toolchain $NIGHTLY_TOOLCHAIN
 
           # Verify llvm-profdata is accessible (cargo-fuzz needs it for coverage merging)
-          LLVM_PROFDATA="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)/lib/rustlib/$(rustc +$NIGHTLY_TOOLCHAIN -vV | sed -n 's|host: ||p')/bin/llvm-profdata"
+          RUST_SYSROOT="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)"
+          RUST_HOST="$(rustc +$NIGHTLY_TOOLCHAIN --print host-tuple)"
+          LLVM_TOOLS_BIN="${RUST_SYSROOT}/lib/rustlib/${RUST_HOST}/bin"
+          LLVM_PROFDATA="${LLVM_TOOLS_BIN}/llvm-profdata"
           if [ ! -f "$LLVM_PROFDATA" ]; then
             echo "ERROR: llvm-profdata not found at $LLVM_PROFDATA"
             echo "Listing bin directory:"
-            ls -la "$(dirname "$LLVM_PROFDATA")" || echo "Directory does not exist"
+            ls -la "$LLVM_TOOLS_BIN" || echo "Directory does not exist"
             exit 1
           fi
           echo "Found llvm-profdata at $LLVM_PROFDATA"
@@ -61,6 +59,11 @@ jobs:
 
       - name: Download corpus from R2
         shell: bash
+        env:
+          AWS_ACCESS_KEY_ID: ${{ secrets.R2_FUZZ_ACCESS_KEY_ID }}
+          AWS_SECRET_ACCESS_KEY: ${{ secrets.R2_FUZZ_SECRET_ACCESS_KEY }}
+          AWS_REGION: "us-east-1"
+          AWS_ENDPOINT_URL: "https://01e9655179bbec953276890b183039bc.r2.cloudflarestorage.com"
         run: |
           CORPUS_KEY="${{ matrix.fuzz_target }}_corpus.tar.zst"
           CORPUS_DIR="fuzz/corpus/${{ matrix.fuzz_target }}"
@@ -84,13 +87,13 @@ jobs:
           COVERAGE_DIR="fuzz/coverage/${{ matrix.fuzz_target }}"
 
           # llvm tools are installed via rustup's llvm-tools component
-          LLVM_TOOLS_BIN="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)/lib/rustlib/$(rustc +$NIGHTLY_TOOLCHAIN -vV | sed -n 's|host: ||p')/bin"
-
-          TARGET_TRIPLE=$(rustc +$NIGHTLY_TOOLCHAIN -vV | sed -n 's|host: ||p')
+          RUST_SYSROOT="$(rustc +$NIGHTLY_TOOLCHAIN --print sysroot)"
+          RUST_HOST="$(rustc +$NIGHTLY_TOOLCHAIN --print host-tuple)"
+          LLVM_TOOLS_BIN="${RUST_SYSROOT}/lib/rustlib/${RUST_HOST}/bin"
 
           # cargo-fuzz coverage places the binary at:
           #   target/<triple>/coverage/<triple>/release/<fuzz_target>
-          FUZZ_BIN="target/${TARGET_TRIPLE}/coverage/${TARGET_TRIPLE}/release/${{ matrix.fuzz_target }}"
+          FUZZ_BIN="target/${RUST_HOST}/coverage/${RUST_HOST}/release/${{ matrix.fuzz_target }}"
 
           if [ ! -f "$FUZZ_BIN" ]; then
             echo "ERROR: Could not find fuzz binary at $FUZZ_BIN"
@@ -114,7 +117,7 @@ jobs:
             --ignore-filename-regex='(\.cargo|rustc|registry)'
 
       - name: Upload coverage report
-        uses: actions/upload-artifact@v7
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a  # v7
         with:
           name: ${{ matrix.fuzz_target }}-coverage
           path: coverage_html/

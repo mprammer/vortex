@@ -17,8 +17,10 @@ use crate::ArrayRef;
 use crate::ExecutionCtx;
 use crate::ExecutionResult;
 use crate::array::Array;
+use crate::array::ArrayParts;
 use crate::array::ArrayView;
 use crate::array::VTable;
+use crate::array::child_to_validity;
 use crate::arrays::bool::BoolData;
 use crate::arrays::bool::array::SLOT_NAMES;
 use crate::buffer::BufferHandle;
@@ -32,7 +34,7 @@ mod validity;
 
 use vortex_session::registry::CachedId;
 
-use crate::Precision;
+use crate::EqMode;
 use crate::array::ArrayId;
 use crate::arrays::bool::compute::rules::RULES;
 use crate::hash::ArrayEq;
@@ -49,20 +51,20 @@ pub struct BoolMetadata {
 }
 
 impl ArrayHash for BoolData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
-        self.bits.array_hash(state, precision);
-        self.offset.hash(state);
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
+        self.bits.array_hash(state, accuracy);
+        self.meta.offset().hash(state);
     }
 }
 
 impl ArrayEq for BoolData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
-        self.offset == other.offset && self.bits.array_eq(&other.bits, precision)
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
+        self.meta.offset() == other.meta.offset() && self.bits.array_eq(&other.bits, accuracy)
     }
 }
 
 impl VTable for Bool {
-    type ArrayData = BoolData;
+    type TypedArrayData = BoolData;
 
     type OperationsVTable = Self;
     type ValidityVTable = Self;
@@ -94,10 +96,11 @@ impl VTable for Bool {
         array: ArrayView<'_, Self>,
         _session: &VortexSession,
     ) -> VortexResult<Option<Vec<u8>>> {
-        assert!(array.offset < 8, "Offset must be <8, got {}", array.offset);
+        let offset = array.meta.offset();
+        assert!(offset < 8, "Offset must be <8, got {offset}");
         Ok(Some(
             BoolMetadata {
-                offset: u32::try_from(array.offset).vortex_expect("checked"),
+                offset: u32::try_from(offset).vortex_expect("checked"),
             }
             .encode_to_vec(),
         ))
@@ -114,14 +117,14 @@ impl VTable for Bool {
             vortex_bail!("Expected bool dtype, got {dtype:?}");
         };
         vortex_ensure!(
-            data.bits.len() * 8 >= data.offset + len,
+            data.bits.len() * 8 >= data.meta.offset() + len,
             "BoolArray buffer with offset {} cannot back outer length {} (buffer bits = {})",
-            data.offset,
+            data.meta.offset(),
             len,
             data.bits.len() * 8
         );
 
-        let validity = crate::array::child_to_validity(&slots[0], *nullability);
+        let validity = child_to_validity(slots[0].as_ref(), *nullability);
         if let Some(validity_len) = validity.maybe_len() {
             vortex_ensure!(
                 validity_len == len,
@@ -139,11 +142,10 @@ impl VTable for Bool {
         dtype: &DType,
         len: usize,
         metadata: &[u8],
-
         buffers: &[BufferHandle],
         children: &dyn ArrayChildren,
         _session: &VortexSession,
-    ) -> VortexResult<crate::array::ArrayParts<Self>> {
+    ) -> VortexResult<ArrayParts<Self>> {
         let metadata = BoolMetadata::decode(metadata)?;
         if buffers.len() != 1 {
             vortex_bail!("Expected 1 buffer, got {}", buffers.len());
@@ -161,7 +163,7 @@ impl VTable for Bool {
         let buffer = buffers[0].clone();
         let slots = BoolData::make_slots(&validity, len);
         let data = BoolData::try_new_from_handle(buffer, metadata.offset as usize, len, validity)?;
-        Ok(crate::array::ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
+        Ok(ArrayParts::new(self.clone(), dtype.clone(), len, data).with_slots(slots))
     }
 
     fn slot_name(_array: ArrayView<'_, Self>, idx: usize) -> String {

@@ -5,15 +5,19 @@ use vortex_array::arrays::dict::TakeExecuteAdaptor;
 use vortex_array::arrays::filter::FilterExecuteAdaptor;
 use vortex_array::kernel::ParentKernelSet;
 use vortex_array::scalar_fn::fns::binary::CompareExecuteAdaptor;
+use vortex_array::scalar_fn::fns::byte_length::ByteLengthExecuteAdaptor;
+use vortex_array::scalar_fn::fns::cast::CastExecuteAdaptor;
 use vortex_array::scalar_fn::fns::like::LikeExecuteAdaptor;
 
 use crate::FSST;
 
 pub(super) const PARENT_KERNELS: ParentKernelSet<FSST> = ParentKernelSet::new(&[
+    ParentKernelSet::lift(&CastExecuteAdaptor(FSST)),
     ParentKernelSet::lift(&CompareExecuteAdaptor(FSST)),
     ParentKernelSet::lift(&FilterExecuteAdaptor(FSST)),
     ParentKernelSet::lift(&TakeExecuteAdaptor(FSST)),
     ParentKernelSet::lift(&LikeExecuteAdaptor(FSST)),
+    ParentKernelSet::lift(&ByteLengthExecuteAdaptor(FSST)),
 ]);
 
 #[cfg(test)]
@@ -25,10 +29,13 @@ mod tests {
     use vortex_array::IntoArray;
     use vortex_array::VortexSessionExecute;
     use vortex_array::arrays::FilterArray;
+    use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::varbin::builder::VarBinBuilder;
     use vortex_array::assert_arrays_eq;
     use vortex_array::dtype::DType;
     use vortex_array::dtype::Nullability;
+    use vortex_array::expr::byte_length;
+    use vortex_array::expr::root;
     use vortex_array::session::ArraySession;
     use vortex_error::VortexResult;
     use vortex_mask::Mask;
@@ -58,7 +65,8 @@ mod tests {
         let compressor = fsst_train_compressor(&input);
         let len = input.len();
         let dtype = input.dtype().clone();
-        fsst_compress(input, len, &dtype, &compressor).into_array()
+        let mut ctx = SESSION.create_execution_ctx();
+        fsst_compress(input, len, &dtype, &compressor, &mut ctx).into_array()
     }
 
     #[test]
@@ -131,8 +139,15 @@ mod tests {
         let input = builder.finish(DType::Utf8(Nullability::Nullable));
 
         let compressor = fsst_train_compressor(&input);
-        let fsst_array: ArrayRef =
-            fsst_compress(input.clone(), input.len(), input.dtype(), &compressor).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let fsst_array: ArrayRef = fsst_compress(
+            input.clone(),
+            input.len(),
+            input.dtype(),
+            &compressor,
+            &mut ctx,
+        )
+        .into_array();
 
         // Filter: only select the last element (index 22)
         let mut mask = vec![false; 22];
@@ -140,7 +155,6 @@ mod tests {
         let mask = Mask::from_iter(mask);
 
         let filter_array = FilterArray::new(fsst_array, mask.clone()).into_array();
-        let mut ctx = SESSION.create_execution_ctx();
         let result = filter_array.execute::<Canonical>(&mut ctx)?;
 
         let expected = input.filter(mask)?;
@@ -160,13 +174,19 @@ mod tests {
         let input = builder.finish(DType::Utf8(Nullability::Nullable));
 
         let compressor = fsst_train_compressor(&input);
-        let fsst_array: ArrayRef =
-            fsst_compress(input.clone(), input.len(), input.dtype(), &compressor).into_array();
+        let mut ctx = SESSION.create_execution_ctx();
+        let fsst_array: ArrayRef = fsst_compress(
+            input.clone(),
+            input.len(),
+            input.dtype(),
+            &compressor,
+            &mut ctx,
+        )
+        .into_array();
 
         let mask = Mask::from_iter([true, false, true]);
 
         let filter_array = FilterArray::new(fsst_array, mask.clone()).into_array();
-        let mut ctx = SESSION.create_execution_ctx();
         let result = filter_array.execute::<Canonical>(&mut ctx)?;
 
         let expected = input.filter(mask)?;
@@ -188,6 +208,26 @@ mod tests {
         let result = filter_array.execute::<Canonical>(&mut ctx)?.into_array();
 
         assert_arrays_eq!(result, fsst_array);
+        Ok(())
+    }
+
+    #[test]
+    fn test_fsst_byte_length() -> VortexResult<()> {
+        let mut builder = VarBinBuilder::<i32>::with_capacity(3);
+        builder.append_value(b"hello");
+        builder.append_value(b"world!!");
+        builder.append_value("Пуховички"); // 9 characters, 18 bytes
+        builder.append_value(b"");
+
+        let varbin = builder.finish(DType::Utf8(Nullability::NonNullable));
+        let compressor = fsst_train_compressor(&varbin);
+        let len = varbin.len();
+        let dtype = varbin.dtype().clone();
+        let mut ctx = SESSION.create_execution_ctx();
+        let fsst = fsst_compress(varbin, len, &dtype, &compressor, &mut ctx).into_array();
+        let result = fsst.apply(&byte_length(root()))?;
+        let expected = PrimitiveArray::from_iter(vec![5u64, 7, 18, 0]);
+        assert_arrays_eq!(result, expected);
         Ok(())
     }
 }

@@ -40,11 +40,11 @@ fn slice_preserves_data() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 4,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     // Full decompress then slice.
     let mut ctx = SESSION.create_execution_ctx();
@@ -85,11 +85,11 @@ fn scalar_at_matches_decompress() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 2,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     let full_decoded = encoded.clone().execute::<ExtensionArray>(&mut ctx)?;
 
@@ -108,11 +108,11 @@ fn l2_norm_readthrough() -> VortexResult<()> {
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 3,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 5,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
     let (_sorf_child, norms_child) = unwrap_l2denorm(&encoded);
 
     // Stored norms should match the actual L2 norms of the input.
@@ -146,11 +146,11 @@ fn l2_norm_readthrough_is_authoritative_for_lossy_storage() -> VortexResult<()> 
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 1,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 3,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
     let (_sorf_child, norms_child) = unwrap_l2denorm(&encoded);
 
     let stored_norms: PrimitiveArray = norms_child.execute(&mut ctx)?;
@@ -183,11 +183,11 @@ fn cosine_similarity_readthrough_is_authoritative_for_lossy_storage() -> VortexR
     let ext = make_vector_ext(&fsl);
     let config = TurboQuantConfig {
         bit_width: 1,
-        seed: Some(123),
+        seed: 123,
         num_rounds: 3,
     };
     let mut ctx = SESSION.create_execution_ctx();
-    let encoded = normalize_and_encode(&ext, &config, &mut ctx)?;
+    let encoded = turboquant_encode(ext, &config, &mut ctx)?;
 
     let encoded_cos =
         execute_cosine_similarity(encoded.clone(), encoded.clone(), num_rows, &mut ctx)?;

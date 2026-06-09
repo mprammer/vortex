@@ -5,26 +5,31 @@ use std::fs::File;
 use std::path::PathBuf;
 
 use anyhow::Result;
+use arrow_array::RecordBatch;
+use arrow_array::cast::AsArray;
+use arrow_schema::Field;
 use async_trait::async_trait;
 use parquet::arrow::ArrowWriter;
 use rand::RngExt;
 use rand::SeedableRng;
 use rand::rngs::StdRng;
 use vortex::array::ArrayRef;
+use vortex::array::ExecutionCtx;
 use vortex::array::IntoArray;
-use vortex::array::LEGACY_SESSION;
 use vortex::array::VortexSessionExecute;
+use vortex::array::arrays::Chunked;
 use vortex::array::arrays::ChunkedArray;
 use vortex::array::arrays::ListArray;
 use vortex::array::arrays::PrimitiveArray;
 use vortex::array::arrays::StructArray;
 use vortex::array::arrays::chunked::ChunkedArrayExt;
 use vortex::array::arrays::listview::recursive_list_from_list_view;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::array::validity::Validity;
 use vortex::dtype::FieldNames;
 
 use crate::IdempotentPath;
+use crate::SESSION;
 use crate::datasets::Dataset;
 use crate::idempotent_async;
 
@@ -39,11 +44,26 @@ pub struct StructListOfInts {
 
 impl StructListOfInts {
     pub fn new(num_columns: usize, row_count: usize, chunk_count: usize) -> Self {
+        Self::new_with_projection(num_columns, row_count, chunk_count, None)
+    }
+
+    /// Like [`StructListOfInts::new`], but names the dataset for a projected decompress benchmark.
+    pub fn new_with_projection(
+        num_columns: usize,
+        row_count: usize,
+        chunk_count: usize,
+        project_columns: Option<usize>,
+    ) -> Self {
+        let mut name =
+            format!("wide table cols={num_columns} chunks={chunk_count} rows={row_count}");
+        if let Some(count) = project_columns {
+            name.push_str(&format!(" project={count}"));
+        }
         Self {
             num_columns,
             row_count,
             chunk_count,
-            name: format!("wide table cols={num_columns} chunks={chunk_count} rows={row_count}"),
+            name,
         }
     }
 }
@@ -63,7 +83,7 @@ impl Dataset for StructListOfInts {
         &self.name
     }
 
-    async fn to_vortex_array(&self) -> Result<ArrayRef> {
+    async fn to_vortex_array(&self, _ctx: &mut ExecutionCtx) -> Result<ArrayRef> {
         let names: FieldNames = (0..self.num_columns)
             .map(|col_idx| col_idx.to_string())
             .collect();
@@ -115,19 +135,23 @@ impl Dataset for StructListOfInts {
 
         idempotent_async(&parquet_path, |temp_path| async move {
             // Generate the data
-            let array = self.to_vortex_array().await?;
+            let mut ctx = SESSION.create_execution_ctx();
+            let array = self.to_vortex_array(&mut ctx).await?;
 
             // Convert to Arrow RecordBatches and write to parquet
-            let chunked = array.as_::<vortex::array::arrays::Chunked>();
+            let chunked = array.as_::<Chunked>();
 
             let file = File::create(&temp_path)?;
             let mut writer: Option<ArrowWriter<File>> = None;
 
             for chunk in chunked.iter_chunks() {
-                let converted = recursive_list_from_list_view(chunk.clone())?;
+                let converted = recursive_list_from_list_view(chunk.clone(), &mut ctx)?;
                 let schema = converted.dtype().to_arrow_schema()?;
-                let batch = converted
-                    .execute_record_batch(&schema, &mut LEGACY_SESSION.create_execution_ctx())?;
+                let schema = Field::new_struct("", schema.fields, false);
+                let batch = SESSION
+                    .arrow()
+                    .execute_arrow(converted, Some(&schema), &mut ctx)?;
+                let batch = RecordBatch::from(batch.as_struct());
 
                 if writer.is_none() {
                     writer = Some(ArrowWriter::try_new(

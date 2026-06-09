@@ -31,23 +31,20 @@ use crate::validity::Validity;
 mod bitbuffer;
 mod bool;
 mod buffer;
+pub(crate) mod byte_compress;
 mod decimal;
 mod fixed_size_list;
 mod listview;
 mod primitive;
 mod slice;
 mod struct_;
+pub mod take;
 mod varbinview;
-
-/// Reconstruct a [`Mask`] from an [`Arc<MaskValues>`].
-fn values_to_mask(values: &Arc<MaskValues>) -> Mask {
-    Mask::Values(Arc::clone(values))
-}
 
 /// A helper function that lazily filters a [`Validity`] with selection mask values.
 fn filter_validity(validity: Validity, mask: &Arc<MaskValues>) -> Validity {
     validity
-        .filter(&values_to_mask(mask))
+        .filter(&Mask::Values(Arc::clone(mask)))
         .vortex_expect("Somehow unable to wrap filter around a validity array")
 }
 
@@ -73,7 +70,7 @@ pub(super) fn execute_filter_fast_paths(
     let child_arr = array.array();
     if child_arr
         .validity()?
-        .to_mask(child_arr.len(), ctx)?
+        .execute_mask(child_arr.len(), ctx)?
         .true_count()
         == 0
     {
@@ -101,16 +98,25 @@ pub(super) fn execute_filter(canonical: Canonical, mask: &Arc<MaskValues>) -> Ca
         Canonical::Extension(a) => {
             let filtered_storage = a
                 .storage_array()
-                .filter(values_to_mask(mask))
+                .filter(Mask::Values(Arc::clone(mask)))
                 .vortex_expect("ExtensionArray storage type somehow could not be filtered");
             Canonical::Extension(ExtensionArray::new(a.ext_dtype().clone(), filtered_storage))
         }
         Canonical::Variant(a) => {
-            let filtered_child = a
-                .child()
-                .filter(values_to_mask(mask))
-                .vortex_expect("VariantArray child could not be filtered");
-            Canonical::Variant(VariantArray::new(filtered_child))
+            let filter_mask = Mask::Values(Arc::clone(mask));
+            let filtered_core_storage = a
+                .core_storage()
+                .filter(filter_mask.clone())
+                .vortex_expect("VariantArray core_storage could not be filtered");
+            let filtered_shredded = a.shredded().map(|shredded| {
+                shredded
+                    .filter(filter_mask)
+                    .vortex_expect("VariantArray shredded child could not be filtered")
+            });
+            Canonical::Variant(
+                VariantArray::try_new(filtered_core_storage, filtered_shredded)
+                    .vortex_expect("filtered VariantArray children are row-aligned"),
+            )
         }
     }
 }

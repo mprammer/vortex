@@ -67,20 +67,19 @@
 //! [`DataSourceRef`]: vortex::scan::DataSourceRef
 //! [`ScanRequest`]: vortex::scan::ScanRequest
 
-use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
-use std::num::NonZero;
-use std::num::NonZeroUsize;
 use std::sync::Arc;
 
-use arrow_schema::DataType;
+use arrow_schema::Field;
 use arrow_schema::Schema;
 use arrow_schema::SchemaRef;
 use datafusion_common::ColumnStatistics;
 use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_common::Statistics;
+use datafusion_common::arrow::array::AsArray;
+use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::stats::Precision as DFPrecision;
 use datafusion_datasource::source::DataSource;
 use datafusion_execution::SendableRecordBatchStream;
@@ -99,11 +98,10 @@ use futures::StreamExt;
 use futures::TryStreamExt;
 use futures::future::try_join_all;
 use vortex::array::VortexSessionExecute;
-use vortex::array::arrow::ArrowArrayExecutor;
+use vortex::array::arrow::ArrowSessionExt;
 use vortex::dtype::DType;
 use vortex::dtype::FieldPath;
 use vortex::dtype::Nullability;
-use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::expr::Expression;
@@ -117,6 +115,7 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::scan::ScanRequest;
 use vortex::session::VortexSession;
+use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::convert::exprs::DefaultExpressionConvertor;
 use crate::convert::exprs::ExpressionConvertor;
@@ -211,13 +210,11 @@ impl VortexDataSourceBuilder {
         // Resolve the Arrow schema
         let mut arrow_schema = match self.arrow_schema {
             Some(schema) => schema,
-            None => {
-                let data_type = self.data_source.dtype().to_arrow_dtype()?;
-                let DataType::Struct(fields) = data_type else {
-                    vortex_bail!("Expected a struct-like DataType, found {}", data_type);
-                };
-                Arc::new(Schema::new(fields))
-            }
+            None => Arc::new(
+                self.session
+                    .arrow()
+                    .to_arrow_schema(self.data_source.dtype())?,
+            ),
         };
 
         // Apply any selection and create a projection expression.
@@ -277,9 +274,7 @@ impl VortexDataSourceBuilder {
             filter: None,
             limit: None,
             ordered: false,
-            num_partitions: std::thread::available_parallelism().unwrap_or_else(|_| {
-                NonZero::new(1).vortex_expect("available parallelism must be non-zero")
-            }),
+            num_partitions: get_available_parallelism().unwrap_or(1),
         })
     }
 }
@@ -360,7 +355,7 @@ pub struct VortexDataSource {
     /// We use this as a hint for how many splits to execute concurrently in `open()`, but we
     /// always declare to DataFusion that we only have a single partition so that we can
     /// internally manage concurrency and fix the problem of partition skew.
-    num_partitions: NonZeroUsize,
+    num_partitions: usize,
 }
 
 impl fmt::Debug for VortexDataSource {
@@ -400,6 +395,11 @@ impl DataSource for VortexDataSource {
 
         let data_source = Arc::clone(&self.data_source);
         let projected_schema = Arc::clone(&self.projected_schema);
+        let projected_target_field = Arc::new(Field::new_struct(
+            "",
+            projected_schema.fields().clone(),
+            false,
+        ));
         let session = self.session.clone();
         let num_partitions = self.num_partitions;
 
@@ -428,16 +428,23 @@ impl DataSource for VortexDataSource {
 
             let handle = session.handle();
             let stream = scan_streams
-                .try_flatten_unordered(Some(num_partitions.get() * 2))
+                .try_flatten_unordered(Some(num_partitions * 2))
                 .map(move |result| {
                     let session = session.clone();
-                    let schema = Arc::clone(&projected_schema);
+                    let target_field = Arc::clone(&projected_target_field);
                     handle.spawn_cpu(move || {
                         let mut ctx = session.create_execution_ctx();
-                        result.and_then(|chunk| chunk.execute_record_batch(&schema, &mut ctx))
+                        result.and_then(|chunk| {
+                            let arrow = session.arrow().execute_arrow(
+                                chunk,
+                                Some(target_field.as_ref()),
+                                &mut ctx,
+                            )?;
+                            Ok(RecordBatch::from(arrow.as_struct().clone()))
+                        })
                     })
                 })
-                .buffered(num_partitions.get())
+                .buffered(num_partitions)
                 .map(|result| result.map_err(|e| DataFusionError::External(Box::new(e))));
 
             // Apply leftover projection (expressions that couldn't be pushed into Vortex).
@@ -461,17 +468,13 @@ impl DataSource for VortexDataSource {
         )))
     }
 
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut Formatter) -> fmt::Result {
         write!(
             f,
             "VortexScanSource: projection={}",
             self.projected_projection
         )?;
-        if let Some(ref filter) = self.filter {
+        if let Some(filter) = &self.filter {
             write!(f, ", filter={filter}")?;
         }
         if let Some(limit) = self.limit {
@@ -488,8 +491,7 @@ impl DataSource for VortexDataSource {
     ) -> DFResult<Option<Arc<dyn DataSource>>> {
         // Vortex handles parallelism internally — always use a single partition.
         let mut this = self.clone();
-        this.num_partitions = NonZero::new(target_partitions)
-            .ok_or_else(|| DataFusionError::Internal("non-zero partitions".to_string()))?;
+        this.num_partitions = target_partitions;
         this.ordered |= output_ordering.is_some();
         Ok(Some(Arc::new(this)))
     }
@@ -502,7 +504,7 @@ impl DataSource for VortexDataSource {
         EquivalenceProperties::new(Arc::clone(&self.leftover_schema))
     }
 
-    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Statistics> {
+    fn partition_statistics(&self, _partition: Option<usize>) -> DFResult<Arc<Statistics>> {
         // FIXME(ngates): this should be adjusted based on filters. See DuckDB for heuristics,
         //  and in the future, store the selectivity stats in the session.
         let num_rows = estimate_to_df_precision(&self.data_source.row_count());
@@ -514,11 +516,11 @@ impl DataSource for VortexDataSource {
         // from the initial schema after try_swapping_with_projection adds computed columns.
         let column_statistics = self.leftover_statistics.clone();
 
-        Ok(Statistics {
+        Ok(Arc::new(Statistics {
             num_rows,
             total_byte_size,
             column_statistics,
-        })
+        }))
     }
 
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
@@ -562,15 +564,12 @@ impl DataSource for VortexDataSource {
         let scan_dtype = scan_projection
             .return_dtype(self.data_source.dtype())
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let scan_arrow_type = scan_dtype
-            .to_arrow_dtype()
-            .map_err(|e| DataFusionError::External(Box::new(e)))?;
-        let DataType::Struct(scan_fields) = scan_arrow_type else {
-            return Err(DataFusionError::Internal(
-                "Scan projection must produce a struct type".to_string(),
-            ));
-        };
-        let scan_output_schema = Arc::new(Schema::new(scan_fields));
+        let scan_output_schema = Arc::new(
+            self.session
+                .arrow()
+                .to_arrow_schema(&scan_dtype)
+                .map_err(|e| DataFusionError::External(Box::new(e)))?,
+        );
 
         // Remap the leftover column references to match the scan output schema.
         let leftover_projection = leftover_projection
@@ -659,12 +658,10 @@ impl DataSource for VortexDataSource {
 /// [`DataFusionPrecision`].
 ///
 /// [`DataFusionPrecision`]: datafusion_common::stats::Precision
-fn estimate_to_df_precision(est: &Option<Precision<u64>>) -> DFPrecision<usize> {
+fn estimate_to_df_precision(est: &Precision<u64>) -> DFPrecision<usize> {
     match est {
-        Some(Precision::Exact(v)) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
-        Some(Precision::Inexact(v)) => {
-            DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX))
-        }
-        None => DFPrecision::Absent,
+        Precision::Exact(v) => DFPrecision::Exact(usize::try_from(*v).unwrap_or(usize::MAX)),
+        Precision::Inexact(v) => DFPrecision::Inexact(usize::try_from(*v).unwrap_or(usize::MAX)),
+        Precision::Absent => DFPrecision::Absent,
     }
 }

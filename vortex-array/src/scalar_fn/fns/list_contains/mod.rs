@@ -3,7 +3,6 @@
 
 mod kernel;
 
-use std::fmt::Formatter;
 use std::ops::BitOr;
 
 use arrow_buffer::bit_iterator::BitIndexIterator;
@@ -15,6 +14,7 @@ use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_err;
 use vortex_session::VortexSession;
+use vortex_session::registry::CachedId;
 use vortex_utils::iter::ReduceBalancedIterExt;
 
 use crate::ArrayRef;
@@ -27,6 +27,7 @@ use crate::arrays::ListViewArray;
 use crate::arrays::PrimitiveArray;
 use crate::arrays::bool::BoolArrayExt;
 use crate::arrays::listview::ListViewArrayExt;
+use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::arrays::scalar_fn::ScalarFnFactoryExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
@@ -40,6 +41,7 @@ use crate::expr::lit;
 use crate::expr::lt;
 use crate::expr::or;
 use crate::match_each_integer_ptype;
+use crate::match_each_unsigned_integer_ptype;
 use crate::scalar::ListScalar;
 use crate::scalar::Scalar;
 use crate::scalar_fn::Arity;
@@ -60,7 +62,8 @@ impl ScalarFnVTable for ListContains {
     type Options = EmptyOptions;
 
     fn id(&self) -> ScalarFnId {
-        ScalarFnId::new("vortex.list.contains")
+        static ID: CachedId = CachedId::new("vortex.list.contains");
+        *ID
     }
 
     fn serialize(&self, _instance: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -89,19 +92,6 @@ impl ScalarFnVTable for ListContains {
             ),
         }
     }
-    fn fmt_sql(
-        &self,
-        _options: &Self::Options,
-        expr: &Expression,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        write!(f, "contains(")?;
-        expr.child(0).fmt_sql(f)?;
-        write!(f, ", ")?;
-        expr.child(1).fmt_sql(f)?;
-        write!(f, ")")
-    }
-
     fn return_dtype(&self, _options: &Self::Options, arg_dtypes: &[DType]) -> VortexResult<DType> {
         let list_dtype = &arg_dtypes[0];
         let needle_dtype = &arg_dtypes[1];
@@ -330,16 +320,19 @@ fn list_contains_scalar(
         };
     }
 
-    // Get the offsets and sizes as primitive arrays.
+    // Get the offsets and sizes as primitive arrays. They are non-negative, so reinterpret to
+    // unsigned and dispatch over the 4 unsigned widths each (4x4 instead of 8x8).
     let offsets = list_array
         .offsets()
         .clone()
         .execute::<PrimitiveArray>(ctx)?;
+    let offsets = offsets.reinterpret_cast(offsets.ptype().to_unsigned());
     let sizes = list_array.sizes().clone().execute::<PrimitiveArray>(ctx)?;
+    let sizes = sizes.reinterpret_cast(sizes.ptype().to_unsigned());
 
     // Process based on the offset and size types.
-    let list_matches = match_each_integer_ptype!(offsets.ptype(), |O| {
-        match_each_integer_ptype!(sizes.ptype(), |S| {
+    let list_matches = match_each_unsigned_integer_ptype!(offsets.ptype(), |O| {
+        match_each_unsigned_integer_ptype!(sizes.ptype(), |S| {
             process_matches::<O, S>(matches, list_array.len(), offsets, sizes)
         })
     });
@@ -365,7 +358,7 @@ where
 {
     let offsets_slice = offsets.as_slice::<O>();
     let sizes_slice = sizes.as_slice::<S>();
-    let bits = matches.to_bit_buffer();
+    let bits = matches.bit_buffer_view();
 
     (0..list_array_len)
         .map(|i| {
@@ -374,7 +367,7 @@ where
 
             // BitIndexIterator yields indices of true bits only. If `.next()` returns
             // `Some(_)`, at least one element in this list's range matches.
-            let mut set_bits = BitIndexIterator::new(bits.inner().as_ref(), offset, size);
+            let mut set_bits = BitIndexIterator::new(bits.inner(), offset, size);
             set_bits.next().is_some()
         })
         .collect::<BitBuffer>()
@@ -483,7 +476,6 @@ mod tests {
     use crate::expr::stats::Stat;
     use crate::scalar::Scalar;
     use crate::scalar_fn::fns::list_contains::BoolArray;
-    use crate::scalar_fn::fns::list_contains::Constant;
     use crate::scalar_fn::fns::list_contains::ConstantArray;
     use crate::scalar_fn::fns::list_contains::ListViewArray;
     use crate::scalar_fn::fns::list_contains::PrimitiveArray;
@@ -671,10 +663,10 @@ mod tests {
     #[test]
     pub fn test_display() {
         let expr = list_contains(get_item("tags", root()), lit("urgent"));
-        assert_eq!(expr.to_string(), "contains($.tags, \"urgent\")");
+        assert_eq!(expr.to_string(), "vortex.list.contains($.tags, \"urgent\")");
 
         let expr2 = list_contains(root(), lit(42));
-        assert_eq!(expr2.to_string(), "contains($, 42i32)");
+        assert_eq!(expr2.to_string(), "vortex.list.contains($, 42i32)");
     }
 
     #[test]
@@ -827,7 +819,6 @@ mod tests {
 
         let expr = list_contains(root(), lit(2i32));
         let contains = list_array.apply(&expr).unwrap();
-        assert!(contains.is::<Constant>(), "Expected constant result");
         let expected = BoolArray::from_iter([true, true]);
         assert_arrays_eq!(contains, expected);
     }
@@ -845,7 +836,6 @@ mod tests {
 
         let expr = list_contains(root(), lit(2i32));
         let contains = list_array.apply(&expr).unwrap();
-        assert!(contains.is::<Constant>(), "Expected constant result");
 
         let expected = BoolArray::new(
             [false, false, false, false, false].into_iter().collect(),

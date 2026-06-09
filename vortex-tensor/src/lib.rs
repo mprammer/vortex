@@ -5,25 +5,35 @@
 //! including unit vectors, spherical coordinates, and similarity measures such as cosine
 //! similarity.
 
+#![cfg_attr(
+    test,
+    allow(clippy::unwrap_used, clippy::expect_used, clippy::unwrap_in_result)
+)]
+
+use std::sync::Arc;
+
 use vortex_array::arrays::scalar_fn::plugin::ScalarFnArrayPlugin;
+use vortex_array::arrow::ArrowSessionExt;
 use vortex_array::dtype::session::DTypeSessionExt;
 use vortex_array::scalar_fn::session::ScalarFnSessionExt;
 use vortex_array::session::ArraySessionExt;
 use vortex_session::VortexSession;
 
-use crate::fixed_shape::FixedShapeTensor;
 use crate::scalar_fns::cosine_similarity::CosineSimilarity;
 use crate::scalar_fns::inner_product::InnerProduct;
 use crate::scalar_fns::l2_denorm::L2Denorm;
 use crate::scalar_fns::l2_norm::L2Norm;
 use crate::scalar_fns::sorf_transform::SorfTransform;
-use crate::vector::Vector;
+use crate::types::fixed_shape_tensor::FixedShapeTensor;
+use crate::types::vector::Vector;
 
 pub mod matcher;
 pub mod scalar_fns;
 
-pub mod fixed_shape;
-pub mod vector;
+mod types;
+
+pub use types::fixed_shape_tensor;
+pub use types::vector;
 
 pub mod encodings;
 
@@ -42,6 +52,10 @@ pub const SCALAR_FN_ARRAY_TENSOR_PLUGIN_ENV: &str = "VX_SCALAR_FN_ARRAY_TENSOR_P
 pub fn initialize(session: &VortexSession) {
     session.dtypes().register(Vector);
     session.dtypes().register(FixedShapeTensor);
+
+    let arrow_session = session.arrow();
+    arrow_session.register_exporter(Arc::new(Vector));
+    arrow_session.register_importer(Arc::new(Vector));
 
     let session_fns = session.scalar_fns();
 

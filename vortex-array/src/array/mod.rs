@@ -4,8 +4,8 @@
 use std::any::Any;
 use std::fmt::Debug;
 use std::fmt::Formatter;
-use std::hash::Hash;
 use std::hash::Hasher;
+use std::sync::Arc;
 
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexExpect;
@@ -23,7 +23,6 @@ use crate::dtype::Nullability;
 use crate::executor::ExecutionResult;
 use crate::executor::ExecutionStep;
 use crate::scalar::Scalar;
-use crate::stats::ArrayStats;
 use crate::validity::Validity;
 
 mod erased;
@@ -42,34 +41,29 @@ pub mod vtable;
 pub use vtable::*;
 
 mod view;
+use smallvec::SmallVec;
 pub use view::*;
 
 use crate::hash::ArrayEq;
 use crate::hash::ArrayHash;
+
+/// The slots of an array: a collection of optional child arrays.
+///
+/// Most encodings have 4 or fewer slots, so we use a `SmallVec` to avoid
+/// heap allocation in the common case.
+pub type ArraySlots = SmallVec<[Option<ArrayRef>; 4]>;
 
 /// The public API trait for all Vortex arrays.
 ///
 /// This trait is sealed and cannot be implemented outside of `vortex-array`.
 /// Use [`ArrayRef`] as the primary handle for working with arrays.
 #[doc(hidden)]
-pub(crate) trait DynArray: 'static + private::Sealed + Send + Sync + Debug {
+pub(crate) trait DynArrayData: 'static + private::Sealed + Send + Sync + Debug {
     /// Returns the array as a reference to a generic [`Any`] trait object.
     fn as_any(&self) -> &dyn Any;
 
-    /// Converts an owned array allocation into an owned [`Any`] allocation for downcasting.
-    fn into_any_arc(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn Any + Send + Sync>;
-
-    /// Returns the length of the array.
-    fn len(&self) -> usize;
-
-    /// Returns the logical Vortex [`DType`] of the array.
-    fn dtype(&self) -> &DType;
-
-    /// Returns the slots of the array.
-    fn slots(&self) -> &[Option<ArrayRef>];
-
-    /// Returns the encoding ID of the array.
-    fn encoding_id(&self) -> ArrayId;
+    /// Returns the array as a mutable reference to a generic [`Any`] trait object.
+    fn as_any_mut(&mut self) -> &mut dyn Any;
 
     /// Returns the [`Validity`] of the array.
     fn validity(&self, this: &ArrayRef) -> VortexResult<Validity>;
@@ -83,9 +77,6 @@ pub(crate) trait DynArray: 'static + private::Sealed + Send + Sync + Debug {
         builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()>;
-
-    /// Returns the statistics of the array.
-    fn statistics(&self) -> &ArrayStats;
 
     // --- Visitor methods (formerly in ArrayVisitor) ---
 
@@ -128,13 +119,27 @@ pub(crate) trait DynArray: 'static + private::Sealed + Send + Sync + Debug {
     fn metadata_fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result;
 
     /// Hashes the array contents including len, dtype, and encoding id.
-    fn dyn_array_hash(&self, state: &mut dyn Hasher, precision: crate::Precision);
+    fn dyn_array_hash(&self, state: &mut dyn Hasher, accuracy: crate::EqMode);
 
     /// Compares two arrays of the same concrete type for equality.
-    fn dyn_array_eq(&self, other: &ArrayRef, precision: crate::Precision) -> bool;
+    fn dyn_array_eq(&self, other: &ArrayRef, accuracy: crate::EqMode) -> bool;
 
     /// Returns a new array with the given slots.
-    fn with_slots(&self, this: ArrayRef, slots: Vec<Option<ArrayRef>>) -> VortexResult<ArrayRef>;
+    fn with_slots(&self, this: &ArrayRef, slots: ArraySlots) -> VortexResult<ArrayRef>;
+
+    /// Returns a new array with the given slots, bypassing encoding-level validation.
+    ///
+    /// Used by the executor to temporarily carry an array that has had one of its child slots
+    /// taken out (leaving `None`) without panicking `V::validate`. The caller must ensure the
+    /// missing slot is filled back in (via `put_slot_unchecked`) or driven to completion by the
+    /// builder path before the array becomes externally observable.
+    ///
+    /// # Safety
+    ///
+    /// The array returned may have slots whose content does not match the encoding's normal
+    /// invariants. Callers must re-establish those invariants before handing the array to
+    /// anything outside the executor.
+    unsafe fn with_slots_unchecked(&self, this: &ArrayRef, slots: ArraySlots) -> ArrayRef;
 
     /// Attempt to reduce the array to a simpler representation.
     fn reduce(&self, this: &ArrayRef) -> VortexResult<Option<ArrayRef>>;
@@ -148,7 +153,29 @@ pub(crate) trait DynArray: 'static + private::Sealed + Send + Sync + Debug {
     ) -> VortexResult<Option<ArrayRef>>;
 
     /// Execute the array by taking a single encoding-specific execution step.
+    ///
+    /// This is the checked entry point. If the encoding reports
+    /// [`ExecutionStep::Done`](crate::ExecutionStep::Done), implementations must validate that the
+    /// returned array preserves this array's logical `len` and `dtype`, and must transfer this
+    /// array's statistics to the returned array.
     fn execute(&self, this: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult>;
+
+    /// Execute the array by taking a single encoding-specific execution step without applying
+    /// `Done`-result postconditions.
+    ///
+    /// This exists for the iterative executor, which may call into `execute` on suspended
+    /// executor-private arrays whose slots temporarily contain `None`. In that mode the executor
+    /// itself is responsible for deciding when a `Done` result represents a real logical array,
+    /// enforcing any `len`/`dtype` invariants, and transferring statistics.
+    ///
+    /// # Safety
+    /// The `array` returned should have it's `DType` and len checked
+    /// (optionally it should have its stats propagated from `this`).
+    unsafe fn execute_unchecked(
+        &self,
+        this: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ExecutionResult>;
 
     /// Attempt to execute the parent of this array.
     fn execute_parent(
@@ -180,52 +207,36 @@ mod private {
 
     pub trait Sealed {}
 
-    impl<V: VTable> Sealed for ArrayInner<V> {}
+    impl<V: VTable> Sealed for ArrayData<V> {}
 }
 
 // =============================================================================
-// New path: DynArray and supporting trait impls for ArrayInner<V>
+// New path: DynArrayData and supporting trait impls for ArrayData<V>
 // =============================================================================
 
-/// DynArray implementation for [`ArrayInner<V>`].
+/// DynArrayData implementation for [`ArrayData<V>`].
 ///
-/// This is self-contained: identity methods use `ArrayInner<V>`'s own fields (dtype, len, stats),
-/// while data-access methods delegate to VTable methods on the inner `V::ArrayData`.
-impl<V: VTable> DynArray for ArrayInner<V> {
+/// This is self-contained: identity methods use `ArrayData<V>`'s own fields (dtype, len, stats),
+/// while data-access methods delegate to VTable methods on the inner `V::TypedArrayData`.
+impl<V: VTable> DynArrayData for ArrayData<V> {
     fn as_any(&self) -> &dyn Any {
         self
     }
 
-    fn into_any_arc(self: std::sync::Arc<Self>) -> std::sync::Arc<dyn Any + Send + Sync> {
+    fn as_any_mut(&mut self) -> &mut dyn Any {
         self
     }
 
-    fn len(&self) -> usize {
-        self.len
-    }
-
-    fn dtype(&self) -> &DType {
-        &self.dtype
-    }
-
-    fn slots(&self) -> &[Option<ArrayRef>] {
-        &self.slots
-    }
-
-    fn encoding_id(&self) -> ArrayId {
-        self.vtable.id()
-    }
-
     fn validity(&self, this: &ArrayRef) -> VortexResult<Validity> {
-        if self.dtype.is_nullable() {
+        if this.dtype().is_nullable() {
             let view = unsafe { ArrayView::new_unchecked(this, &self.data) };
             let validity = <V::ValidityVTable as ValidityVTable<V>>::validity(view)?;
             if let Validity::Array(array) = &validity {
-                vortex_ensure!(array.len() == self.len, "Validity array length mismatch");
+                vortex_ensure!(array.len() == this.len(), "Validity array length mismatch");
                 vortex_ensure!(
                     matches!(array.dtype(), DType::Bool(Nullability::NonNullable)),
                     "Validity array is not non-nullable boolean: {}",
-                    self.vtable.id(),
+                    this.encoding_id(),
                 );
             }
             Ok(validity)
@@ -240,10 +251,10 @@ impl<V: VTable> DynArray for ArrayInner<V> {
         builder: &mut dyn ArrayBuilder,
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<()> {
-        if builder.dtype() != &self.dtype {
+        if builder.dtype() != this.dtype() {
             vortex_panic!(
                 "Builder dtype mismatch: expected {}, got {}",
-                self.dtype,
+                this.dtype(),
                 builder.dtype(),
             );
         }
@@ -253,16 +264,12 @@ impl<V: VTable> DynArray for ArrayInner<V> {
         V::append_to_builder(view, builder, ctx)?;
 
         assert_eq!(
-            len + self.len,
+            len + this.len(),
             builder.len(),
             "Builder length mismatch after writing array for encoding {}",
-            self.vtable.id(),
+            this.encoding_id(),
         );
         Ok(())
-    }
-
-    fn statistics(&self) -> &ArrayStats {
-        &self.stats
     }
 
     fn children(&self, this: &ArrayRef) -> Vec<ArrayRef> {
@@ -334,46 +341,50 @@ impl<V: VTable> DynArray for ArrayInner<V> {
         std::fmt::Display::fmt(&self.data, f)
     }
 
-    fn dyn_array_hash(&self, state: &mut dyn Hasher, precision: crate::Precision) {
+    fn dyn_array_hash(&self, state: &mut dyn Hasher, accuracy: crate::EqMode) {
         let mut wrapper = HasherWrapper(state);
-        self.len.hash(&mut wrapper);
-        self.dtype.hash(&mut wrapper);
-        self.vtable.id().hash(&mut wrapper);
-        self.slots.len().hash(&mut wrapper);
-        for slot in &self.slots {
-            slot.array_hash(&mut wrapper, precision);
-        }
-        self.data.array_hash(&mut wrapper, precision);
+        // Note: metadata (len, dtype, encoding_id) and slots are hashed by ArrayRef.
+        self.data.array_hash(&mut wrapper, accuracy);
     }
 
-    fn dyn_array_eq(&self, other: &ArrayRef, precision: crate::Precision) -> bool {
+    fn dyn_array_eq(&self, other: &ArrayRef, accuracy: crate::EqMode) -> bool {
+        // Note: metadata (len, dtype, encoding_id) and slots are compared by ArrayRef.
         other
-            .inner()
+            .dyn_array()
             .as_any()
             .downcast_ref::<Self>()
-            .is_some_and(|other_inner| {
-                self.len == other.len()
-                    && self.dtype == *other.dtype()
-                    && self.vtable.id() == other.encoding_id()
-                    && self.slots.len() == other_inner.slots.len()
-                    && self
-                        .slots
-                        .iter()
-                        .zip(other_inner.slots.iter())
-                        .all(|(slot, other_slot)| slot.array_eq(other_slot, precision))
-                    && self.data.array_eq(&other_inner.data, precision)
-            })
+            .is_some_and(|other_inner| self.data.array_eq(&other_inner.data, accuracy))
     }
 
-    fn with_slots(&self, this: ArrayRef, slots: Vec<Option<ArrayRef>>) -> VortexResult<ArrayRef> {
-        let data = self.data.clone();
+    fn with_slots(&self, this: &ArrayRef, slots: ArraySlots) -> VortexResult<ArrayRef> {
         let stats = this.statistics().to_owned();
         Ok(Array::<V>::try_from_parts(
-            ArrayParts::new(self.vtable.clone(), this.dtype().clone(), this.len(), data)
-                .with_slots(slots),
+            ArrayParts::new(
+                self.vtable.clone(),
+                this.dtype().clone(),
+                this.len(),
+                self.data.clone(),
+            )
+            .with_slots(slots),
         )?
         .with_stats_set(stats)
         .into_array())
+    }
+
+    unsafe fn with_slots_unchecked(&self, this: &ArrayRef, slots: ArraySlots) -> ArrayRef {
+        // SAFETY: we intentionally skip `V::validate` here. Caller guarantees that the resulting
+        // array is either repaired or not externally observed.
+        let store = unsafe {
+            ArrayInner::<ArrayData<V>>::new_unchecked(
+                self.vtable.clone(),
+                this.len(),
+                this.dtype().clone(),
+                self.data.clone(),
+                slots,
+                this.statistics().to_array_stats(),
+            )
+        };
+        ArrayRef::from_inner(Arc::new(store))
     }
 
     fn reduce(&self, this: &ArrayRef) -> VortexResult<Option<ArrayRef>> {
@@ -426,12 +437,8 @@ impl<V: VTable> DynArray for ArrayInner<V> {
     fn execute(&self, this: ArrayRef, ctx: &mut ExecutionCtx) -> VortexResult<ExecutionResult> {
         let len = this.len();
         let dtype = this.dtype().clone();
-        let stats = this.statistics().to_owned();
-
-        let typed = Array::<V>::try_from_array_ref(this)
-            .map_err(|_| vortex_err!("Failed to downcast array for execute"))
-            .vortex_expect("Failed to downcast array for execute");
-        let result = V::execute(typed, ctx)?;
+        let stats = this.statistics().to_array_stats();
+        let result = unsafe { self.execute_unchecked(this, ctx)? };
 
         if matches!(result.step(), ExecutionStep::Done) {
             if cfg!(debug_assertions) {
@@ -447,10 +454,24 @@ impl<V: VTable> DynArray for ArrayInner<V> {
                 );
             }
 
-            result.array().statistics().set_iter(stats.into_iter());
+            result
+                .array()
+                .statistics()
+                .set_iter(crate::stats::StatsSet::from(stats).into_iter());
         }
 
         Ok(result)
+    }
+
+    unsafe fn execute_unchecked(
+        &self,
+        this: ArrayRef,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<ExecutionResult> {
+        let typed = Array::<V>::try_from_array_ref(this)
+            .map_err(|_| vortex_err!("Failed to downcast array for execute"))
+            .vortex_expect("Failed to downcast array for execute");
+        V::execute(typed, ctx)
     }
 
     fn execute_parent(

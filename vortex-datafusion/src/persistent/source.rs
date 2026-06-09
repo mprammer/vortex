@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
 
-use std::any::Any;
 use std::fmt::Formatter;
+use std::ops::Range;
 use std::sync::Arc;
 use std::sync::Weak;
 
@@ -13,13 +13,16 @@ use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
+use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::PhysicalExprRef;
+use datafusion_physical_expr::PhysicalSortExpr;
 use datafusion_physical_expr::conjunction;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr_adapter::DefaultPhysicalExprAdapterFactory;
 use datafusion_physical_expr_common::physical_expr::fmt_sql;
 use datafusion_physical_plan::DisplayFormatType;
 use datafusion_physical_plan::PhysicalExpr;
+use datafusion_physical_plan::SortOrderPushdownResult;
 use datafusion_physical_plan::filter_pushdown::FilterPushdownPropagation;
 use datafusion_physical_plan::filter_pushdown::PushedDown;
 use datafusion_physical_plan::filter_pushdown::PushedDownPredicate;
@@ -185,8 +188,11 @@ pub struct VortexSource {
     ///
     /// Sharing the readers allows us to only read every layout once from the file, even across partitions.
     layout_readers: Arc<DashMap<Path, Weak<dyn LayoutReader>>>,
+    /// Shared full-file natural split ranges keyed by path.
+    natural_split_ranges: Arc<DashMap<Path, Arc<[Range<u64>]>>>,
     expression_convertor: Arc<dyn ExpressionConvertor>,
     pub(crate) vortex_reader_factory: Option<Arc<dyn VortexReaderFactory>>,
+    pub(crate) ordered: bool,
     vx_metrics_registry: Arc<dyn MetricsRegistry>,
     file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
     /// Whether to enable expression pushdown into the underlying Vortex scan.
@@ -216,10 +222,12 @@ impl VortexSource {
             batch_size: None,
             _unused_df_metrics: Default::default(),
             layout_readers: Arc::new(DashMap::default()),
+            natural_split_ranges: Arc::new(DashMap::default()),
             expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
             vortex_reader_factory: None,
             vx_metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
             file_metadata_cache: None,
+            ordered: false,
             options: VortexTableOptions::default(),
         }
     }
@@ -297,15 +305,13 @@ impl VortexSource {
         self.options = opts;
         self
     }
-}
 
-impl FileSource for VortexSource {
-    fn create_file_opener(
+    fn create_vortex_opener(
         &self,
         object_store: Arc<dyn ObjectStore>,
         base_config: &FileScanConfig,
         partition: usize,
-    ) -> DFResult<Arc<dyn FileOpener>> {
+    ) -> DFResult<VortexOpener> {
         let batch_size = self
             .batch_size
             .vortex_expect("batch_size must be supplied to VortexSource");
@@ -333,18 +339,30 @@ impl FileSource for VortexSource {
             limit: base_config.limit.map(|l| l as u64),
             metrics_registry: Arc::clone(&self.vx_metrics_registry),
             layout_readers: Arc::clone(&self.layout_readers),
-            has_output_ordering: !base_config.output_ordering.is_empty(),
-            expression_convertor: Arc::new(DefaultExpressionConvertor::default()),
+            natural_split_ranges: Arc::clone(&self.natural_split_ranges),
+            has_output_ordering: !base_config.output_ordering.is_empty() || self.ordered,
+            expression_convertor: Arc::clone(&self.expression_convertor),
             file_metadata_cache: self.file_metadata_cache.clone(),
             projection_pushdown: self.options.projection_pushdown,
             scan_concurrency: self.options.scan_concurrency,
         };
 
-        Ok(Arc::new(opener))
+        Ok(opener)
     }
+}
 
-    fn as_any(&self) -> &dyn Any {
-        self
+impl FileSource for VortexSource {
+    fn create_file_opener(
+        &self,
+        object_store: Arc<dyn ObjectStore>,
+        base_config: &FileScanConfig,
+        partition: usize,
+    ) -> DFResult<Arc<dyn FileOpener>> {
+        Ok(Arc::new(self.create_vortex_opener(
+            object_store,
+            base_config,
+            partition,
+        )?))
     }
 
     fn with_batch_size(&self, batch_size: usize) -> Arc<dyn FileSource> {
@@ -365,16 +383,37 @@ impl FileSource for VortexSource {
         VORTEX_FILE_EXTENSION
     }
 
+    fn try_pushdown_sort(
+        &self,
+        order: &[PhysicalSortExpr],
+        eq_properties: &EquivalenceProperties,
+    ) -> DFResult<SortOrderPushdownResult<Arc<dyn FileSource>>> {
+        if order.is_empty() {
+            return Ok(SortOrderPushdownResult::Unsupported);
+        }
+
+        if eq_properties.ordering_satisfy(order.iter().cloned())? {
+            let mut this = self.clone();
+            this.ordered = true;
+
+            return Ok(SortOrderPushdownResult::Exact {
+                inner: Arc::new(this) as Arc<dyn FileSource>,
+            });
+        }
+
+        Ok(SortOrderPushdownResult::Unsupported)
+    }
+
     fn fmt_extra(&self, t: DisplayFormatType, f: &mut Formatter) -> std::fmt::Result {
         match t {
             DisplayFormatType::Default | DisplayFormatType::Verbose => {
-                if let Some(ref predicate) = self.vortex_predicate {
+                if let Some(predicate) = &self.vortex_predicate {
                     write!(f, ", predicate: {predicate}")?;
                 }
             }
             // Use TreeRender style key=value formatting to display the predicate
             DisplayFormatType::TreeRender => {
-                if let Some(ref predicate) = self.vortex_predicate {
+                if let Some(predicate) = &self.vortex_predicate {
                     writeln!(f, "predicate={}", fmt_sql(predicate.as_ref()))?;
                 };
             }
@@ -470,5 +509,133 @@ impl FileSource for VortexSource {
 
     fn table_schema(&self) -> &TableSchema {
         &self.table_schema
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use arrow_schema::DataType;
+    use arrow_schema::Field;
+    use arrow_schema::Schema;
+    use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+    use datafusion_execution::object_store::ObjectStoreUrl;
+    use datafusion_physical_expr::expressions::Column;
+    use object_store::memory::InMemory;
+    use vortex::VortexSessionDefault;
+
+    use super::*;
+    use crate::convert::exprs::ProcessedProjection;
+
+    struct TrackingExpressionConvertor {
+        inner: DefaultExpressionConvertor,
+    }
+
+    impl ExpressionConvertor for TrackingExpressionConvertor {
+        fn can_be_pushed_down(&self, expr: &PhysicalExprRef, schema: &Schema) -> bool {
+            self.inner.can_be_pushed_down(expr, schema)
+        }
+
+        fn convert(&self, expr: &dyn PhysicalExpr) -> DFResult<vortex::expr::Expression> {
+            self.inner.convert(expr)
+        }
+
+        fn split_projection(
+            &self,
+            source_projection: ProjectionExprs,
+            input_schema: &Schema,
+            output_schema: &Schema,
+        ) -> DFResult<ProcessedProjection> {
+            self.inner
+                .split_projection(source_projection, input_schema, output_schema)
+        }
+
+        fn no_pushdown_projection(
+            &self,
+            source_projection: ProjectionExprs,
+            input_schema: &Schema,
+        ) -> DFResult<ProcessedProjection> {
+            self.inner
+                .no_pushdown_projection(source_projection, input_schema)
+        }
+    }
+
+    fn sort_column(name: &str, index: usize) -> PhysicalSortExpr {
+        let expr: PhysicalExprRef = Arc::new(Column::new(name, index));
+        PhysicalSortExpr::new_default(expr)
+    }
+
+    fn sort_test_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]))
+    }
+
+    fn sort_test_source(schema: Arc<Schema>) -> VortexSource {
+        VortexSource::new(
+            TableSchema::from_file_schema(schema),
+            VortexSession::default(),
+        )
+    }
+
+    fn assert_ordered_source(inner: Arc<dyn FileSource>) -> anyhow::Result<()> {
+        let source = inner
+            .downcast_ref::<VortexSource>()
+            .ok_or_else(|| anyhow::anyhow!("expected VortexSource"))?;
+
+        assert!(source.ordered);
+        Ok(())
+    }
+
+    #[test]
+    fn try_pushdown_sort_returns_exact_when_ordering_is_satisfied() -> anyhow::Result<()> {
+        let schema = sort_test_schema();
+        let source = sort_test_source(Arc::clone(&schema));
+        let order = vec![sort_column("a", 0), sort_column("b", 1)];
+        let eq_properties = EquivalenceProperties::new_with_orderings(schema, [order.clone()]);
+
+        let result = source.try_pushdown_sort(&order, &eq_properties)?;
+
+        match result {
+            SortOrderPushdownResult::Exact { inner } => assert_ordered_source(inner)?,
+            SortOrderPushdownResult::Inexact { .. } | SortOrderPushdownResult::Unsupported => {
+                anyhow::bail!("expected exact sort pushdown")
+            }
+        }
+        assert!(!source.ordered);
+        Ok(())
+    }
+
+    #[test]
+    fn create_vortex_opener_preserves_expression_convertor() -> anyhow::Result<()> {
+        let file_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let expression_convertor = Arc::new(TrackingExpressionConvertor {
+            inner: DefaultExpressionConvertor::default(),
+        }) as Arc<dyn ExpressionConvertor>;
+
+        let mut source = VortexSource::new(
+            TableSchema::from_file_schema(file_schema),
+            VortexSession::default(),
+        )
+        .with_expression_convertor(Arc::clone(&expression_convertor));
+        source.batch_size = Some(100);
+
+        let config = FileScanConfigBuilder::new(
+            ObjectStoreUrl::local_filesystem(),
+            Arc::new(source.clone()),
+        )
+        .build();
+
+        let opener = source.create_vortex_opener(
+            Arc::new(InMemory::new()) as Arc<dyn ObjectStore>,
+            &config,
+            0,
+        )?;
+
+        assert!(Arc::ptr_eq(
+            &opener.expression_convertor,
+            &expression_convertor
+        ));
+        Ok(())
     }
 }

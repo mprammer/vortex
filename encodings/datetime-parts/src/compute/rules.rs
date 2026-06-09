@@ -10,8 +10,8 @@ use vortex_array::arrays::Filter;
 use vortex_array::arrays::ScalarFnArray;
 use vortex_array::arrays::filter::FilterReduceAdaptor;
 use vortex_array::arrays::scalar_fn::AnyScalarFn;
+use vortex_array::arrays::scalar_fn::ScalarFn;
 use vortex_array::arrays::scalar_fn::ScalarFnArrayExt;
-use vortex_array::arrays::scalar_fn::ScalarFnVTable;
 use vortex_array::arrays::slice::SliceReduceAdaptor;
 use vortex_array::builtins::ArrayBuiltins;
 use vortex_array::dtype::DType;
@@ -27,7 +27,7 @@ use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
 
 use crate::DateTimeParts;
-use crate::array::DateTimePartsArrayExt;
+use crate::array::DateTimePartsArraySlotsExt;
 use crate::timestamp;
 pub(crate) const PARENT_RULES: ParentRuleSet<DateTimeParts> = ParentRuleSet::new(&[
     ParentRuleSet::lift(&DTPFilterPushDownRule),
@@ -95,7 +95,7 @@ impl ArrayParentReduceRule<DateTimeParts> for DTPComparisonPushDownRule {
     fn reduce_parent(
         &self,
         child: ArrayView<'_, DateTimeParts>,
-        parent: ArrayView<'_, ScalarFnVTable>,
+        parent: ArrayView<'_, ScalarFn>,
         child_idx: usize,
     ) -> VortexResult<Option<ArrayRef>> {
         // Only handle comparison operations (Binary comparisons or Between)
@@ -179,6 +179,11 @@ fn is_constant_zero(array: &ArrayRef) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use vortex_array::ArrayRef;
+    use vortex_array::ExecutionCtx;
+    use vortex_array::LEGACY_SESSION;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::aggregate_fn::fns::sum::sum;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::TemporalArray;
     use vortex_array::arrays::scalar_fn::ScalarFnFactoryExt;
@@ -197,6 +202,15 @@ mod tests {
     use crate::DateTimePartsArray;
 
     const SECONDS_PER_DAY: i64 = 86400;
+
+    /// Count the true values in a boolean array using the provided execution context.
+    fn true_count(array: &ArrayRef, ctx: &mut ExecutionCtx) -> usize {
+        sum(array, ctx)
+            .unwrap()
+            .as_primitive()
+            .as_::<usize>()
+            .unwrap()
+    }
 
     /// Create a DTP array with the given day values (all at midnight).
     fn dtp_at_midnight(days: &[i64], time_unit: TimeUnit) -> DateTimePartsArray {
@@ -217,7 +231,7 @@ mod tests {
             time_unit,
             None,
         );
-        DateTimeParts::try_from_temporal(temporal)
+        DateTimeParts::try_from_temporal(temporal, &mut LEGACY_SESSION.create_execution_ctx())
             .vortex_expect("TemporalArray must produce valid DateTimeParts")
     }
 
@@ -283,7 +297,8 @@ mod tests {
         );
 
         // Verify correctness: days [0, 1, 2] <= 1 should give [true, true, false]
-        assert_eq!(optimized.as_bool_typed().true_count().unwrap(), 2);
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        assert_eq!(true_count(&optimized, &mut ctx), 2);
     }
 
     #[test]
@@ -311,7 +326,8 @@ mod tests {
         let optimized = between.optimize().unwrap();
 
         // Verify correctness: days [0, 1, 2, 3, 4] between 1 and 3 should give [false, true, true, true, false]
-        assert_eq!(optimized.as_bool_typed().true_count().unwrap(), 3);
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        assert_eq!(true_count(&optimized, &mut ctx), 3);
     }
 
     #[test]
@@ -333,7 +349,8 @@ mod tests {
         // (optimization doesn't apply, so we keep the original structure)
         // Just verify it still computes correctly
         // days [0, 1, 2] at midnight <= day 1 at noon: [true, true, false]
-        assert_eq!(optimized.as_bool_typed().true_count().unwrap(), 2);
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        assert_eq!(true_count(&optimized, &mut ctx), 2);
     }
 
     #[test]
@@ -350,7 +367,8 @@ mod tests {
             TimeUnit::Seconds,
             None,
         );
-        let dtp = DateTimeParts::try_from_temporal(temporal).unwrap();
+        let mut ctx = LEGACY_SESSION.create_execution_ctx();
+        let dtp = DateTimeParts::try_from_temporal(temporal, &mut ctx).unwrap();
         let len = dtp.len();
 
         // Compare against midnight constant
@@ -362,6 +380,6 @@ mod tests {
         // Should still compute correctly (just not optimized via pushdown)
         let optimized = comparison.optimize().unwrap();
         // timestamps at 1am on days [0, 1, 2] <= day 1 midnight: [true, false, false]
-        assert_eq!(optimized.as_bool_typed().true_count().unwrap(), 1);
+        assert_eq!(true_count(&optimized, &mut ctx), 1);
     }
 }

@@ -57,14 +57,15 @@ use arrow_buffer::buffer::NullBuffer;
 use arrow_buffer::buffer::OffsetBuffer;
 use arrow_schema::DataType;
 use arrow_schema::TimeUnit as ArrowTimeUnit;
-use itertools::Itertools;
 use vortex_buffer::Alignment;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::Buffer;
 use vortex_buffer::ByteBuffer;
-use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
+use vortex_error::vortex_ensure;
+use vortex_error::vortex_ensure_eq;
+use vortex_error::vortex_err;
 use vortex_error::vortex_panic;
 
 use crate::ArrayRef;
@@ -140,7 +141,7 @@ macro_rules! impl_from_arrow_primitive {
         impl FromArrowArray<&ArrowPrimitiveArray<$T>> for ArrayRef {
             fn from_arrow(value: &ArrowPrimitiveArray<$T>, nullable: bool) -> VortexResult<Self> {
                 let buffer = Buffer::from_arrow_scalar_buffer(value.values().clone());
-                let validity = nulls(value.nulls(), nullable);
+                let validity = nulls(value.nulls(), nullable)?;
                 Ok(PrimitiveArray::new(buffer, validity).into_array())
             }
         }
@@ -166,7 +167,7 @@ impl FromArrowArray<&ArrowPrimitiveArray<Decimal32Type>> for ArrayRef {
     ) -> VortexResult<Self> {
         let decimal_type = DecimalDType::new(array.precision(), array.scale());
         let buffer = Buffer::from_arrow_scalar_buffer(array.values().clone());
-        let validity = nulls(array.nulls(), nullable);
+        let validity = nulls(array.nulls(), nullable)?;
         Ok(DecimalArray::new(buffer, decimal_type, validity).into_array())
     }
 }
@@ -178,7 +179,7 @@ impl FromArrowArray<&ArrowPrimitiveArray<Decimal64Type>> for ArrayRef {
     ) -> VortexResult<Self> {
         let decimal_type = DecimalDType::new(array.precision(), array.scale());
         let buffer = Buffer::from_arrow_scalar_buffer(array.values().clone());
-        let validity = nulls(array.nulls(), nullable);
+        let validity = nulls(array.nulls(), nullable)?;
         Ok(DecimalArray::new(buffer, decimal_type, validity).into_array())
     }
 }
@@ -190,7 +191,7 @@ impl FromArrowArray<&ArrowPrimitiveArray<Decimal128Type>> for ArrayRef {
     ) -> VortexResult<Self> {
         let decimal_type = DecimalDType::new(array.precision(), array.scale());
         let buffer = Buffer::from_arrow_scalar_buffer(array.values().clone());
-        let validity = nulls(array.nulls(), nullable);
+        let validity = nulls(array.nulls(), nullable)?;
         Ok(DecimalArray::new(buffer, decimal_type, validity).into_array())
     }
 }
@@ -207,7 +208,7 @@ impl FromArrowArray<&ArrowPrimitiveArray<Decimal256Type>> for ArrayRef {
         //  of either type.
         let buffer =
             unsafe { std::mem::transmute::<Buffer<arrow_buffer::i256>, Buffer<i256>>(buffer) };
-        let validity = nulls(array.nulls(), nullable);
+        let validity = nulls(array.nulls(), nullable)?;
         Ok(DecimalArray::new(buffer, decimal_type, validity).into_array())
     }
 }
@@ -219,7 +220,7 @@ macro_rules! impl_from_arrow_temporal {
                 value: &ArrowPrimitiveArray<$T>,
                 nullable: bool,
             ) -> vortex_error::VortexResult<Self> {
-                Ok(temporal_array(value, nullable))
+                temporal_array(value, nullable)
             }
         }
     };
@@ -241,17 +242,20 @@ impl_from_arrow_temporal!(Time64NanosecondType);
 impl_from_arrow_temporal!(Date32Type);
 impl_from_arrow_temporal!(Date64Type);
 
-fn temporal_array<T: ArrowPrimitiveType>(value: &ArrowPrimitiveArray<T>, nullable: bool) -> ArrayRef
+fn temporal_array<T: ArrowPrimitiveType>(
+    value: &ArrowPrimitiveArray<T>,
+    nullable: bool,
+) -> VortexResult<ArrayRef>
 where
     T::Native: NativePType,
 {
     let arr = PrimitiveArray::new(
         Buffer::from_arrow_scalar_buffer(value.values().clone()),
-        nulls(value.nulls(), nullable),
+        nulls(value.nulls(), nullable)?,
     )
     .into_array();
 
-    match value.data_type() {
+    Ok(match value.data_type() {
         DataType::Timestamp(time_unit, tz) => {
             TemporalArray::new_timestamp(arr, time_unit.into(), tz.clone()).into()
         }
@@ -262,7 +266,7 @@ where
         DataType::Duration(_) => unimplemented!(),
         DataType::Interval(_) => unimplemented!(),
         _ => vortex_panic!("Invalid temporal type: {}", value.data_type()),
-    }
+    })
 }
 
 impl<T: ByteArrayType> FromArrowArray<&GenericByteArray<T>> for ArrayRef
@@ -281,7 +285,7 @@ where
                 value.offsets().clone().into_array(),
                 ByteBuffer::from_arrow_buffer(value.values().clone(), Alignment::of::<u8>()),
                 dtype,
-                nulls(value.nulls(), nullable),
+                nulls(value.nulls(), nullable)?,
             )
         }
         .into_array())
@@ -313,7 +317,7 @@ impl<T: ByteViewType> FromArrowArray<&GenericByteViewArray<T>> for ArrayRef {
                         .collect::<Vec<_>>(),
                 ),
                 dtype,
-                nulls(value.nulls(), nullable),
+                nulls(value.nulls(), nullable)?,
             )
             .into_array()
         })
@@ -324,17 +328,17 @@ impl FromArrowArray<&ArrowBooleanArray> for ArrayRef {
     fn from_arrow(value: &ArrowBooleanArray, nullable: bool) -> VortexResult<Self> {
         Ok(BoolArray::new(
             value.values().clone().into(),
-            nulls(value.nulls(), nullable),
+            nulls(value.nulls(), nullable)?,
         )
         .into_array())
     }
 }
 
 /// Strip out the nulls from this array and return a new array without nulls.
-fn remove_nulls(data: arrow_data::ArrayData) -> arrow_data::ArrayData {
+pub(crate) fn remove_nulls(data: arrow_data::ArrayData) -> VortexResult<arrow_data::ArrayData> {
     if data.null_count() == 0 {
         // No nulls to remove, return the array as is
-        return data;
+        return Ok(data);
     }
 
     let children = match data.data_type() {
@@ -344,12 +348,12 @@ fn remove_nulls(data: arrow_data::ArrayData) -> arrow_data::ArrayData {
                 .zip(data.child_data().iter())
                 .map(|(field, child_data)| {
                     if field.is_nullable() {
-                        child_data.clone()
+                        Ok(child_data.clone())
                     } else {
                         remove_nulls(child_data.clone())
                     }
                 })
-                .collect_vec(),
+                .collect::<VortexResult<Vec<_>>>()?,
         ),
         DataType::List(f)
         | DataType::LargeList(f)
@@ -359,12 +363,12 @@ fn remove_nulls(data: arrow_data::ArrayData) -> arrow_data::ArrayData {
             if !f.is_nullable() =>
         {
             // All list types only have one child
-            assert_eq!(
+            vortex_ensure_eq!(
                 data.child_data().len(),
                 1,
                 "List types should have one child"
             );
-            Some(vec![remove_nulls(data.child_data()[0].clone())])
+            Some(vec![remove_nulls(data.child_data()[0].clone())?])
         }
         _ => None,
     };
@@ -375,7 +379,7 @@ fn remove_nulls(data: arrow_data::ArrayData) -> arrow_data::ArrayData {
     }
     builder
         .build()
-        .vortex_expect("reconstructing array without nulls")
+        .map_err(|e| vortex_err!("Failed to reconstruct Arrow array without nulls: {e}"))
 }
 
 impl FromArrowArray<&ArrowStructArray> for ArrayRef {
@@ -390,7 +394,7 @@ impl FromArrowArray<&ArrowStructArray> for ArrayRef {
                     // Arrow pushes down nulls, even into non-nullable fields. So we strip them
                     // out here because Vortex is a little more strict.
                     if c.null_count() > 0 && !field.is_nullable() {
-                        let stripped = make_array(remove_nulls(c.into_data()));
+                        let stripped = make_array(remove_nulls(c.into_data())?);
                         Self::from_arrow(stripped.as_ref(), false)
                     } else {
                         Self::from_arrow(c.as_ref(), field.is_nullable())
@@ -398,7 +402,7 @@ impl FromArrowArray<&ArrowStructArray> for ArrayRef {
                 })
                 .collect::<VortexResult<Vec<_>>>()?,
             value.len(),
-            nulls(value.nulls(), nullable),
+            nulls(value.nulls(), nullable)?,
         )?
         .into_array())
     }
@@ -417,7 +421,7 @@ impl<O: IntegerPType + OffsetSizeTrait> FromArrowArray<&GenericListArray<O>> for
 
         // `offsets` are always non-nullable.
         let offsets = value.offsets().clone().into_array();
-        let nulls = nulls(value.nulls(), nullable);
+        let nulls = nulls(value.nulls(), nullable)?;
 
         Ok(ListArray::try_new(elements, offsets, nulls)?.into_array())
     }
@@ -437,7 +441,7 @@ impl<O: OffsetSizeTrait + NativePType> FromArrowArray<&GenericListViewArray<O>> 
         // `offsets` and `sizes` are always non-nullable.
         let offsets = array.offsets().clone().into_array();
         let sizes = array.sizes().clone().into_array();
-        let nulls = nulls(array.nulls(), nullable);
+        let nulls = nulls(array.nulls(), nullable)?;
 
         Ok(ListViewArray::try_new(elements, offsets, sizes, nulls)?.into_array())
     }
@@ -452,7 +456,7 @@ impl FromArrowArray<&ArrowFixedSizeListArray> for ArrayRef {
         Ok(FixedSizeListArray::try_new(
             Self::from_arrow(array.values().as_ref(), field.is_nullable())?,
             *list_size as u32,
-            nulls(array.nulls(), nullable),
+            nulls(array.nulls(), nullable)?,
             array.len(),
         )?
         .into_array())
@@ -461,7 +465,10 @@ impl FromArrowArray<&ArrowFixedSizeListArray> for ArrayRef {
 
 impl FromArrowArray<&ArrowNullArray> for ArrayRef {
     fn from_arrow(value: &ArrowNullArray, nullable: bool) -> VortexResult<Self> {
-        assert!(nullable);
+        vortex_ensure!(
+            nullable,
+            "Cannot convert an Arrow NullArray into a non-nullable Vortex array"
+        );
         Ok(NullArray::new(value.len()).into_array())
     }
 }
@@ -476,9 +483,9 @@ impl<K: ArrowDictionaryKeyType> FromArrowArray<&DictionaryArray<K>> for DictArra
     }
 }
 
-fn nulls(nulls: Option<&NullBuffer>, nullable: bool) -> Validity {
+pub(crate) fn nulls(nulls: Option<&NullBuffer>, nullable: bool) -> VortexResult<Validity> {
     if nullable {
-        nulls
+        Ok(nulls
             .map(|nulls| {
                 if nulls.null_count() == nulls.len() {
                     Validity::AllInvalid
@@ -486,10 +493,15 @@ fn nulls(nulls: Option<&NullBuffer>, nullable: bool) -> Validity {
                     Validity::from(BitBuffer::from(nulls.inner().clone()))
                 }
             })
-            .unwrap_or_else(|| Validity::AllValid)
+            .unwrap_or(Validity::AllValid))
     } else {
-        assert!(nulls.map(|x| x.null_count() == 0).unwrap_or(true));
-        Validity::NonNullable
+        let null_count = nulls.map(NullBuffer::null_count).unwrap_or(0);
+        vortex_ensure_eq!(
+            null_count,
+            0,
+            "Cannot convert an Arrow array containing {null_count} nulls into a non-nullable Vortex array"
+        );
+        Ok(Validity::NonNullable)
     }
 }
 
@@ -680,6 +692,7 @@ mod tests {
     use arrow_schema::Field;
     use arrow_schema::Fields;
     use arrow_schema::Schema;
+    use rstest::rstest;
 
     use crate::ArrayRef;
     use crate::IntoArray;
@@ -689,171 +702,80 @@ mod tests {
     use crate::arrays::ListView;
     use crate::arrays::Primitive;
     use crate::arrays::Struct;
-    use crate::arrays::VarBin;
     use crate::arrays::VarBinView;
     use crate::arrays::fixed_size_list::FixedSizeListArrayExt;
     use crate::arrays::list::ListArrayExt;
     use crate::arrays::listview::ListViewArrayExt;
     use crate::arrays::struct_::StructArrayExt;
     use crate::arrow::FromArrowArray as _;
-    use crate::arrow::convert::TemporalArray;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
     use crate::extension::datetime::TimeUnit;
     use crate::extension::datetime::Timestamp;
 
-    // Test primitive array conversions
-    #[test]
-    fn test_int8_array_conversion() {
-        let arrow_array = Int8Array::from(vec![Some(1), None, Some(3), Some(4)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Int8Array::from(vec![1, 2, 3, 4]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with I8 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::I8);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::I8);
-    }
-
-    #[test]
-    fn test_int16_array_conversion() {
-        let arrow_array = Int16Array::from(vec![Some(100), None, Some(300), Some(400)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Int16Array::from(vec![100, 200, 300, 400]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with I16 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::I16);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::I16);
-    }
-
-    #[test]
-    fn test_int32_array_conversion() {
-        let arrow_array = Int32Array::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Int32Array::from(vec![1000, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with I32 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::I32);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::I32);
-    }
-
-    #[test]
-    fn test_int64_array_conversion() {
-        let arrow_array = Int64Array::from(vec![Some(10000), None, Some(30000), Some(40000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Int64Array::from(vec![10000_i64, 20000, 30000, 40000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with I64 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::I64);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::I64);
-    }
-
-    #[test]
-    fn test_uint8_array_conversion() {
-        let arrow_array = UInt8Array::from(vec![Some(1), None, Some(3), Some(4)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = UInt8Array::from(vec![1_u8, 2, 3, 4]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with U8 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::U8);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::U8);
-    }
-
-    #[test]
-    fn test_uint16_array_conversion() {
-        let arrow_array = UInt16Array::from(vec![Some(100), None, Some(300), Some(400)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = UInt16Array::from(vec![100_u16, 200, 300, 400]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with U16 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::U16);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::U16);
-    }
-
-    #[test]
-    fn test_uint32_array_conversion() {
-        let arrow_array = UInt32Array::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = UInt32Array::from(vec![1000_u32, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with U32 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::U32);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::U32);
-    }
-
-    #[test]
-    fn test_uint64_array_conversion() {
-        let arrow_array = UInt64Array::from(vec![Some(10000), None, Some(30000), Some(40000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = UInt64Array::from(vec![10000_u64, 20000, 30000, 40000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with U64 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::U64);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::U64);
+    #[rstest]
+    #[case::i8(
+        Arc::new(Int8Array::from(vec![Some(1), None, Some(3), Some(4)])),
+        Arc::new(Int8Array::from(vec![1, 2, 3, 4])),
+        PType::I8,
+    )]
+    #[case::i16(
+        Arc::new(Int16Array::from(vec![Some(100), None, Some(300), Some(400)])),
+        Arc::new(Int16Array::from(vec![100, 200, 300, 400])),
+        PType::I16,
+    )]
+    #[case::i32(
+        Arc::new(Int32Array::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(Int32Array::from(vec![1000, 2000, 3000, 4000])),
+        PType::I32,
+    )]
+    #[case::i64(
+        Arc::new(Int64Array::from(vec![Some(10000), None, Some(30000), Some(40000)])),
+        Arc::new(Int64Array::from(vec![10000_i64, 20000, 30000, 40000])),
+        PType::I64,
+    )]
+    #[case::u8(
+        Arc::new(UInt8Array::from(vec![Some(1), None, Some(3), Some(4)])),
+        Arc::new(UInt8Array::from(vec![1_u8, 2, 3, 4])),
+        PType::U8,
+    )]
+    #[case::u16(
+        Arc::new(UInt16Array::from(vec![Some(100), None, Some(300), Some(400)])),
+        Arc::new(UInt16Array::from(vec![100_u16, 200, 300, 400])),
+        PType::U16,
+    )]
+    #[case::u32(
+        Arc::new(UInt32Array::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(UInt32Array::from(vec![1000_u32, 2000, 3000, 4000])),
+        PType::U32,
+    )]
+    #[case::u64(
+        Arc::new(UInt64Array::from(vec![Some(10000), None, Some(30000), Some(40000)])),
+        Arc::new(UInt64Array::from(vec![10000_u64, 20000, 30000, 40000])),
+        PType::U64,
+    )]
+    #[case::f32(
+        Arc::new(Float32Array::from(vec![Some(1.5), None, Some(3.5), Some(4.5)])),
+        Arc::new(Float32Array::from(vec![1.5_f32, 2.5, 3.5, 4.5])),
+        PType::F32,
+    )]
+    #[case::f64(
+        Arc::new(Float64Array::from(vec![Some(1.5), None, Some(3.5), Some(4.5)])),
+        Arc::new(Float64Array::from(vec![1.5_f64, 2.5, 3.5, 4.5])),
+        PType::F64,
+    )]
+    fn test_primitive_array_conversion(
+        #[case] nullable: Arc<dyn ArrowArray>,
+        #[case] non_nullable: Arc<dyn ArrowArray>,
+        #[case] expected_ptype: PType,
+    ) {
+        let v_null = ArrayRef::from_arrow(nullable.as_ref(), true).unwrap();
+        let v_non_null = ArrayRef::from_arrow(non_nullable.as_ref(), false).unwrap();
+        assert_eq!(v_null.len(), 4);
+        assert_eq!(v_non_null.len(), 4);
+        assert_eq!(v_null.as_::<Primitive>().ptype(), expected_ptype);
+        assert_eq!(v_non_null.as_::<Primitive>().ptype(), expected_ptype);
     }
 
     #[test]
@@ -883,44 +805,6 @@ mod tests {
 
         let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
         assert_eq!(primitive_array_non_null.ptype(), PType::F16);
-    }
-
-    #[test]
-    fn test_float32_array_conversion() {
-        let arrow_array = Float32Array::from(vec![Some(1.5), None, Some(3.5), Some(4.5)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Float32Array::from(vec![1.5_f32, 2.5, 3.5, 4.5]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with F32 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::F32);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::F32);
-    }
-
-    #[test]
-    fn test_float64_array_conversion() {
-        let arrow_array = Float64Array::from(vec![Some(1.5), None, Some(3.5), Some(4.5)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Float64Array::from(vec![1.5_f64, 2.5, 3.5, 4.5]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be PrimitiveArray with F64 ptype
-        let primitive_array = vortex_array.as_::<Primitive>();
-        assert_eq!(primitive_array.ptype(), PType::F64);
-
-        let primitive_array_non_null = vortex_array_non_null.as_::<Primitive>();
-        assert_eq!(primitive_array_non_null.ptype(), PType::F64);
     }
 
     // Test decimal array conversions
@@ -999,58 +883,57 @@ mod tests {
     }
 
     // Test temporal array conversions
-    #[test]
-    fn test_timestamp_second_array_conversion() {
-        let arrow_array =
-            TimestampSecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = TimestampSecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be TemporalArray with Second time unit
-        let temporal_array = TemporalArray::try_from(vortex_array).unwrap();
-        assert_eq!(
-            temporal_array.temporal_metadata().time_unit(),
-            TimeUnit::Seconds
-        );
-
-        let temporal_array_non_null = TemporalArray::try_from(vortex_array_non_null).unwrap();
-        assert_eq!(
-            temporal_array_non_null.temporal_metadata().time_unit(),
-            TimeUnit::Seconds
-        );
-    }
-
-    #[test]
-    fn test_timestamp_millisecond_array_conversion() {
-        let arrow_array =
-            TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null =
-            TimestampMillisecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_timestamp_microsecond_array_conversion() {
-        let arrow_array =
-            TimestampMicrosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null =
-            TimestampMicrosecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
+    #[rstest]
+    #[case::timestamp_second(
+        Arc::new(TimestampSecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(TimestampSecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::timestamp_millisecond(
+        Arc::new(TimestampMillisecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(TimestampMillisecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::timestamp_microsecond(
+        Arc::new(TimestampMicrosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(TimestampMicrosecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::timestamp_nanosecond(
+        Arc::new(TimestampNanosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(TimestampNanosecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::time32_second(
+        Arc::new(Time32SecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(Time32SecondArray::from(vec![1000_i32, 2000, 3000, 4000])),
+    )]
+    #[case::time32_millisecond(
+        Arc::new(Time32MillisecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(Time32MillisecondArray::from(vec![1000_i32, 2000, 3000, 4000])),
+    )]
+    #[case::time64_microsecond(
+        Arc::new(Time64MicrosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(Time64MicrosecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::time64_nanosecond(
+        Arc::new(Time64NanosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)])),
+        Arc::new(Time64NanosecondArray::from(vec![1000_i64, 2000, 3000, 4000])),
+    )]
+    #[case::date32(
+        Arc::new(Date32Array::from(vec![Some(18000), None, Some(18002), Some(18003)])),
+        Arc::new(Date32Array::from(vec![18000_i32, 18001, 18002, 18003])),
+    )]
+    #[case::date64(
+        Arc::new(Date64Array::from(vec![Some(1555200000000), None, Some(1555286400000), Some(1555372800000)]
+        )),
+        Arc::new(Date64Array::from(vec![1555200000000_i64, 1555213600000, 1555286400000, 1555372800000]
+        )),
+    )]
+    fn test_temporal_array_conversion(
+        #[case] nullable: Arc<dyn ArrowArray>,
+        #[case] non_nullable: Arc<dyn ArrowArray>,
+    ) {
+        let v_null = ArrayRef::from_arrow(nullable.as_ref(), true).unwrap();
+        let v_non_null = ArrayRef::from_arrow(non_nullable.as_ref(), false).unwrap();
+        assert_eq!(v_null.len(), 4);
+        assert_eq!(v_non_null.len(), 4);
     }
 
     #[test]
@@ -1090,192 +973,47 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_timestamp_nanosecond_array_conversion() {
-        let arrow_array =
-            TimestampNanosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = TimestampNanosecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_time32_second_array_conversion() {
-        let arrow_array = Time32SecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Time32SecondArray::from(vec![1000_i32, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be TemporalArray with Second time unit
-        let temporal_array = TemporalArray::try_from(vortex_array).unwrap();
-        assert_eq!(
-            temporal_array.temporal_metadata().time_unit(),
-            TimeUnit::Seconds
-        );
-
-        let temporal_array_non_null = TemporalArray::try_from(vortex_array_non_null).unwrap();
-        assert_eq!(
-            temporal_array_non_null.temporal_metadata().time_unit(),
-            TimeUnit::Seconds
-        );
-    }
-
-    #[test]
-    fn test_time32_millisecond_array_conversion() {
-        let arrow_array =
-            Time32MillisecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Time32MillisecondArray::from(vec![1000_i32, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_time64_microsecond_array_conversion() {
-        let arrow_array =
-            Time64MicrosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Time64MicrosecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_time64_nanosecond_array_conversion() {
-        let arrow_array =
-            Time64NanosecondArray::from(vec![Some(1000), None, Some(3000), Some(4000)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Time64NanosecondArray::from(vec![1000_i64, 2000, 3000, 4000]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_date32_array_conversion() {
-        let arrow_array = Date32Array::from(vec![Some(18000), None, Some(18002), Some(18003)]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Date32Array::from(vec![18000_i32, 18001, 18002, 18003]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_date64_array_conversion() {
-        let arrow_array = Date64Array::from(vec![
-            Some(1555200000000),
-            None,
-            Some(1555286400000),
-            Some(1555372800000),
-        ]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = Date64Array::from(vec![
-            1555200000000_i64,
-            1555213600000,
-            1555286400000,
-            1555372800000,
-        ]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
     // Test string/binary array conversions
-    #[test]
-    fn test_utf8_array_conversion() {
-        let arrow_array = StringArray::from(vec![Some("hello"), None, Some("world"), Some("test")]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = StringArray::from(vec!["hello", "world", "test", "vortex"]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-
-        // Verify metadata - should be VarBinArray with Utf8 dtype
-        let varbin_array = vortex_array.as_::<VarBin>();
-        assert_eq!(varbin_array.dtype(), &DType::Utf8(true.into()));
-
-        let varbin_array_non_null = vortex_array_non_null.as_::<VarBin>();
-        assert_eq!(varbin_array_non_null.dtype(), &DType::Utf8(false.into()));
-    }
-
-    #[test]
-    fn test_large_utf8_array_conversion() {
-        let arrow_array =
-            LargeStringArray::from(vec![Some("hello"), None, Some("world"), Some("test")]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = LargeStringArray::from(vec!["hello", "world", "test", "vortex"]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_binary_array_conversion() {
-        let arrow_array = BinaryArray::from(vec![
-            Some("hello".as_bytes()),
-            None,
-            Some("world".as_bytes()),
-            Some("test".as_bytes()),
-        ]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = BinaryArray::from(vec![
-            "hello".as_bytes(),
-            "world".as_bytes(),
-            "test".as_bytes(),
-            "vortex".as_bytes(),
-        ]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
-    }
-
-    #[test]
-    fn test_large_binary_array_conversion() {
-        let arrow_array = LargeBinaryArray::from(vec![
-            Some("hello".as_bytes()),
-            None,
-            Some("world".as_bytes()),
-            Some("test".as_bytes()),
-        ]);
-        let vortex_array = ArrayRef::from_arrow(&arrow_array, true).unwrap();
-
-        let arrow_array_non_null = LargeBinaryArray::from(vec![
-            "hello".as_bytes(),
-            "world".as_bytes(),
-            "test".as_bytes(),
-            "vortex".as_bytes(),
-        ]);
-        let vortex_array_non_null = ArrayRef::from_arrow(&arrow_array_non_null, false).unwrap();
-
-        assert_eq!(vortex_array.len(), 4);
-        assert_eq!(vortex_array_non_null.len(), 4);
+    #[rstest]
+    #[case::utf8(
+        Arc::new(StringArray::from(vec![Some("hello"), None, Some("world"), Some("test")])),
+        Arc::new(StringArray::from(vec!["hello", "world", "test", "vortex"])),
+        DType::Utf8(Nullability::NonNullable),
+    )]
+    #[case::large_utf8(
+        Arc::new(LargeStringArray::from(vec![Some("hello"), None, Some("world"), Some("test")])),
+        Arc::new(LargeStringArray::from(vec!["hello", "world", "test", "vortex"])),
+        DType::Utf8(Nullability::NonNullable),
+    )]
+    #[case::binary(
+        Arc::new(BinaryArray::from(vec![
+            Some("hello".as_bytes()), None, Some("world".as_bytes()), Some("test".as_bytes()),
+        ])),
+        Arc::new(BinaryArray::from(vec![
+            "hello".as_bytes(), "world".as_bytes(), "test".as_bytes(), "vortex".as_bytes(),
+        ])),
+        DType::Binary(Nullability::NonNullable),
+    )]
+    #[case::large_binary(
+        Arc::new(LargeBinaryArray::from(vec![
+            Some("hello".as_bytes()), None, Some("world".as_bytes()), Some("test".as_bytes()),
+        ])),
+        Arc::new(LargeBinaryArray::from(vec![
+            "hello".as_bytes(), "world".as_bytes(), "test".as_bytes(), "vortex".as_bytes(),
+        ])),
+        DType::Binary(Nullability::NonNullable),
+    )]
+    fn test_string_binary_array_conversion(
+        #[case] nullable: Arc<dyn ArrowArray>,
+        #[case] non_nullable: Arc<dyn ArrowArray>,
+        #[case] expected_non_nullable_dtype: DType,
+    ) {
+        let v_null = ArrayRef::from_arrow(nullable.as_ref(), true).unwrap();
+        let v_non_null = ArrayRef::from_arrow(non_nullable.as_ref(), false).unwrap();
+        assert_eq!(v_null.len(), 4);
+        assert_eq!(v_non_null.len(), 4);
+        assert_eq!(v_null.dtype(), &expected_non_nullable_dtype.as_nullable());
+        assert_eq!(v_non_null.dtype(), &expected_non_nullable_dtype);
     }
 
     #[test]
@@ -1762,8 +1500,48 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
-    pub fn cannot_handle_nullable_struct_containing_non_nullable_dictionary() {
+    fn non_nullable_request_rejects_nulls() {
+        // Requesting `nullable = false` on an Arrow array that physically contains nulls is a
+        // contradiction and must surface as an error, not a panic.
+        let arrow_array = Int32Array::from(vec![Some(1), None, Some(3)]);
+        assert!(ArrayRef::from_arrow(&arrow_array, false).is_err());
+    }
+
+    #[test]
+    fn non_nullable_request_rejects_null_array() {
+        // An Arrow NullArray is entirely null, so it cannot be converted to a non-nullable
+        // Vortex array.
+        let arrow_array = NullArray::new(5);
+        assert!(ArrayRef::from_arrow(&arrow_array, false).is_err());
+    }
+
+    #[test]
+    fn non_nullable_struct_with_nulls_errors() {
+        // A struct array carrying top-level nulls cannot be converted to a non-nullable Vortex
+        // struct; the struct-level validity reconciliation must error rather than panic.
+        let struct_array = new_null_array(
+            &DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+            3,
+        );
+        assert!(ArrayRef::from_arrow(struct_array.as_ref(), false).is_err());
+    }
+
+    #[test]
+    fn non_nullable_list_with_nulls_errors() {
+        // Likewise for a list array with a null entry: requesting a non-nullable list must error
+        // rather than panic.
+        let mut builder = ListBuilder::new(Int32Builder::new());
+        builder.append_value([Some(1), Some(2)]);
+        builder.append_null();
+        let list = builder.finish();
+        assert!(ArrayRef::from_arrow(&list, false).is_err());
+    }
+
+    #[test]
+    pub fn nullable_struct_containing_non_nullable_dictionary_with_nulls_errors() {
+        // `remove_nulls` cannot strip pushed-down nulls out of a non-nullable dictionary field,
+        // so the values end up converted with `nullable = false` while still containing nulls.
+        // This must surface as an error rather than panicking.
         let null_struct_array_with_non_nullable_field = new_null_array(
             &DataType::Struct(Fields::from(vec![Field::new(
                 "non_nullable_deeper_inner",
@@ -1773,6 +1551,8 @@ mod tests {
             1,
         );
 
-        ArrayRef::from_arrow(null_struct_array_with_non_nullable_field.as_ref(), true).unwrap();
+        assert!(
+            ArrayRef::from_arrow(null_struct_array_with_non_nullable_field.as_ref(), true).is_err()
+        );
     }
 }

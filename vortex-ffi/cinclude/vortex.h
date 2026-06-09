@@ -8,10 +8,16 @@
 //
 
 // https://arrow.apache.org/docs/format/CDataInterface.html#structure-definitions
-// We don't want to bundle nanoarrow or similar just for these two definitions.
-// If you use your own Arrow library, define this macro and
-// typedef FFI_ArrowSchema ArrowSchema;
-// typedef FFI_ArrowArrayStream ArrowArrayStream;
+// If you want to use your own Arrow library like nanoarrow, define this macro
+// and typedef your types:
+//
+// #include "nanoarrow/common/inline_types.h"
+// #define USE_OWN_ARROW
+// typedef struct ArrowSchema FFI_ArrowSchema;
+// typedef struct ArrowArray FFI_ArrowArray;
+// typedef struct ArrowArrayStream FFI_ArrowArrayStream;
+// #include "vortex.h"
+//
 #ifndef USE_OWN_ARROW
 struct ArrowSchema {
     const char *format;
@@ -44,6 +50,7 @@ struct ArrowArrayStream {
     void *private_data;
 };
 typedef struct ArrowSchema FFI_ArrowSchema;
+typedef struct ArrowArray FFI_ArrowArray;
 typedef struct ArrowArrayStream FFI_ArrowArrayStream;
 #endif
 
@@ -175,10 +182,19 @@ typedef enum {
 } vx_validity_type;
 
 typedef enum {
-    VX_CARD_UNKNOWN = 0,
-    VX_CARD_ESTIMATE = 1,
-    VX_CARD_MAXIMUM = 2,
-} vx_cardinality;
+    /**
+     * No estimate is available.
+     */
+    VX_ESTIMATE_UNKNOWN = 0,
+    /**
+     * The value in vx_estimate.estimate is exact.
+     */
+    VX_ESTIMATE_EXACT = 1,
+    /**
+     * The value in vx_estimate.estimate is an upper bound.
+     */
+    VX_ESTIMATE_INEXACT = 2,
+} vx_estimate_type;
 
 /**
  * Equalities, inequalities, and boolean operations over possibly null values.
@@ -282,28 +298,13 @@ typedef enum {
     VX_SELECTION_EXCLUDE_RANGE = 2,
 } vx_scan_selection_include;
 
-typedef enum {
-    /**
-     * No estimate is available.
-     */
-    VX_ESTIMATE_UNKNOWN = 0,
-    /**
-     * The value in vx_estimate.estimate is exact.
-     */
-    VX_ESTIMATE_EXACT = 1,
-    /**
-     * The value in vx_estimate.estimate is an upper bound.
-     */
-    VX_ESTIMATE_INEXACT = 2,
-} vx_estimate_type;
-
 /**
  * Physical type enum, represents the in-memory physical layout but might represent a different logical type.
  */
 enum PType
-#ifdef __cplusplus
+#if defined(__cplusplus) || __STDC_VERSION__ >= 202311L
     : uint8_t
-#endif // __cplusplus
+#endif // defined(__cplusplus) || __STDC_VERSION__ >= 202311L
 {
     /**
      * An 8-bit unsigned integer
@@ -351,7 +352,11 @@ enum PType
     F64 = 10,
 };
 #ifndef __cplusplus
+#if __STDC_VERSION__ >= 202311L
+typedef enum PType PType;
+#else
 typedef uint8_t PType;
+#endif // __STDC_VERSION__ >= 202311L
 #endif // __cplusplus
 
 /**
@@ -490,6 +495,20 @@ typedef struct vx_file vx_file;
  */
 typedef struct vx_partition vx_partition;
 
+/**
+ * A typed scalar value.
+ *
+ * A `vx_scalar` represents a single value with an associated `DType`.
+ * Its value is either null or a `ScalarValue`. Null values are allowed only
+ * when the associated `DType` allows nulls. Non-null values are represented
+ * by `ScalarValue` and interpreted using the `DType`.
+ */
+typedef struct vx_scalar vx_scalar;
+
+/**
+ * A scan is a single traversal of a data source with projections and
+ * filters. A scan can be consumed only once.
+ */
 typedef struct vx_scan vx_scan;
 
 /**
@@ -537,75 +556,17 @@ typedef struct {
     const char *paths;
 } vx_data_source_options;
 
-typedef struct {
-    vx_cardinality cardinality;
-    /**
-     * Set only when "cardinality" is not VX_CARD_UNKNOWN
-     */
-    uint64_t rows;
-} vx_data_source_row_count;
-
 /**
- * Options supplied for opening a file.
+ * Used for estimating number of partitions in a data source or number of rows
+ * in a partition.
  */
 typedef struct {
+    vx_estimate_type type;
     /**
-     * URI for opening the file.
-     * This must be a valid URI, even for files (file:///path/to/file)
+     * Set only when "type" is not VX_ESTIMATE_UNKNOWN.
      */
-    const char *uri;
-    /**
-     * Additional configuration for the file source (e.g. "s3.accessKey").
-     * This may be null, in which case it is treated as empty.
-     */
-    const char *const *property_keys;
-    /**
-     * Additional configuration values for the file source (e.g. S3 credentials).
-     */
-    const char *const *property_vals;
-    /**
-     * Number of properties in `property_keys` and `property_vals`.
-     */
-    int property_len;
-} vx_file_open_options;
-
-/**
- * Scan options provided by an FFI client calling the `vx_file_scan` function.
- */
-typedef struct {
-    /**
-     * Column names to project out in the scan. These must be null-terminated C strings.
-     */
-    const char *projection_expression;
-    /**
-     * Number of columns in `projection`.
-     */
-    unsigned int projection_expr_len;
-    /**
-     * Serialized expressions for pushdown
-     */
-    const char *filter_expression;
-    /**
-     * The len in bytes of the filter expression
-     */
-    unsigned int filter_expression_len;
-    /**
-     * Splits the file into chunks of this size, if zero then we use the write layout.
-     */
-    int split_by_row_count;
-    /**
-     * First row of a range to scan.
-     */
-    unsigned long row_range_start;
-    /**
-     * Last row of a range to scan.
-     */
-    unsigned long row_range_end;
-    /**
-     * The row offset of the file in a multi-file scan.
-     */
-    unsigned long row_offset;
-} vx_file_scan_options;
+    uint64_t estimate;
+} vx_estimate;
 
 /**
  * Scan row selection.
@@ -652,27 +613,10 @@ typedef struct {
      */
     uint64_t limit;
     /**
-     * Upper limit for parallelism. 0 means no limit.
-     * Scan will return at most "max_threads" partitions.
-     */
-    uint64_t max_threads;
-    /**
      * If true, return in storage order.
      */
     bool ordered;
 } vx_scan_options;
-
-/**
- * Used for estimating number of partitions in a data source or number of rows
- * in a partition.
- */
-typedef struct {
-    vx_estimate_type type;
-    /**
-     * Set only when "type" is not VX_ESTIMATE_UNKNOWN.
-     */
-    uint64_t estimate;
-} vx_estimate;
 
 #ifdef __cplusplus
 extern "C" {
@@ -680,8 +624,6 @@ extern "C" {
 
 /**
  * Clone a borrowed [`vx_array`], returning an owned [`vx_array`].
- *
- *
  * Must be released with [`vx_array_free`].
  */
 const vx_array *vx_array_clone(const vx_array *ptr);
@@ -782,6 +724,34 @@ const vx_array *vx_array_new_primitive(vx_ptype ptype,
                                        const vx_validity *validity,
                                        vx_error **error);
 
+/**
+ * Create a Vortex array by importing an Arrow array via the Arrow C Data Interface.
+ *
+ * `array` and `schema` together describe a single Arrow array (the standard Arrow C Data
+ * Interface pair, e.g. as produced by exporting a record batch). Both are *consumed*: their
+ * `release` callbacks are invoked by this function and the caller must not use or release them
+ * afterwards.
+ *
+ * `nullable` controls the top-level nullability of the resulting array's dtype. For an Arrow
+ * record batch (which has no top-level validity) pass `false`.
+ *
+ * The imported buffers are referenced zero-copy where possible; the returned array keeps the
+ * Arrow data alive until it is freed with [`vx_array_free`].
+ *
+ * On error, returns NULL and sets `error_out`.
+ *
+ * Example:
+ *
+ * // export an Arrow record batch into (array, schema), then:
+ * vx_error* error = NULL;
+ * const vx_array* vx = vx_array_from_arrow(&array, &schema, false, &error);
+ * // ... push it to a sink or write it ...
+ * vx_array_free(vx);
+ *
+ */
+const vx_array *
+vx_array_from_arrow(FFI_ArrowArray *array, FFI_ArrowSchema *schema, bool nullable, vx_error **error_out);
+
 uint8_t vx_array_get_u8(const vx_array *array, size_t index);
 
 uint8_t vx_array_get_storage_u8(const vx_array *array, size_t index);
@@ -862,8 +832,6 @@ const vx_array *vx_array_iterator_next(vx_array_iterator *iter, vx_error **error
 
 /**
  * Clone a borrowed [`vx_binary`], returning an owned [`vx_binary`].
- *
- *
  * Must be released with [`vx_binary_free`].
  */
 const vx_binary *vx_binary_clone(const vx_binary *ptr);
@@ -890,8 +858,6 @@ const char *vx_binary_ptr(const vx_binary *ptr);
 
 /**
  * Clone a borrowed [`vx_data_source`], returning an owned [`vx_data_source`].
- *
- *
  * Must be released with [`vx_data_source_free`].
  */
 const vx_data_source *vx_data_source_clone(const vx_data_source *ptr);
@@ -921,12 +887,10 @@ const vx_dtype *vx_data_source_dtype(const vx_data_source *ds);
 /**
  * Write data source's row count estimate into "row_count".
  */
-void vx_data_source_get_row_count(const vx_data_source *ds, vx_data_source_row_count *row_count);
+void vx_data_source_get_row_count(const vx_data_source *ds, vx_estimate *row_count);
 
 /**
  * Clone a borrowed [`vx_dtype`], returning an owned [`vx_dtype`].
- *
- *
  * Must be released with [`vx_dtype_free`].
  */
 const vx_dtype *vx_dtype_clone(const vx_dtype *ptr);
@@ -1074,6 +1038,18 @@ const vx_string *vx_dtype_time_zone(const DType *dtype);
 int vx_dtype_to_arrow_schema(const vx_dtype *dtype, FFI_ArrowSchema *schema, vx_error **err);
 
 /**
+ * Create a Vortex dtype from an Arrow C Data Interface schema.
+ *
+ * `schema` must point to a valid `ArrowSchema` describing a struct (record-batch) schema. It is
+ * *consumed*: its `release` callback is invoked by this function and the caller must not use or
+ * release it afterwards. The returned dtype is a non-nullable struct, mirroring how Arrow record
+ * batches map to Vortex arrays.
+ *
+ * On error, returns NULL and sets `err`.
+ */
+const vx_dtype *vx_dtype_from_arrow_schema(FFI_ArrowSchema *schema, vx_error **err);
+
+/**
  * Free an owned [`vx_error`] object.
  */
 void vx_error_free(vx_error *ptr);
@@ -1109,6 +1085,40 @@ void vx_expression_free(vx_expression *ptr);
  *
  */
 vx_expression *vx_expression_root(void);
+
+/**
+ * Create a literal expression from a scalar.
+ *
+ * Literal expressions are useful for constants in expression trees, especially scan
+ * predicates. For example, a caller can compare a column expression to a scalar
+ * threshold and pass the resulting predicate to `vx_data_source_scan`.
+ *
+ * Example:
+ *
+ * vx_error* error = NULL;
+ * const vx_data_source* data_source = ...;
+ *
+ * vx_expression* root = vx_expression_root();
+ * vx_expression* age = vx_expression_get_item("age", root);
+ *
+ * vx_scalar* threshold_scalar = vx_scalar_new_u8(50, false);
+ * vx_expression* threshold = vx_expression_literal(threshold_scalar, &error);
+ * vx_scalar_free(threshold_scalar);
+ *
+ * vx_expression* predicate = vx_expression_binary(VX_OPERATOR_GTE, age, threshold);
+ * vx_scan_options options = {};
+ * options.filter = predicate;
+ *
+ * vx_scan* scan = vx_data_source_scan(data_source, &options, NULL, &error);
+ *
+ * vx_scan_free(scan);
+ * vx_expression_free(predicate);
+ * vx_expression_free(threshold);
+ * vx_expression_free(age);
+ * vx_expression_free(root);
+ *
+ */
+vx_expression *vx_expression_literal(const vx_scalar *scalar, vx_error **err);
 
 /**
  * Create an expression that selects (includes) specific fields from a child
@@ -1201,8 +1211,6 @@ vx_expression *vx_expression_list_contains(const vx_expression *list, const vx_e
 
 /**
  * Clone a borrowed [`vx_file`], returning an owned [`vx_file`].
- *
- *
  * Must be released with [`vx_file_free`].
  */
 const vx_file *vx_file_clone(const vx_file *ptr);
@@ -1212,43 +1220,10 @@ const vx_file *vx_file_clone(const vx_file *ptr);
  */
 void vx_file_free(const vx_file *ptr);
 
-/**
- * Open a file at the given path on the file system.
- */
-const vx_file *
-vx_file_open_reader(const vx_session *session, const vx_file_open_options *options, vx_error **error_out);
-
 void vx_file_write_array(const vx_session *session,
                          const char *path,
                          const vx_array *array,
                          vx_error **error_out);
-
-uint64_t vx_file_row_count(const vx_file *file);
-
-/**
- * Return the DType of the file.
- *
- * The returned pointer is valid as long as the file is valid.
- * Do NOT free the returned dtype pointer - it shares the lifetime of the file.
- */
-const vx_dtype *vx_file_dtype(const vx_file *file);
-
-/**
- * Can we prune the whole file using file stats and an expression
- */
-bool vx_file_can_prune(const vx_session *session,
-                       const vx_file *file,
-                       const char *filter_expression,
-                       unsigned int filter_expression_len,
-                       vx_error **error_out);
-
-/**
- * Build a new `vx_array_iterator` that returns a series of `vx_array`s from a scan over a `vx_layout_reader`.
- */
-vx_array_iterator *vx_file_scan(const vx_session *session,
-                                const vx_file *file,
-                                const vx_file_scan_options *opts,
-                                vx_error **error_out);
 
 /**
  * Set the stderr logger to output at the specified level.
@@ -1256,6 +1231,237 @@ vx_array_iterator *vx_file_scan(const vx_session *session,
  * The logger will only be installed on the first call.
  */
 void vx_set_log_level(vx_log_level level);
+
+/**
+ * Free an owned [`vx_scalar`] object.
+ */
+void vx_scalar_free(vx_scalar *ptr);
+
+/**
+ * Clone a borrowed scalar handle.
+ *
+ * The input scalar handle is not consumed. The returned scalar handle must be
+ * released with vx_scalar_free. Returns NULL when given a NULL scalar handle.
+ */
+vx_scalar *vx_scalar_clone(const vx_scalar *scalar);
+
+/**
+ * Return the data type of a scalar.
+ *
+ * The returned data type handle borrows storage from the scalar handle, so its
+ * lifetime is bound to the scalar handle. It MUST NOT be freed separately.
+ * Returns NULL when given a NULL scalar handle.
+ */
+const vx_dtype *vx_scalar_dtype(const vx_scalar *scalar);
+
+/**
+ * Return whether the scalar is a typed null value.
+ *
+ * Returns false when given a NULL scalar handle.
+ */
+bool vx_scalar_is_null(const vx_scalar *scalar);
+
+/**
+ * Create a boolean scalar.
+ */
+vx_scalar *vx_scalar_new_bool(bool value, bool is_nullable);
+
+/**
+ * Create an unsigned 8-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_u8(uint8_t value, bool is_nullable);
+
+/**
+ * Create an unsigned 16-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_u16(uint16_t value, bool is_nullable);
+
+/**
+ * Create an unsigned 32-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_u32(uint32_t value, bool is_nullable);
+
+/**
+ * Create an unsigned 64-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_u64(uint64_t value, bool is_nullable);
+
+/**
+ * Create a signed 8-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_i8(int8_t value, bool is_nullable);
+
+/**
+ * Create a signed 16-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_i16(int16_t value, bool is_nullable);
+
+/**
+ * Create a signed 32-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_i32(int32_t value, bool is_nullable);
+
+/**
+ * Create a signed 64-bit integer scalar.
+ */
+vx_scalar *vx_scalar_new_i64(int64_t value, bool is_nullable);
+
+/**
+ * Create a 32-bit floating point scalar.
+ */
+vx_scalar *vx_scalar_new_f32(float value, bool is_nullable);
+
+/**
+ * Create a 64-bit floating point scalar.
+ */
+vx_scalar *vx_scalar_new_f64(double value, bool is_nullable);
+
+/**
+ * Create a 16-bit floating point scalar.
+ *
+ * The value is read from raw half-precision bits because C has no portable
+ * half-precision floating point ABI.
+ */
+vx_scalar *vx_scalar_new_f16_bits(uint16_t bits, bool is_nullable);
+
+/**
+ * Create a UTF-8 scalar.
+ *
+ * The byte range is copied into the scalar. A NULL data pointer is allowed only
+ * for an empty byte range. Invalid UTF-8 returns NULL and writes the error
+ * output.
+ */
+vx_scalar *vx_scalar_new_utf8(const char *ptr, size_t len, bool is_nullable, vx_error **err);
+
+/**
+ * Create a binary scalar.
+ *
+ * The byte range is copied into the scalar. A NULL data pointer is allowed only
+ * for an empty byte range. Passing a NULL data pointer for a non-empty byte
+ * range returns NULL and writes the error output.
+ */
+vx_scalar *vx_scalar_new_binary(const uint8_t *ptr, size_t len, bool is_nullable, vx_error **err);
+
+/**
+ * Create a typed null scalar.
+ *
+ * The data type handle is borrowed, not consumed. The returned scalar uses a
+ * nullable copy of that logical type, regardless of the input type's top-level
+ * nullability. A NULL data type handle returns NULL and writes the error output.
+ */
+vx_scalar *vx_scalar_new_null(const vx_dtype *dtype, vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is provided as a signed 8-bit integer. Decimal precision
+ * and scale define the logical decimal type. Invalid decimal metadata or value
+ * overflow returns NULL and writes the error output.
+ */
+vx_scalar *
+vx_scalar_new_decimal_i8(int8_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is provided as a signed 16-bit integer. Decimal precision
+ * and scale define the logical decimal type. Invalid decimal metadata or value
+ * overflow returns NULL and writes the error output.
+ */
+vx_scalar *
+vx_scalar_new_decimal_i16(int16_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is provided as a signed 32-bit integer. Decimal precision
+ * and scale define the logical decimal type. Invalid decimal metadata or value
+ * overflow returns NULL and writes the error output.
+ */
+vx_scalar *
+vx_scalar_new_decimal_i32(int32_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is provided as a signed 64-bit integer. Decimal precision
+ * and scale define the logical decimal type. Invalid decimal metadata or value
+ * overflow returns NULL and writes the error output.
+ */
+vx_scalar *
+vx_scalar_new_decimal_i64(int64_t value, uint8_t precision, int8_t scale, bool is_nullable, vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is read from a 16-byte little-endian signed integer
+ * buffer. Decimal precision and scale define the logical decimal type.
+ * Invalid decimal metadata or value overflow returns NULL and writes the error
+ * output.
+ */
+vx_scalar *vx_scalar_new_decimal_i128_le(const uint8_t *bytes16,
+                                         uint8_t precision,
+                                         int8_t scale,
+                                         bool is_nullable,
+                                         vx_error **err);
+
+/**
+ * Create a decimal scalar.
+ *
+ * The unscaled value is read from a 32-byte little-endian signed integer
+ * buffer. Decimal precision and scale define the logical decimal type.
+ * Invalid decimal metadata or value overflow returns NULL and writes the error
+ * output.
+ */
+vx_scalar *vx_scalar_new_decimal_i256_le(const uint8_t *bytes32,
+                                         uint8_t precision,
+                                         int8_t scale,
+                                         bool is_nullable,
+                                         vx_error **err);
+
+/**
+ * Create a list scalar.
+ *
+ * The element data type handle is borrowed, not consumed. Child scalar handles
+ * are cloned into the list value, so the caller keeps ownership of the handle
+ * array and each scalar in it. A NULL child handle array is allowed only for an
+ * empty list. Child values are validated against the element logical type.
+ */
+vx_scalar *vx_scalar_new_list(const vx_dtype *element_dtype,
+                              const vx_scalar *const *elements,
+                              size_t len,
+                              bool is_nullable,
+                              vx_error **err);
+
+/**
+ * Create a fixed-size list scalar.
+ *
+ * The element data type handle is borrowed, not consumed. The number of child
+ * scalars becomes the fixed-size list width and must fit in a 32-bit unsigned
+ * integer. Child scalar handles are cloned into the list value, so the caller
+ * keeps ownership of the handle array and each scalar in it. A NULL child
+ * handle array is allowed only for an empty list. Child values are validated
+ * against the element logical type.
+ */
+vx_scalar *vx_scalar_new_fixed_size_list(const vx_dtype *element_dtype,
+                                         const vx_scalar *const *elements,
+                                         size_t len,
+                                         bool is_nullable,
+                                         vx_error **err);
+
+/**
+ * Create a struct scalar.
+ *
+ * The struct data type handle is borrowed, not consumed. Field scalar handles
+ * are cloned into the struct value, so the caller keeps ownership of the handle
+ * array and each scalar in it. Field count and field logical types are validated
+ * against the struct logical type. A NULL field handle array is allowed only for
+ * an empty struct value.
+ */
+vx_scalar *vx_scalar_new_struct(const vx_dtype *struct_dtype,
+                                const vx_scalar *const *fields,
+                                size_t len,
+                                vx_error **err);
 
 /**
  * Free an owned [`vx_scan`] object.
@@ -1319,6 +1525,17 @@ vx_partition *vx_scan_next_partition(vx_scan *scan, vx_error **err);
  */
 int vx_partition_row_count(const vx_partition *partition, vx_estimate *count, vx_error **err);
 
+/**
+ * Scan partition to ArrowArrayStream.
+ * Consumes partition fully: subsequent calls to vx_partition_scan_arrow or
+ * vx_partition_next are undefined behaviour.
+ * This call blocks current thread until underlying stream is fully consumed.
+ *
+ * Caller must not free partition after calling this function.
+ *
+ * On success, sets "stream" and returns 0.
+ * On error, sets "err" and returns 1, freeing the partition.
+ */
 int vx_partition_scan_arrow(const vx_session *session,
                             vx_partition *partition,
                             FFI_ArrowArrayStream *stream,
@@ -1379,8 +1596,6 @@ void vx_array_sink_close(vx_array_sink *sink, vx_error **error_out);
 
 /**
  * Clone a borrowed [`vx_string`], returning an owned [`vx_string`].
- *
- *
  * Must be released with [`vx_string_free`].
  */
 const vx_string *vx_string_clone(const vx_string *ptr);

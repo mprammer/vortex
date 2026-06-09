@@ -15,10 +15,11 @@ use vortex_array::ArrayHash;
 use vortex_array::ArrayId;
 use vortex_array::ArrayParts;
 use vortex_array::ArrayRef;
+use vortex_array::ArraySlots;
 use vortex_array::ArrayView;
+use vortex_array::EqMode;
 use vortex_array::ExecutionCtx;
 use vortex_array::ExecutionResult;
-use vortex_array::Precision;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::dtype::DType;
 use vortex_array::scalar::Scalar;
@@ -86,7 +87,7 @@ impl ZstdBuffers {
             uncompressed_sizes,
             buffer_alignments,
         };
-        let slots = children.into_iter().map(Some).collect();
+        let slots: ArraySlots = children.into_iter().map(Some).collect();
         let compressed = Array::try_from_parts(
             ArrayParts::new(ZstdBuffers, array.dtype().clone(), array.len(), data)
                 .with_slots(slots),
@@ -336,11 +337,11 @@ fn array_id_from_string(s: &str) -> ArrayId {
 }
 
 impl ArrayHash for ZstdBuffersData {
-    fn array_hash<H: Hasher>(&self, state: &mut H, precision: Precision) {
+    fn array_hash<H: Hasher>(&self, state: &mut H, accuracy: EqMode) {
         self.inner_encoding_id.hash(state);
         self.inner_metadata.hash(state);
         for buf in &self.compressed_buffers {
-            buf.array_hash(state, precision);
+            buf.array_hash(state, accuracy);
         }
         self.uncompressed_sizes.hash(state);
         self.buffer_alignments.hash(state);
@@ -348,7 +349,7 @@ impl ArrayHash for ZstdBuffersData {
 }
 
 impl ArrayEq for ZstdBuffersData {
-    fn array_eq(&self, other: &Self, precision: Precision) -> bool {
+    fn array_eq(&self, other: &Self, accuracy: EqMode) -> bool {
         self.inner_encoding_id == other.inner_encoding_id
             && self.inner_metadata == other.inner_metadata
             && self.compressed_buffers.len() == other.compressed_buffers.len()
@@ -356,14 +357,14 @@ impl ArrayEq for ZstdBuffersData {
                 .compressed_buffers
                 .iter()
                 .zip(&other.compressed_buffers)
-                .all(|(a, b)| a.array_eq(b, precision))
+                .all(|(a, b)| a.array_eq(b, accuracy))
             && self.uncompressed_sizes == other.uncompressed_sizes
             && self.buffer_alignments == other.buffer_alignments
     }
 }
 
 impl VTable for ZstdBuffers {
-    type ArrayData = ZstdBuffersData;
+    type TypedArrayData = ZstdBuffersData;
     type OperationsVTable = Self;
     type ValidityVTable = Self;
 
@@ -374,7 +375,7 @@ impl VTable for ZstdBuffers {
 
     fn validate(
         &self,
-        data: &Self::ArrayData,
+        data: &Self::TypedArrayData,
         _dtype: &DType,
         _len: usize,
         _slots: &[Option<ArrayRef>],
@@ -425,9 +426,10 @@ impl VTable for ZstdBuffers {
         let metadata = ZstdBuffersMetadata::decode(metadata)?;
         let compressed_buffers: Vec<BufferHandle> = buffers.to_vec();
 
-        let slots: Vec<Option<ArrayRef>> = (0..children.len())
+        let slots: ArraySlots = (0..children.len())
             .map(|i| children.get(i, dtype, len).map(Some))
-            .collect::<VortexResult<Vec<_>>>()?;
+            .collect::<VortexResult<Vec<_>>>()?
+            .into();
 
         let data = ZstdBuffersData {
             inner_encoding_id: array_id_from_string(&metadata.inner_encoding_id),
@@ -561,7 +563,7 @@ mod tests {
 
         let compressed = ZstdBuffers::compress(&input, 3, &LEGACY_SESSION)?;
 
-        assert!(compressed.statistics().get(Stat::Min).is_some());
+        assert!(!compressed.statistics().get(Stat::Min).is_absent());
         Ok(())
     }
 

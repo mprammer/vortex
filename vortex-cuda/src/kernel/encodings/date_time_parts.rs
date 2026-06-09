@@ -22,7 +22,7 @@ use vortex::dtype::NativePType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
 use vortex::encodings::datetime_parts::DateTimeParts;
-use vortex::encodings::datetime_parts::DateTimePartsArrayExt;
+use vortex::encodings::datetime_parts::DateTimePartsArraySlotsExt;
 use vortex::error::VortexResult;
 use vortex::error::vortex_bail;
 use vortex::error::vortex_err;
@@ -66,7 +66,7 @@ impl CudaExecute for DateTimePartsExecutor {
 
         let time_unit = options.unit;
         let time_zone = options.tz.clone();
-        let validity = Validity::copy_from_array(&array.clone().into_array())?;
+        let validity = array.validity()?;
 
         if output_len == 0 {
             return Ok(Canonical::empty(array.dtype()));

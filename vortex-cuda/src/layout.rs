@@ -3,7 +3,7 @@
 
 //! A CUDA-optimized flat layout that inlines small constant array buffers into layout metadata.
 
-use std::collections::BTreeSet;
+use std::any::Any;
 use std::ops::BitAnd;
 use std::ops::Range;
 use std::sync::Arc;
@@ -48,6 +48,8 @@ use vortex::layout::LayoutReader;
 use vortex::layout::LayoutReaderRef;
 use vortex::layout::LayoutRef;
 use vortex::layout::LayoutStrategy;
+use vortex::layout::RowSplits;
+use vortex::layout::SplitRange;
 use vortex::layout::VTable;
 use vortex::layout::layouts::SharedArrayFuture;
 use vortex::layout::segments::SegmentId;
@@ -178,6 +180,7 @@ impl VTable for CudaFlat {
         name: Arc<str>,
         segment_source: Arc<dyn SegmentSource>,
         session: &VortexSession,
+        _ctx: &vortex::layout::LayoutReaderContext,
     ) -> VortexResult<LayoutReaderRef> {
         Ok(Arc::new(CudaFlatReader {
             layout: layout.clone(),
@@ -283,10 +286,11 @@ impl LayoutReader for CudaFlatReader {
     fn register_splits(
         &self,
         _field_mask: &[FieldMask],
-        row_range: &Range<u64>,
-        splits: &mut BTreeSet<u64>,
+        split_range: &SplitRange,
+        splits: &mut RowSplits,
     ) -> VortexResult<()> {
-        splits.insert(row_range.start + self.layout.row_count);
+        split_range.check_bounds(self.layout.row_count)?;
+        splits.push(split_range.root_row_range().end);
         Ok(())
     }
 
@@ -381,6 +385,10 @@ impl LayoutReader for CudaFlatReader {
         }
         .boxed())
     }
+
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
 }
 
 /// A [`LayoutStrategy`] that writes a [`CudaFlatLayout`] with constant array buffers inlined
@@ -427,8 +435,8 @@ fn truncate_scalar_stat<F: Fn(Scalar) -> Option<(Scalar, bool)>>(
     stat: Stat,
     truncation: F,
 ) {
-    if let Some(sv) = statistics.get(stat) {
-        if let Some((truncated_value, truncated)) = truncation(sv.into_inner()) {
+    if let Some(sv) = statistics.get(stat).into_inner() {
+        if let Some((truncated_value, truncated)) = truncation(sv) {
             if truncated && let Some(v) = truncated_value.into_value() {
                 statistics.set(stat, Precision::Inexact(v));
             }

@@ -8,12 +8,13 @@ pub trait Matcher {
     type Match<'a>;
 
     /// Check if the given array matches this matcher type
+    #[inline]
     fn matches(array: &ArrayRef) -> bool {
         Self::try_match(array).is_some()
     }
 
     /// Try to match the given array, returning the matched view type if successful.
-    fn try_match<'a>(array: &'a ArrayRef) -> Option<Self::Match<'a>>;
+    fn try_match(array: &ArrayRef) -> Option<Self::Match<'_>>;
 }
 
 /// Matches any array type (wildcard matcher)

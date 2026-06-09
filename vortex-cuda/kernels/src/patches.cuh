@@ -3,6 +3,7 @@
 
 #pragma once
 
+#include "fastlanes_common.cuh"
 #include "patches.h"
 
 /// Load a chunk offset value, dispatching on the runtime type.
@@ -21,8 +22,8 @@ __device__ inline uint32_t load_chunk_offset(const GPUPatches &patches, uint32_t
 }
 
 /// A single patch: a within-chunk index and its replacement value.
-/// A sentinel patch has index == 1024, which can never match a valid
-/// within-chunk position (0–1023).
+/// A sentinel patch has index == FL_CHUNK, which can never match a valid
+/// within-chunk position (0–FL_CHUNK-1).
 template <typename T>
 struct Patch {
     uint16_t index;
@@ -38,7 +39,7 @@ struct Patch {
 ///
 ///     PatchesCursor<uint32_t> cursor(patches, blockIdx.x, thread_idx, 32);
 ///     auto patch = cursor.next();
-///     while (patch.index != 1024) {
+///     while (patch.index != FL_CHUNK) {
 ///         shared_out[patch.index] = patch.value;
 ///         patch = cursor.next();
 ///     }
@@ -55,23 +56,33 @@ public:
             return;
         }
 
-        // mirrors the logic from vortex-array/src/arrays/primitive/array/patch.rs
+        if (chunk >= patches.n_chunks) {
+            indices = nullptr;
+            values = nullptr;
+            remaining = 0;
+            return;
+        }
 
-        // Compute base_offset from the first chunk offset.
-        uint32_t base_offset = load_chunk_offset(patches, 0);
+        const uint32_t indices_base = patches.indices_base == PATCH_DERIVE_INDICES_BASE
+                                          ? load_chunk_offset(patches, 0) + patches.offset_within_chunk
+                                          : patches.indices_base;
 
-        uint32_t patches_start_idx = load_chunk_offset(patches, chunk) - base_offset;
-        patches_start_idx -= min(patches_start_idx, patches.offset_within_chunk);
+        // Convert chunk_offsets entries into offsets within indices/values.
+        // Ordinary sliced patches derive the base from the first chunk offset;
+        // chunk-offset-only sliced views provide it explicitly.
+        uint32_t patches_start_idx = load_chunk_offset(patches, chunk);
+        patches_start_idx = (patches_start_idx > indices_base) ? patches_start_idx - indices_base : 0;
 
         // calculate the ending index.
         uint32_t patches_end_idx;
         if ((chunk + 1) < patches.n_chunks) {
-            patches_end_idx = load_chunk_offset(patches, chunk + 1) - base_offset;
-            // if this is the end of times, we should drop it out here...
-            patches_end_idx -= min(patches_end_idx, patches.offset_within_chunk);
+            patches_end_idx = load_chunk_offset(patches, chunk + 1);
+            patches_end_idx = (patches_end_idx > indices_base) ? patches_end_idx - indices_base : 0;
         } else {
             patches_end_idx = patches.num_patches;
         }
+        patches_end_idx = min(patches_end_idx, patches.num_patches);
+        patches_end_idx = max(patches_end_idx, patches_start_idx);
 
         // calculate how many patches are in the chunk
         uint32_t num_patches = patches_end_idx - patches_start_idx;
@@ -89,15 +100,15 @@ public:
         // The iterator returns indices relative to the start of the chunk.
         // `chunk_base` is the index of the first element within a chunk, accounting
         // for the slice offset.
-        chunk_base = chunk * 1024 + patches.offset;
-        chunk_base -= min(chunk_base, patches.offset % 1024);
+        chunk_base = chunk * FL_CHUNK + patches.offset;
+        chunk_base -= min(chunk_base, patches.offset % FL_CHUNK);
     }
 
     /// Return the current patch (with within-chunk index) and advance,
     /// or a sentinel {1024, 0} if exhausted.
     __device__ Patch<T> next() {
         if (remaining == 0) {
-            return {1024, T {}};
+            return {FL_CHUNK, T {}};
         }
         uint16_t within_chunk = static_cast<uint16_t>(*indices - chunk_base);
         Patch<T> patch = {within_chunk, *values};
@@ -110,6 +121,6 @@ public:
 private:
     const uint32_t *indices;
     const T *values;
-    uint8_t remaining;
+    uint32_t remaining;
     uint32_t chunk_base;
 };

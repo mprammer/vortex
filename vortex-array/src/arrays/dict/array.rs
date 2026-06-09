@@ -4,6 +4,7 @@
 use std::fmt::Display;
 use std::fmt::Formatter;
 
+use smallvec::smallvec;
 use vortex_buffer::BitBuffer;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
@@ -12,6 +13,7 @@ use vortex_error::vortex_ensure;
 use vortex_mask::AllOr;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::LEGACY_SESSION;
 #[expect(deprecated)]
 use crate::ToCanonical as _;
@@ -133,7 +135,7 @@ pub trait DictArrayExt: TypedArrayRef<Dict> + DictArraySlotsExt {
             }
 
             let referenced_mask = self.compute_referenced_values_mask(true)?;
-            let all_referenced = referenced_mask.iter().all(|v| v);
+            let all_referenced = referenced_mask.true_count() == referenced_mask.len();
 
             vortex_ensure!(all_referenced, "value in dict not referenced");
         }
@@ -145,7 +147,7 @@ pub trait DictArrayExt: TypedArrayRef<Dict> + DictArraySlotsExt {
         let codes = self.codes();
         let codes_validity = codes
             .validity()?
-            .to_mask(codes.len(), &mut LEGACY_SESSION.create_execution_ctx())?;
+            .execute_mask(codes.len(), &mut LEGACY_SESSION.create_execution_ctx())?;
         #[expect(deprecated)]
         let codes_primitive = self.codes().to_primitive();
         let values_len = self.values().len();
@@ -189,6 +191,40 @@ pub trait DictArrayExt: TypedArrayRef<Dict> + DictArraySlotsExt {
 }
 impl<T: TypedArrayRef<Dict>> DictArrayExt for T {}
 
+/// Concrete parts of a [`DictArray`](super::DictArray) after iterative execution.
+pub struct DictParts {
+    pub dtype: DType,
+    pub codes: ArrayRef,
+    pub values: ArrayRef,
+}
+
+pub trait DictOwnedExt {
+    fn into_parts(self) -> DictParts;
+}
+
+impl DictOwnedExt for Array<Dict> {
+    fn into_parts(self) -> DictParts {
+        match self.try_into_parts() {
+            Ok(array_parts) => {
+                let slots = DictSlots::from_slots(array_parts.slots);
+                DictParts {
+                    dtype: array_parts.dtype,
+                    codes: slots.codes,
+                    values: slots.values,
+                }
+            }
+            Err(array) => {
+                let slots = DictSlotsView::from_slots(array.slots());
+                DictParts {
+                    dtype: array.dtype().clone(),
+                    codes: slots.codes.clone(),
+                    values: slots.values.clone(),
+                }
+            }
+        }
+    }
+}
+
 impl Array<Dict> {
     /// Build a new `DictArray` from its components, `codes` and `values`.
     pub fn new(codes: ArrayRef, values: ArrayRef) -> Self {
@@ -203,7 +239,8 @@ impl Array<Dict> {
         let len = codes.len();
         let data = DictData::try_new(codes.dtype())?;
         Array::try_from_parts(
-            ArrayParts::new(Dict, dtype, len, data).with_slots(vec![Some(codes), Some(values)]),
+            ArrayParts::new(Dict, dtype, len, data)
+                .with_slots(smallvec![Some(codes), Some(values)]),
         )
     }
 
@@ -220,7 +257,8 @@ impl Array<Dict> {
         let data = unsafe { DictData::new_unchecked() };
         unsafe {
             Array::from_parts_unchecked(
-                ArrayParts::new(Dict, dtype, len, data).with_slots(vec![Some(codes), Some(values)]),
+                ArrayParts::new(Dict, dtype, len, data)
+                    .with_slots(smallvec![Some(codes), Some(values)]),
             )
         }
     }
@@ -233,7 +271,7 @@ impl Array<Dict> {
     pub unsafe fn set_all_values_referenced(self, all_values_referenced: bool) -> Self {
         let dtype = self.dtype().clone();
         let len = self.len();
-        let slots = self.slots().to_vec();
+        let slots: ArraySlots = self.slots().iter().cloned().collect();
         let data = unsafe {
             self.into_data()
                 .set_all_values_referenced(all_values_referenced)
@@ -255,8 +293,6 @@ impl Array<Dict> {
 
 #[cfg(test)]
 mod test {
-    #[expect(unused_imports)]
-    use itertools::Itertools;
     use rand::RngExt;
     use rand::SeedableRng;
     use rand::distr::Distribution;
@@ -302,7 +338,7 @@ mod test {
             .as_ref()
             .validity()
             .unwrap()
-            .to_mask(
+            .execute_mask(
                 dict.as_ref().len(),
                 &mut LEGACY_SESSION.create_execution_ctx(),
             )
@@ -328,7 +364,7 @@ mod test {
             .as_ref()
             .validity()
             .unwrap()
-            .to_mask(
+            .execute_mask(
                 dict.as_ref().len(),
                 &mut LEGACY_SESSION.create_execution_ctx(),
             )
@@ -358,7 +394,7 @@ mod test {
             .as_ref()
             .validity()
             .unwrap()
-            .to_mask(
+            .execute_mask(
                 dict.as_ref().len(),
                 &mut LEGACY_SESSION.create_execution_ctx(),
             )
@@ -384,7 +420,7 @@ mod test {
             .as_ref()
             .validity()
             .unwrap()
-            .to_mask(
+            .execute_mask(
                 dict.as_ref().len(),
                 &mut LEGACY_SESSION.create_execution_ctx(),
             )

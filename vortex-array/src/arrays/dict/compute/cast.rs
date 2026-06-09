@@ -13,19 +13,12 @@ use crate::arrays::dict::DictArraySlotsExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::scalar_fn::fns::cast::CastReduce;
-use crate::validity::Validity;
 
 impl CastReduce for Dict {
     fn cast(array: ArrayView<'_, Dict>, dtype: &DType) -> VortexResult<Option<ArrayRef>> {
         // Can have un-reference null values making the cast of values fail without a possible mask.
         // TODO(joe): optimize this, could look at accessible values and fill_null not those?
-        if !dtype.is_nullable()
-            && array.values().dtype().is_nullable()
-            && !matches!(
-                array.values().validity()?,
-                Validity::NonNullable | Validity::AllValid
-            )
-        {
+        if !dtype.is_nullable() && !array.values().validity()?.no_nulls() {
             return Ok(None);
         }
         // Cast the dictionary values to the target type
@@ -53,12 +46,16 @@ impl CastReduce for Dict {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::LazyLock;
+
     use rstest::rstest;
     use vortex_buffer::buffer;
+    use vortex_session::VortexSession;
 
     use crate::IntoArray;
     #[expect(deprecated)]
     use crate::ToCanonical as _;
+    use crate::VortexSessionExecute;
     use crate::arrays::Dict;
     use crate::arrays::PrimitiveArray;
     use crate::arrays::dict::DictArraySlotsExt;
@@ -69,11 +66,15 @@ mod tests {
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::session::ArraySession;
+
+    static SESSION: LazyLock<VortexSession> =
+        LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
     #[test]
     fn test_cast_dict_to_wider_type() {
         let values = buffer![1i32, 2, 3, 2, 1].into_array();
-        let dict = dict_encode(&values).unwrap();
+        let dict = dict_encode(&values, &mut SESSION.create_execution_ctx()).unwrap();
 
         let casted = dict
             .into_array()
@@ -93,7 +94,7 @@ mod tests {
     fn test_cast_dict_nullable() {
         let values =
             PrimitiveArray::from_option_iter([Some(10i32), None, Some(20), Some(10), None]);
-        let dict = dict_encode(&values.into_array()).unwrap();
+        let dict = dict_encode(&values.into_array(), &mut SESSION.create_execution_ctx()).unwrap();
 
         let casted = dict
             .into_array()
@@ -109,7 +110,7 @@ mod tests {
     fn test_cast_dict_allvalid_to_nonnullable_and_back() {
         // Create an AllValid dict array (no nulls)
         let values = buffer![10i32, 20, 30, 40].into_array();
-        let dict = dict_encode(&values).unwrap();
+        let dict = dict_encode(&values, &mut SESSION.create_execution_ctx()).unwrap();
 
         // Verify initial state - codes should be NonNullable, values should be NonNullable
         assert_eq!(dict.codes().dtype().nullability(), Nullability::NonNullable);
@@ -178,10 +179,10 @@ mod tests {
     }
 
     #[rstest]
-    #[case(dict_encode(&buffer![1i32, 2, 3, 2, 1, 3].into_array()).unwrap().into_array())]
-    #[case(dict_encode(&buffer![100u32, 200, 100, 300, 200].into_array()).unwrap().into_array())]
-    #[case(dict_encode(&PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array()).unwrap().into_array())]
-    #[case(dict_encode(&buffer![1.5f32, 2.5, 1.5, 3.5].into_array()).unwrap().into_array())]
+    #[case(dict_encode(&buffer![1i32, 2, 3, 2, 1, 3].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&buffer![100u32, 200, 100, 300, 200].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&PrimitiveArray::from_option_iter([Some(1i32), None, Some(2), Some(1), None]).into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
+    #[case(dict_encode(&buffer![1.5f32, 2.5, 1.5, 3.5].into_array(), &mut SESSION.create_execution_ctx()).unwrap().into_array())]
     fn test_cast_dict_conformance(#[case] array: crate::ArrayRef) {
         test_cast_conformance(&array);
     }

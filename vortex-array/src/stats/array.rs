@@ -23,7 +23,7 @@ use crate::aggregate_fn::fns::min_max::MinMaxResult;
 use crate::aggregate_fn::fns::min_max::min_max;
 use crate::aggregate_fn::fns::nan_count::nan_count;
 use crate::aggregate_fn::fns::sum::sum;
-use crate::builders::builder_with_capacity;
+use crate::aggregate_fn::fns::uncompressed_size_in_bytes::uncompressed_size_in_bytes;
 use crate::expr::stats::Precision;
 use crate::expr::stats::Stat;
 use crate::expr::stats::StatsProvider;
@@ -104,7 +104,7 @@ impl StatsSetRef<'_> {
         let mut guard = self.array_stats.inner.write();
         for (stat, value) in iter {
             if !value.is_exact() {
-                if !guard.get(*stat).is_some_and(|v| v.is_exact()) {
+                if !guard.get(*stat).is_exact() {
                     guard.set(*stat, value.clone());
                 }
             } else {
@@ -153,9 +153,11 @@ impl StatsSetRef<'_> {
         f(&mut lock.iter())
     }
 
+    /// Returns the value of `stat` by either fetching it from cache if it exists and is [`Precision::Exact`], or falling back to
+    /// computation. The underlying compute kernels will cache the computed stat in the latter case.
     pub fn compute_stat(&self, stat: Stat, ctx: &mut ExecutionCtx) -> VortexResult<Option<Scalar>> {
         // If it's already computed and exact, we can return it.
-        if let Some(Precision::Exact(s)) = self.get(stat) {
+        if let Precision::Exact(s) = self.get(stat) {
             return Ok(Some(s));
         }
 
@@ -182,16 +184,12 @@ impl StatsSetRef<'_> {
             }
             Stat::IsSorted => Some(is_sorted(self.dyn_array_ref, ctx)?.into()),
             Stat::IsStrictSorted => Some(is_strict_sorted(self.dyn_array_ref, ctx)?.into()),
-            Stat::UncompressedSizeInBytes => {
-                let mut builder =
-                    builder_with_capacity(self.dyn_array_ref.dtype(), self.dyn_array_ref.len());
-                unsafe {
-                    builder.extend_from_array_unchecked(self.dyn_array_ref);
-                }
-                let nbytes = builder.finish().nbytes();
-                self.set(stat, Precision::exact(nbytes));
-                Some(nbytes.into())
-            }
+            Stat::UncompressedSizeInBytes => Stat::UncompressedSizeInBytes
+                .dtype(self.dyn_array_ref.dtype())
+                .is_some()
+                .then(|| uncompressed_size_in_bytes(self.dyn_array_ref, ctx))
+                .transpose()?
+                .map(|s| s.into()),
             Stat::NaNCount => {
                 Stat::NaNCount
                     .dtype(self.dyn_array_ref.dtype())
@@ -285,7 +283,7 @@ impl StatsSetRef<'_> {
 }
 
 impl StatsProvider for StatsSetRef<'_> {
-    fn get(&self, stat: Stat) -> Option<Precision<Scalar>> {
+    fn get(&self, stat: Stat) -> Precision<Scalar> {
         self.array_stats
             .inner
             .read()

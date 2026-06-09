@@ -16,6 +16,31 @@ use crate::Format;
 use crate::measurements::CompressionTimingMeasurement;
 use crate::measurements::CustomUnitMeasurement;
 
+/// Number of top-level columns in the wide-table decompression projection benchmark.
+pub const READ_PROJECTION_ROOT_COLUMNS: usize = 100_000;
+
+/// Number of top-level columns read by the wide-table decompression projection benchmark.
+pub const READ_PROJECTION_COLUMNS: usize = 10_000;
+
+/// Fixed read projection for the wide-table decompression projection benchmark.
+pub static READ_PROJECTION: [usize; READ_PROJECTION_COLUMNS] = make_read_projection();
+
+const fn make_read_projection() -> [usize; READ_PROJECTION_COLUMNS] {
+    let stride = READ_PROJECTION_ROOT_COLUMNS / READ_PROJECTION_COLUMNS;
+    let mut projection = [0; READ_PROJECTION_COLUMNS];
+    let mut idx = 0;
+    while idx < READ_PROJECTION_COLUMNS {
+        projection[idx] = idx * stride;
+        idx += 1;
+    }
+    projection
+}
+
+/// Read projection for a file with `root_columns` top-level columns, if this benchmark projects it.
+pub fn read_projection(root_columns: usize) -> Option<&'static [usize]> {
+    (root_columns == READ_PROJECTION_ROOT_COLUMNS).then_some(&READ_PROJECTION)
+}
+
 #[derive(Default)]
 pub struct CompressMeasurements {
     pub timings: Vec<CompressionTimingMeasurement>,
@@ -64,6 +89,8 @@ pub struct CompressResult {
     pub time: Duration,
     pub compressed_size: u64,
     pub timing: CompressionTimingMeasurement,
+    /// Per-iteration encode wall times. Captured for v3 emission.
+    pub all_runs: Vec<Duration>,
     pub ratios: Vec<CustomUnitMeasurement>,
 }
 
@@ -71,6 +98,8 @@ pub struct CompressResult {
 pub struct DecompressResult {
     pub time: Duration,
     pub timing: CompressionTimingMeasurement,
+    /// Per-iteration decode wall times. Captured for v3 emission.
+    pub all_runs: Vec<Duration>,
 }
 
 /// Trait for format-specific compression/decompression operations.
@@ -96,6 +125,9 @@ pub trait Compressor: Send + Sync {
     ///
     /// This method first compresses the data to the target format, then decompresses it.
     /// The timing returned should only measure the decompression phase.
+    ///
+    /// Format implementations apply the fixed wide-table read projection when the input schema
+    /// matches the projection benchmark.
     async fn decompress(&self, parquet_path: &Path) -> Result<Duration>;
 }
 
@@ -111,12 +143,14 @@ pub async fn benchmark_compress(
     let format = compressor.format();
     let mut fastest = Duration::MAX;
     let mut compressed_size = 0u64;
+    let mut all_runs = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
         let (size, elapsed) = compressor.compress(parquet_path).await?;
 
         compressed_size = size;
         fastest = fastest.min(elapsed);
+        all_runs.push(elapsed);
     }
 
     let ratios = vec![CustomUnitMeasurement {
@@ -136,6 +170,7 @@ pub async fn benchmark_compress(
         time: fastest,
         compressed_size,
         timing,
+        all_runs,
         ratios,
     })
 }
@@ -151,11 +186,13 @@ pub async fn benchmark_decompress(
 ) -> Result<DecompressResult> {
     let format = compressor.format();
     let mut fastest = Duration::MAX;
+    let mut all_runs = Vec::with_capacity(iterations);
 
     for _ in 0..iterations {
         let elapsed = compressor.decompress(parquet_path).await?;
 
         fastest = fastest.min(elapsed);
+        all_runs.push(elapsed);
     }
 
     let timing = CompressionTimingMeasurement {
@@ -167,6 +204,7 @@ pub async fn benchmark_decompress(
     Ok(DecompressResult {
         time: fastest,
         timing,
+        all_runs,
     })
 }
 

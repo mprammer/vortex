@@ -10,6 +10,7 @@ use num_traits::NumCast;
 use vortex_buffer::BitBuffer;
 use vortex_buffer::BufferMut;
 use vortex_error::VortexError;
+use vortex_error::VortexExpect as _;
 use vortex_error::VortexResult;
 use vortex_error::vortex_bail;
 use vortex_error::vortex_ensure;
@@ -19,6 +20,7 @@ use vortex_mask::Mask;
 use vortex_utils::aliases::hash_map::HashMap;
 
 use crate::ArrayRef;
+use crate::ArraySlots;
 use crate::ExecutionCtx;
 use crate::IntoArray;
 use crate::LEGACY_SESSION;
@@ -26,6 +28,7 @@ use crate::LEGACY_SESSION;
 use crate::ToCanonical as _;
 use crate::VortexSessionExecute;
 use crate::arrays::PrimitiveArray;
+use crate::arrays::primitive::PrimitiveArrayExt;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::IntegerPType;
@@ -122,6 +125,93 @@ impl PatchesMetadata {
     }
 }
 
+/// Metadata stored in an array's data struct for reconstructing [`Patches`] from slots.
+///
+/// The actual patch arrays (indices, values, chunk_offsets) live in the array's
+/// slots. This struct stores only the scalar metadata needed to reassemble them.
+#[derive(Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PatchesData {
+    offset: usize,
+    offset_within_chunk: Option<usize>,
+}
+
+/// Slot indices for the three patch components within a slot array.
+#[derive(Copy, Clone, Debug)]
+pub struct PatchSlotIndices {
+    pub indices: usize,
+    pub values: usize,
+    pub chunk_offsets: usize,
+}
+
+impl PatchesData {
+    /// Extract patch metadata from an existing [`Patches`].
+    pub fn from_patches(patches: &Patches) -> Self {
+        Self {
+            offset: patches.offset(),
+            offset_within_chunk: patches.offset_within_chunk(),
+        }
+    }
+
+    /// Reconstruct patches from the given slot positions.
+    ///
+    /// Returns `None` if `patches_data` is `None`.
+    /// Panics if `patches_data` is `Some` but the indices or values slots are missing.
+    pub fn patches_from_slots(
+        patches_data: Option<&Self>,
+        len: usize,
+        slots: &[Option<ArrayRef>],
+        slot_idx: PatchSlotIndices,
+    ) -> Option<Patches> {
+        let data = patches_data?;
+        let indices = slots[slot_idx.indices]
+            .as_ref()
+            .vortex_expect("patches_data is set but patch_indices slot is missing");
+        let values = slots[slot_idx.values]
+            .as_ref()
+            .vortex_expect("patches_data is set but patch_values slot is missing");
+        Some(unsafe {
+            Patches::new_unchecked(
+                len,
+                data.offset,
+                indices.clone(),
+                values.clone(),
+                slots[slot_idx.chunk_offsets].clone(),
+                data.offset_within_chunk,
+            )
+        })
+    }
+
+    /// Push 3 patch slots (indices, values, chunk_offsets) onto a slot vector.
+    ///
+    /// If `patches` is `None`, pushes three `None` entries.
+    pub fn push_slots(slots: &mut ArraySlots, patches: Option<&Patches>) {
+        match patches {
+            Some(p) => {
+                slots.push(Some(p.indices().clone()));
+                slots.push(Some(p.values().clone()));
+                slots.push(p.chunk_offsets().clone());
+            }
+            None => {
+                slots.push(None);
+                slots.push(None);
+                slots.push(None);
+            }
+        }
+    }
+
+    /// Returns the patch offset.
+    #[inline]
+    pub fn offset(&self) -> usize {
+        self.offset
+    }
+
+    /// Returns the offset within the first chunk, if chunk offsets are present.
+    #[inline]
+    pub fn offset_within_chunk(&self) -> Option<usize> {
+        self.offset_within_chunk
+    }
+}
+
 /// A helper for working with patched arrays.
 #[derive(Debug, Clone)]
 pub struct Patches {
@@ -188,10 +278,10 @@ impl Patches {
             #[cfg(debug_assertions)]
             {
                 use crate::VortexSessionExecute;
+                use crate::aggregate_fn::fns::is_sorted::is_sorted;
                 let mut ctx = LEGACY_SESSION.create_execution_ctx();
                 assert!(
-                    crate::aggregate_fn::fns::is_sorted::is_sorted(&indices, &mut ctx)
-                        .unwrap_or(false),
+                    is_sorted(&indices, &mut ctx).unwrap_or(false),
                     "Patch indices must be sorted"
                 );
             }
@@ -757,6 +847,10 @@ impl Patches {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<Option<Self>> {
         let take_indices_validity = take_indices.validity()?;
+        // Take indices are non-negative; reinterpret to unsigned so the `TakeT` dimension
+        // dispatches over 4 widths instead of 8.
+        let take_indices_unsigned =
+            take_indices.reinterpret_cast(take_indices.ptype().to_unsigned());
         let patch_indices = self.indices.clone().execute::<PrimitiveArray>(ctx)?;
         let chunk_offsets = self
             .chunk_offsets()
@@ -767,8 +861,8 @@ impl Patches {
         let (values_indices, new_indices): (BufferMut<u64>, BufferMut<u64>) =
             match_each_unsigned_integer_ptype!(patch_indices.ptype(), |PatchT| {
                 let patch_indices_slice = patch_indices.as_slice::<PatchT>();
-                match_each_integer_ptype!(take_indices.ptype(), |TakeT| {
-                    let take_slice = take_indices.as_slice::<TakeT>();
+                match_each_unsigned_integer_ptype!(take_indices_unsigned.ptype(), |TakeT| {
+                    let take_slice = take_indices_unsigned.as_slice::<TakeT>();
 
                     if let Some(chunk_offsets) = chunk_offsets {
                         match_each_unsigned_integer_ptype!(chunk_offsets.ptype(), |OffsetT| {
@@ -779,7 +873,7 @@ impl Patches {
                                 take_indices
                                     .as_ref()
                                     .validity()?
-                                    .to_mask(take_indices.as_ref().len(), ctx)?,
+                                    .execute_mask(take_indices.as_ref().len(), ctx)?,
                                 include_nulls,
                                 |take_idx| {
                                     self.search_index_chunked_batch(
@@ -797,7 +891,7 @@ impl Patches {
                             take_indices
                                 .as_ref()
                                 .validity()?
-                                .to_mask(take_indices.as_ref().len(), ctx)?,
+                                .execute_mask(take_indices.as_ref().len(), ctx)?,
                             include_nulls,
                             |take_idx| {
                                 let Some(offset) = <PatchT as NumCast>::from(self.offset) else {
@@ -841,18 +935,21 @@ impl Patches {
     ) -> VortexResult<Option<Self>> {
         let indices = self.indices.clone().execute::<PrimitiveArray>(ctx)?;
         let new_length = take_indices.len();
+        // Take indices are non-negative; reinterpret to unsigned (4 widths instead of 8).
+        let take_indices_unsigned =
+            take_indices.reinterpret_cast(take_indices.ptype().to_unsigned());
 
         let min_index = self.min_index()?;
         let max_index = self.max_index()?;
 
         let Some((new_sparse_indices, value_indices)) =
             match_each_unsigned_integer_ptype!(indices.ptype(), |Indices| {
-                match_each_integer_ptype!(take_indices.ptype(), |TakeIndices| {
+                match_each_unsigned_integer_ptype!(take_indices_unsigned.ptype(), |TakeIndices| {
                     let take_validity = take_indices
                         .validity()?
                         .execute_mask(take_indices.len(), ctx)?;
                     let take_nullability = take_indices.validity()?.nullability();
-                    let take_slice = take_indices.as_slice::<TakeIndices>();
+                    let take_slice = take_indices_unsigned.as_slice::<TakeIndices>();
                     take_map::<_, TakeIndices>(
                         indices.as_slice::<Indices>(),
                         take_slice,
@@ -1183,7 +1280,7 @@ mod test {
                 .as_ref()
                 .validity()
                 .unwrap()
-                .to_mask(
+                .execute_mask(
                     primitive_values.as_ref().len(),
                     &mut LEGACY_SESSION.create_execution_ctx()
                 )
@@ -1226,7 +1323,7 @@ mod test {
                 .as_ref()
                 .validity()
                 .unwrap()
-                .to_mask(
+                .execute_mask(
                     primitive_values.as_ref().len(),
                     &mut LEGACY_SESSION.create_execution_ctx()
                 )
@@ -1541,7 +1638,7 @@ mod test {
         .unwrap();
 
         // Keep all indices (mask with indices 0-9)
-        let mask = Mask::from_indices(10, (0..10).collect());
+        let mask = Mask::from_indices(10, 0..10);
         let filtered = patches
             .filter(&mask, &mut LEGACY_SESSION.create_execution_ctx())
             .unwrap()
