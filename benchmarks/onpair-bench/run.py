@@ -76,18 +76,32 @@ def build_binary(release: bool, cuda: bool) -> Path:
 
 def download(url: str, dest: Path) -> None:
     """Stream `url` to `dest` (atomically via a .part file). Uses curl/wget if
-    available, else urllib — so it works without extra deps."""
+    available, else urllib — so it works without extra deps. For huggingface.co
+    URLs, an HF_TOKEN in the environment is sent as a Bearer header (scoped to HF
+    hosts only) for faster, rate-limit-free downloads of the gated/large datasets."""
+    import os
     import shutil
     dest.parent.mkdir(parents=True, exist_ok=True)
     tmp = dest.with_suffix(dest.suffix + ".part")
     print(f"==> downloading {url}\n        -> {dest}", file=sys.stderr)
+    hf_tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    auth = hf_tok if (hf_tok and "huggingface.co" in url) else None
     if shutil.which("curl"):
-        subprocess.run(["curl", "-L", "--fail", "-o", str(tmp), url], check=True)
+        cmd = ["curl", "-L", "--fail", "-o", str(tmp)]
+        if auth:
+            cmd += ["-H", f"Authorization: Bearer {auth}"]
+        subprocess.run(cmd + [url], check=True)
     elif shutil.which("wget"):
-        subprocess.run(["wget", "-O", str(tmp), url], check=True)
+        cmd = ["wget", "-O", str(tmp)]
+        if auth:
+            cmd += ["--header", f"Authorization: Bearer {auth}"]
+        subprocess.run(cmd + [url], check=True)
     else:
         import urllib.request
-        with urllib.request.urlopen(url) as r, open(tmp, "wb") as f:
+        req = urllib.request.Request(url)
+        if auth:
+            req.add_header("Authorization", f"Bearer {auth}")
+        with urllib.request.urlopen(req) as r, open(tmp, "wb") as f:
             shutil.copyfileobj(r, f)
     tmp.rename(dest)
 
