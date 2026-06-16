@@ -1,0 +1,36 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+[package]
+name = "ffi-boundary-bench"
+description = "Rust<->host-runtime Arrow boundary microbenchmark for Vortex (proposal experiment E4)"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+arrow-array = { workspace = true }
+arrow-schema = { workspace = true }
+bytes = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+futures = { workspace = true }
+parquet = { workspace = true, features = ["zstd"] }
+tokio = { workspace = true, features = ["full"] }
+vortex = { workspace = true, features = ["files", "tokio"] }
+vortex-bench = { workspace = true }
+
+[features]
+unstable_encodings = ["vortex-bench/unstable_encodings"]
+
+[lints]
+workspace = true

@@ -1,0 +1,30 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright the Vortex contributors
+
+[package]
+name = "iceberg-bench"
+description = "Apache Iceberg benchmark lane for Vortex (scaffold)"
+authors.workspace = true
+categories.workspace = true
+edition.workspace = true
+homepage.workspace = true
+include.workspace = true
+keywords.workspace = true
+license.workspace = true
+readme.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true, features = ["derive"] }
+
+# NOTE: the Iceberg integration deps (`iceberg`, `iceberg-datafusion`) are intentionally NOT added
+# yet. `iceberg-datafusion` 0.9.1 requires DataFusion 52, but this workspace is on DataFusion 53;
+# pulling them in now would put two DataFusion versions in the build graph. See README.md for the
+# integration plan and the version gate.
+
+[lints]
+workspace = true

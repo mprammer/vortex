@@ -96,6 +96,7 @@ def backends_for_engines(engines: list[Engine]) -> list[Engine]:
         Engine.DATAFUSION: Format.PARQUET,
         Engine.DUCKDB: Format.PARQUET,
         Engine.LANCE: Format.LANCE,
+        Engine.ICEBERG: Format.PARQUET,
     }
     return list(
         group_targets_by_backend(BenchmarkTarget(engine=engine, format=seed_formats[engine]) for engine in engines)

@@ -19,6 +19,7 @@ testcontainers-jupiter = "1.21.4"
 
 [libraries]
 arrow-c-data = { module = "org.apache.arrow:arrow-c-data", version.ref = "arrow" }
+arrow-dataset = { module = "org.apache.arrow:arrow-dataset", version.ref = "arrow" }
 arrow-memory-core = { module = "org.apache.arrow:arrow-memory-core", version.ref = "arrow" }
 arrow-memory-netty = { module = "org.apache.arrow:arrow-memory-netty", version.ref = "arrow" }
 errorprone-annotations = { module = "com.google.errorprone:error_prone_annotations", version.ref = "errorprone" }

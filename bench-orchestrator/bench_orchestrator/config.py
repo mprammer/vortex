@@ -17,6 +17,7 @@ class Engine(Enum):
     DUCKDB = "duckdb"
     DATAFUSION = "datafusion"
     LANCE = "lance"
+    ICEBERG = "iceberg"
 
     @property
     def binary_name(self) -> str:
@@ -25,6 +26,7 @@ class Engine(Enum):
             Engine.DUCKDB: "duckdb-bench",
             Engine.DATAFUSION: "datafusion-bench",
             Engine.LANCE: "lance-bench",
+            Engine.ICEBERG: "iceberg-bench",
         }[self]
 
 
@@ -69,6 +71,8 @@ ENGINE_FORMATS: dict[Engine, list[Format]] = {
         Format.DUCKDB,
     ],
     Engine.LANCE: [Format.LANCE],
+    # Scaffold: the Iceberg lane is wired but not yet runnable (see benchmarks/iceberg-bench).
+    Engine.ICEBERG: [Format.PARQUET, Format.VORTEX, Format.VORTEX_COMPACT],
 }
 
 T = TypeVar("T")
@@ -108,6 +112,8 @@ class BenchmarkTarget:
             return Engine.DATAFUSION
         if target.engine == Engine.DUCKDB:
             return Engine.DUCKDB
+        if target.engine == Engine.ICEBERG:
+            return Engine.ICEBERG
         raise ValueError(f"Unsupported benchmark target: {target}")
 
     def is_supported(self) -> bool:

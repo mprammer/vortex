@@ -40,6 +40,9 @@ testing {
             useJUnitJupiter()
             dependencies {
                 implementation(libs.junit.jupiter.params)
+                // For the JVM-Parquet boundary baseline (ParquetBoundaryBench): reads Parquet via
+                // Arrow C++ -> C Data Interface -> JVM, mirroring vortex-jni's native->JVM path.
+                implementation(libs.arrow.dataset)
             }
         }
     }
@@ -126,10 +129,17 @@ tasks.register("makeTestFiles") {
         val execOps = serviceOf<ExecOperations>()
 
         // Build the JNI lib for the host architecture only.
+        // Set VORTEX_JNI_RELEASE=true for an optimized lib (e.g. for benchmarking).
+        val releaseLib = System.getenv("VORTEX_JNI_RELEASE") == "true"
+        val cargoProfileDir = if (releaseLib) "release" else "debug"
         execOps.exec {
             workingDir = rootProject.projectDir.absoluteFile.parentFile
             executable = "cargo"
-            args("build", "--package", "vortex-jni")
+            if (releaseLib) {
+                args("build", "--release", "--package", "vortex-jni")
+            } else {
+                args("build", "--package", "vortex-jni")
+            }
         }
 
         val osName = System.getProperty("os.name").lowercase()
@@ -152,7 +162,7 @@ tasks.register("makeTestFiles") {
         // Only populate the host-arch directory so cross-compiled libs for other
         // architectures (placed by the publish workflow) are preserved.
         copy {
-            from("${rootProject.projectDir.absoluteFile.parentFile}/target/debug/libvortex_jni$libExt")
+            from("${rootProject.projectDir.absoluteFile.parentFile}/target/$cargoProfileDir/libvortex_jni$libExt")
             into("$projectDir/src/main/resources/native/$osShortName-$osArch")
         }
     }
