@@ -163,10 +163,17 @@ COLUMNS: list[Column] = [
                    url=WIKIPEDIA_URL, cache="wikipedia_20231101_en_000.parquet"),
     # FSST paper's dbtext corpus: 23 raw text columns under cwida/fsst.
     *_dbtext_cols(_DBTEXT_COLS),
-    # OnPair paper's book-reviews corpus (single `text` column). No public URL —
-    # reused from a local copy if present, otherwise skipped.
+    # OnPair paper's book-reviews corpus (single `text` column). Reproduced on-box
+    # from Amazon-Reviews-2023 "Books" (McAuley Lab); see the harness fetch block.
     Column(dataset_id="book-reviews", column="text", kind="parquet",
            cache="book_reviews.parquet", local=_LOCAL["book-reviews"]),
+    # Two further Amazon-Reviews-2023 categories with contrasting token profiles:
+    # Movies_and_TV (long narrative review prose) and Electronics (short product
+    # text/jargon). Same on-box materialization as book-reviews (review `text`).
+    Column(dataset_id="amazon-movies", column="text", kind="parquet",
+           cache="amazon_movies.parquet"),
+    Column(dataset_id="amazon-electronics", column="text", kind="parquet",
+           cache="amazon_electronics.parquet"),
     # Synthetic ClickBench-style URL corpus (deterministic, seed 123) — the
     # micro-benchmark workload, regenerated in-pipeline via `gen-synth-urls`
     # (no external source). Column name `url` matches the paper's synthetic row.
