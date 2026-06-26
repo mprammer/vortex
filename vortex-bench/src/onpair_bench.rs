@@ -266,12 +266,17 @@ pub struct NvcompZstdGpuResult {
     pub frames: usize,
     /// `raw_bytes / compressed_bytes`.
     pub compression_ratio: f64,
-    /// Average CUDA event time for one batched nvCOMP hardware decompress pass.
+    /// Min CUDA-event time over the timed iterations, in ms (matches FastPair's and the
+    /// DE's reduction; derived from `decode_ms_iters`).
     pub decode_ms: f64,
-    /// Raw string bytes per second.
+    /// Raw string bytes per second, derived from `decode_ms`.
     pub decode_gib_s: f64,
     /// Compressed input bytes per second.
     pub compressed_gib_s: f64,
+    /// Every timed iteration's decompress-pass time, in ms (raw samples; reduction and
+    /// unit chosen at figure-generation, mirroring FastPair's `decode_ns_iters`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_ms_iters: Vec<f64>,
 }
 
 /// CUDA kernel-only OnPair decompression results loaded from existing Vortex files.
@@ -296,10 +301,17 @@ pub struct GpuVortexDecodeResult {
 pub struct GpuKernelResult {
     /// CUDA function name.
     pub kernel: String,
-    /// Average CUDA event time for decoding all chunks once.
+    /// Min full-pass time over the timed iterations, in ms (derived from
+    /// `decode_ns_iters`; the convenience scalar used for best-kernel selection).
     pub decode_ms: f64,
-    /// Raw decoded bytes per second.
+    /// Raw decoded bytes per second, derived from `decode_ms`.
     pub decode_gib_s: f64,
+    /// Every timed iteration's full-pass CUDA-event duration, as raw integer
+    /// nanoseconds (the exact value the timer accumulated, summed over chunks). All
+    /// reduction (min/median/mean), the ns->ms->throughput math, and the reported unit
+    /// are done at figure-generation; this integer field is the provenance.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_ns_iters: Vec<u64>,
     /// Whether this kernel was applicable to all chunks.
     pub applicable: bool,
     /// Whether this kernel's GPU bytes matched CPU bytes, if validation was requested.
@@ -1318,6 +1330,7 @@ async fn run_gpu_kernel_bench(
                 kernel: variant.name.to_string(),
                 decode_ms: 0.0,
                 decode_gib_s: 0.0,
+                decode_ns_iters: Vec::new(),
                 applicable: false,
                 verified: None,
                 reason: Some(reason),
@@ -1326,7 +1339,11 @@ async fn run_gpu_kernel_bench(
             continue;
         }
 
-        let decode_ms = time_kernel_variant(*variant, &chunks, iterations)?;
+        let decode_ns_iters = time_kernel_variant(*variant, &chunks, iterations)?;
+        // Convenience scalar = the fastest pass (min ns -> ms). All other reductions
+        // are recoverable from `decode_ns_iters` at figure-generation.
+        let min_ns = decode_ns_iters.iter().copied().min().unwrap_or(0);
+        let decode_ms = min_ns as f64 / 1_000_000.0;
         let validation_error = if config.validate {
             validate_kernel_variant(*variant, &chunks).await.err()
         } else {
@@ -1337,6 +1354,7 @@ async fn run_gpu_kernel_bench(
             kernel: variant.name.to_string(),
             decode_ms,
             decode_gib_s: gib_s(decoded_bytes, decode_ms),
+            decode_ns_iters,
             applicable: true,
             verified,
             reason: None,
@@ -1386,6 +1404,7 @@ async fn run_gpu_kernel_bench(
             decode_ms: 0.0,
             decode_gib_s: 0.0,
             compressed_gib_s: 0.0,
+            decode_ms_iters: Vec::new(),
         });
         let mut z = Vec::with_capacity(NVCOMP_ZSTD_LEVELS.len());
         for &level in NVCOMP_ZSTD_LEVELS {
@@ -1411,6 +1430,7 @@ async fn run_gpu_kernel_bench(
                     decode_ms: 0.0,
                     decode_gib_s: 0.0,
                     compressed_gib_s: 0.0,
+                    decode_ms_iters: Vec::new(),
                 }),
             );
         }
@@ -1872,14 +1892,19 @@ async fn run_nvcomp_zstd_bench(
         execute_nvcomp_zstd(exec, &mut ctx, opts, backend)?;
     }
 
-    let mut total_ms = 0.0;
+    // Per-iteration decode times (prep/H2D is outside `execute_nvcomp_zstd`), reduced to
+    // MIN to match FastPair and the DE; raw samples retained for figure-gen.
+    let mut decode_ms_iters = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
         let exec = prepare_zstd_exec(&zstd_array, &mut ctx, opts, backend).await?;
-        total_ms += execute_nvcomp_zstd(exec, &mut ctx, opts, backend)?;
+        decode_ms_iters.push(execute_nvcomp_zstd(exec, &mut ctx, opts, backend)?);
     }
     ctx.synchronize_stream()?;
 
-    let decode_ms = total_ms / iterations as f64;
+    let decode_ms = decode_ms_iters
+        .iter()
+        .copied()
+        .fold(f64::INFINITY, f64::min);
     Ok(NvcompZstdGpuResult {
         supported: true,
         error: None,
@@ -1894,6 +1919,7 @@ async fn run_nvcomp_zstd_bench(
         decode_ms,
         decode_gib_s: gib_s(raw_bytes, decode_ms),
         compressed_gib_s: gib_s(compressed_bytes, decode_ms),
+        decode_ms_iters,
     })
 }
 
@@ -2268,7 +2294,7 @@ fn time_kernel_variant(
     variant: KernelVariant,
     chunks: &[GpuOnPairChunk],
     iterations: u64,
-) -> Result<f64> {
+) -> Result<Vec<u64>> {
     let timed = TimedLaunchStrategy::default();
     let timer = timed.timer();
     let mut ctx = create_cuda_execution_ctx()?.with_launch_strategy(Arc::new(timed));
@@ -2299,15 +2325,22 @@ fn time_kernel_variant(
             launch_variant(&mut ctx, &function, variant, chunk)?;
         }
     }
-    timer.store(0, Ordering::Relaxed);
+    // Time each iteration in isolation (its launches' CUDA-event durations accumulate
+    // into `timer`, reset per iteration) and return the full per-iteration sample set as
+    // raw integer nanoseconds — exactly what the timer holds, with no float conversion.
+    // The reduction (min/median/mean), ns->throughput math, and unit are chosen
+    // downstream at figure-generation, so the stored data stays raw and reproducible.
+    let mut samples = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
+        timer.store(0, Ordering::Relaxed);
         for chunk in chunks {
             launch_variant(&mut ctx, &function, variant, chunk)?;
         }
+        ctx.synchronize_stream()?;
+        samples.push(timer.load(Ordering::Relaxed));
     }
-    ctx.synchronize_stream()?;
 
-    Ok(timer.load(Ordering::Relaxed) as f64 / 1_000_000.0 / iterations as f64)
+    Ok(samples)
 }
 
 #[cfg(feature = "cuda")]

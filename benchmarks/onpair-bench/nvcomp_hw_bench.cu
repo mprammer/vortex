@@ -90,11 +90,16 @@ void run(const char* name, std::vector<unsigned char>& host, CompOpts copts, Dec
     std::vector<unsigned char> back(N); CK(cudaMemcpy(back.data(),d_out,N,cudaMemcpyDeviceToHost));
     bool ok = memcmp(back.data(),host.data(),N)==0;
 
+    // MIN single-pass time over the iterations (matches FastPair's reduction): each
+    // decode is timed in isolation and we keep the fastest, not the mean.
     cudaEvent_t a,b; CK(cudaEventCreate(&a)); CK(cudaEventCreate(&b));
-    int iters=100; CK(cudaEventRecord(a,stream));
-    for(int i=0;i<iters;i++){ NK(decompAsync(d_cptr,d_csz,d_obufsz,d_actual,num,d_dtemp,dtemp,d_optr,dopts,d_st,stream)); }
-    CK(cudaEventRecord(b,stream)); CK(cudaEventSynchronize(b));
-    float ms=0; CK(cudaEventElapsedTime(&ms,a,b)); ms/=iters;
+    int iters=100; float ms=1e30f;
+    for(int i=0;i<iters;i++){
+        CK(cudaEventRecord(a,stream));
+        NK(decompAsync(d_cptr,d_csz,d_obufsz,d_actual,num,d_dtemp,dtemp,d_optr,dopts,d_st,stream));
+        CK(cudaEventRecord(b,stream)); CK(cudaEventSynchronize(b));
+        float it=0; CK(cudaEventElapsedTime(&it,a,b)); if(it<ms) ms=it;
+    }
     double gibs = (double)N/(ms/1e3)/ (1024.0*1024*1024);
     double gbs  = (double)N/(ms/1e3)/ 1e9;
     printf("%-13s ratio=%.2fx  compress=%6.1f GiB/s  decode=%6.1f GiB/s (%.0f GB/s)  valid=%s\n",
