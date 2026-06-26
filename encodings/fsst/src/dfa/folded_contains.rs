@@ -163,6 +163,47 @@ fn teddy_trace_enabled() -> bool {
         .unwrap_or(false)
 }
 
+/// O(1)-common-case test of whether a Teddy candidate `cand` lands on an FSST
+/// **code boundary** (the start of a code). Escapes occupy 2 bytes
+/// (`[ESCAPE, literal]`), so the streaming prefilter can flag a candidate that
+/// lands on the literal byte — a non-boundary. `verify_from_candidate` reads
+/// `all_bytes[cand]` as a code, so a literal misread as a code can phantom-accept
+/// (observed as `%ure%` overcounting the ClickBench URL column by 580). Dropping
+/// non-boundary candidates fixes it without losing recall — a real match's first
+/// code always sits on a boundary.
+///
+/// Identity that makes this O(1): `cand` is a boundary **unless** `all_bytes[cand-1]`
+/// is an `ESCAPE_CODE`. If the prior byte isn't an escape code, `cand-1` ends some
+/// code (a symbol code, or an escape's literal), so `cand` starts a fresh one.
+/// Only when `all_bytes[cand-1] == ESCAPE_CODE` is it ambiguous (an escape code →
+/// `cand` is its literal, non-boundary; or a literal-`255` → `cand` is a boundary):
+/// we then find `cand`'s row (via `offsets`) and walk back over the consecutive
+/// escape-byte run to the boundary `p`, where `cand` is a boundary iff `cand - p`
+/// is even. Escapes are rare, so the rare branch almost never fires and the run is
+/// tiny — no full pass, no allocation.
+#[inline]
+fn candidate_is_code_boundary<T: vortex_array::dtype::IntegerPType>(
+    all_bytes: &[u8],
+    offsets: &[T],
+    cand: usize,
+) -> bool {
+    if cand == 0 || all_bytes[cand - 1] != ESCAPE_CODE {
+        return true;
+    }
+    // Rare: prior byte is an escape byte. Bound the walk-back to cand's row start
+    // (escapes don't cross rows; a row never begins mid-code).
+    let idx = offsets.partition_point(|o| (*o).as_() <= cand);
+    let row_start: usize = offsets[idx - 1].as_();
+    if cand == row_start {
+        return true;
+    }
+    let mut p = cand - 1;
+    while p > row_start && all_bytes[p - 1] == ESCAPE_CODE {
+        p -= 1;
+    }
+    (cand - p) % 2 == 0
+}
+
 /// Emit a planner-level trace under `VORTEX_FSST_PLAN_TRACE=1`: chosen
 /// plan, inputs, estimated cost. Used to validate that the planner picks
 /// the same path as the legacy cascade on every bench needle.
@@ -835,7 +876,7 @@ impl FoldedContainsDfa {
             triples,
             ssa_codes,
             negated,
-            |cand, end| self.verify_from_candidate(all_bytes, cand, end).0,
+            |cand, end| candidate_is_code_boundary(all_bytes, offsets, cand) && self.verify_from_candidate(all_bytes, cand, end).0,
         );
         let pair_fallback_buckets = self.bucketed_pair_fallback_codes.as_ref();
         let result = if let Some(pairs) = pair_fallback_buckets {
@@ -848,7 +889,7 @@ impl FoldedContainsDfa {
                 pairs,
                 None,
                 negated,
-                |cand, end| self.verify_from_candidate(all_bytes, cand, end).0,
+                |cand, end| candidate_is_code_boundary(all_bytes, offsets, cand) && self.verify_from_candidate(all_bytes, cand, end).0,
             );
             if negated {
                 &triple & &pair
@@ -907,7 +948,7 @@ impl FoldedContainsDfa {
             all_bytes,
             c2_codes,
             negated,
-            |cand, end| self.verify_from_candidate(all_bytes, cand, end).0,
+            |cand, end| candidate_is_code_boundary(all_bytes, offsets, cand) && self.verify_from_candidate(all_bytes, cand, end).0,
         );
         if trace {
             let total_us = t
@@ -950,7 +991,7 @@ impl FoldedContainsDfa {
             buckets,
             ssa_codes,
             negated,
-            |cand, end| self.verify_from_candidate(all_bytes, cand, end).0,
+            |cand, end| candidate_is_code_boundary(all_bytes, offsets, cand) && self.verify_from_candidate(all_bytes, cand, end).0,
         );
         if trace {
             let total_us = t
