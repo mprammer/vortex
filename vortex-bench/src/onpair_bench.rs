@@ -1648,6 +1648,42 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let (codes_u16, dict_padded, lens_table, dict_table) =
         maybe_reorder_dict(codes_u16, dict_padded, lens_table, dict_table);
 
+    // EXPERIMENTAL, env-gated: dump the exact decode inputs for the standalone
+    // end-to-end scan bench (e2e_scan.cu). The decode output is a plain in-order
+    // concatenation of token bytes, so {codes, lens, dict_padded} is sufficient —
+    // the standalone derives dict_s8, chunk_offsets, and a CPU reference from these.
+    // Format: "E2E1" | total_tokens:u64 | dict_size:u32 | max_token:u32 | codes(u16 LE)
+    // | lens(u8) | dict_padded(u8, dict_size*max_token). Last-writer-wins (run one cell).
+    if let Ok(dump_path) = std::env::var("ONPAIR_DUMP_E2E") {
+        use std::io::Write;
+        let dict_size = lens_table.len();
+        match std::fs::File::create(&dump_path) {
+            Ok(file) => {
+                let mut w = std::io::BufWriter::new(file);
+                let mut hdr_ok = w.write_all(b"E2E1").is_ok();
+                hdr_ok &= w.write_all(&(codes_u16.len() as u64).to_le_bytes()).is_ok();
+                hdr_ok &= w.write_all(&(dict_size as u32).to_le_bytes()).is_ok();
+                hdr_ok &= w
+                    .write_all(&(vortex_onpair::MAX_TOKEN_SIZE as u32).to_le_bytes())
+                    .is_ok();
+                let mut codes_le = Vec::with_capacity(codes_u16.len() * 2);
+                for &c in &codes_u16 {
+                    codes_le.extend_from_slice(&c.to_le_bytes());
+                }
+                hdr_ok &= w.write_all(&codes_le).is_ok();
+                hdr_ok &= w.write_all(&lens_table).is_ok();
+                hdr_ok &= w.write_all(&dict_padded).is_ok();
+                hdr_ok &= w.flush().is_ok();
+                eprintln!(
+                    "ONPAIR_DUMP_E2E: wrote {dump_path} ok={hdr_ok} tokens={} dict={dict_size} max_token={}",
+                    codes_u16.len(),
+                    vortex_onpair::MAX_TOKEN_SIZE
+                );
+            }
+            Err(e) => eprintln!("ONPAIR_DUMP_E2E: create {dump_path} failed: {e}"),
+        }
+    }
+
     // Variable-width directory for the `vwidth` kernel: pack (offset:24 | len:8)
     // per entry into a u32. Derived from the native dict offsets in `dict_table`
     // (off<<16 | len) — a trivial repack, no on-disk change. Empty (=> kernel
