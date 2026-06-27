@@ -61,36 +61,34 @@
     }                                                                          \
   } while (0)
 
-// Substring-count scan: each thread tests whether `needle` (m bytes) begins at
-// its byte position. A cheap <=4-byte prefix gate keeps full compares rare; the
-// streaming first-byte read touches every decoded byte (coalesced), so for a rare
-// needle this is a pure bandwidth pass over the decoded column.
+// Substring-count scan: each thread tests whether `needle` (m bytes) begins at its
+// byte position. A packed <=4-byte prefix gate (`prefix4`, `pbytes` = min(4,m)) reads
+// exactly pbytes bytes/position -- the gate branches are uniform across threads (the
+// args are kernel-wide), so no warp divergence and the streaming read is coalesced;
+// every decoded byte is touched once. A 4-byte prefix collision is rare for any
+// needle, so the full compare almost never fires -> a pure bandwidth pass over the
+// decoded column (the worst case for a selective operator: it must read all of it).
 __global__ void scan_needle(const uint8_t *__restrict__ data, uint64_t n,
                             const uint8_t *__restrict__ needle, uint32_t m,
+                            uint32_t prefix4, uint32_t pbytes,
                             unsigned long long *__restrict__ count) {
   uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
   const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
-  const uint32_t pg = m < 4u ? m : 4u;
   unsigned long long local = 0;
   for (; i + m <= n; i += stride) {
-    bool hit = true;
-#pragma unroll
-    for (uint32_t j = 0; j < 4u; ++j) {
-      if (j < pg && data[i + j] != needle[j]) {
-        hit = false;
-        break;
-      }
-    }
-    if (hit) {
-      for (uint32_t j = pg; j < m; ++j) {
+    uint32_t w = data[i];
+    if (pbytes > 1) w |= (uint32_t)data[i + 1] << 8;
+    if (pbytes > 2) w |= (uint32_t)data[i + 2] << 16;
+    if (pbytes > 3) w |= (uint32_t)data[i + 3] << 24;
+    if (w == prefix4) {
+      bool hit = true;
+      for (uint32_t j = pbytes; j < m; ++j) {
         if (data[i + j] != needle[j]) {
           hit = false;
           break;
         }
       }
-      if (hit) {
-        local++;
-      }
+      if (hit) local++;
     }
   }
   atomicAdd(count, local);
@@ -185,12 +183,13 @@ int main(int argc, char **argv) {
   // ── choose the needle: explicit arg, else a deterministic 16-byte window from
   //    40% through the decoded column (present, and on real URL data rare) ──
   std::vector<uint8_t> needle;
-  if (needle_arg) {
+  if (needle_arg && needle_arg[0]) {  // explicit, non-empty needle
     needle.assign((const uint8_t *)needle_arg,
                   (const uint8_t *)needle_arg + strlen(needle_arg));
-  } else {
+  } else {  // AUTO: a 24-byte window 40% through the column -- present by construction,
+            // and on real URL/text data rare (a long substring is near-unique)
     uint64_t pos = decoded_bytes * 2 / 5;
-    uint32_t want = 16;
+    uint32_t want = 24;
     if (pos + want > decoded_bytes) want = (uint32_t)(decoded_bytes - pos);
     needle.assign(&cpu_out[pos], &cpu_out[pos + want]);
   }
@@ -236,8 +235,12 @@ int main(int argc, char **argv) {
     onpair_shmem_4tpt_split8read<<<dgrid, dblock>>>(
         d_codes, d_choff, d_dict_s8, d_dict_padded, d_lens, d_out, total_tokens);
   };
+  const uint32_t pbytes = m < 4u ? m : 4u;
+  uint32_t prefix4 = 0;
+  for (uint32_t j = 0; j < pbytes; ++j) prefix4 |= (uint32_t)needle[j] << (8 * j);
   auto launch_scan = [&]() {
-    scan_needle<<<sgrid, sblk>>>(d_out, decoded_bytes, d_needle, m, d_count);
+    scan_needle<<<sgrid, sblk>>>(d_out, decoded_bytes, d_needle, m, prefix4, pbytes,
+                                 d_count);
   };
 
   // ── correctness: decode once on the GPU, compare to the CPU reference ──
