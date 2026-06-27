@@ -22,6 +22,7 @@ location with no absolute paths required.
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -40,13 +41,13 @@ WIKIPEDIA_URL = ("https://huggingface.co/datasets/wikimedia/wikipedia/"
                  "resolve/main/20231101.en/train-00000-of-00041.parquet")
 DBTEXT_URL_BASE = "https://raw.githubusercontent.com/cwida/fsst/master/paper/dbtext"
 
-# Optional pre-existing local copies to reuse instead of downloading (machine
-# specific; ignored if absent).
-_LOCAL = {
-    "clickbench": [Path("/home/joe/data/hits.parquet")],
-    "fineweb": [Path("/home/joe/data/fineweb/sample_10BT_combined.parquet")],
-    "book-reviews": [Path("/home/joe/data/book_reviews/book_reviews.parquet")],
-}
+# Optional pre-existing local copies to reuse instead of downloading. Point
+# ONPAIR_LOCAL_<DATASET> (e.g. ONPAIR_LOCAL_CLICKBENCH, ONPAIR_LOCAL_BOOK_REVIEWS)
+# at an absolute parquet path to skip that dataset's download; ignored if unset or
+# absent. Lets a reproducer reuse data already on the box without editing this file.
+def _local(dataset_id: str) -> list[Path]:
+    env = os.environ.get("ONPAIR_LOCAL_" + dataset_id.upper().replace("-", "_"))
+    return [Path(env)] if env else []
 
 
 @dataclass
@@ -96,7 +97,7 @@ class Column:
 def _parquet_cols(dataset_id, columns, *, url, cache):
     return [
         Column(dataset_id=dataset_id, column=c, kind="parquet", url=url, cache=cache,
-               local=_LOCAL.get(dataset_id, []))
+               local=_local(dataset_id))
         for c in columns
     ]
 
@@ -166,7 +167,7 @@ COLUMNS: list[Column] = [
     # OnPair paper's book-reviews corpus (single `text` column). Reproduced on-box
     # from Amazon-Reviews-2023 "Books" (McAuley Lab); see the harness fetch block.
     Column(dataset_id="book-reviews", column="text", kind="parquet",
-           cache="book_reviews.parquet", local=_LOCAL["book-reviews"]),
+           cache="book_reviews.parquet", local=_local("book-reviews")),
     # Two further Amazon-Reviews-2023 categories with contrasting token profiles:
     # Movies_and_TV (long narrative review prose) and Electronics (short product
     # text/jargon). Same on-box materialization as book-reviews (review `text`).

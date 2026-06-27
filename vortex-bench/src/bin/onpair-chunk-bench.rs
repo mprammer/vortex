@@ -205,11 +205,12 @@ async fn main() -> Result<()> {
 // ---------------------------------------------------------------------------
 // Synthetic ClickBench-style URL corpus.
 //
-// Reproduces `vortex_fsst::test_utils::generate_clickbench_urls` (seed 123)
-// verbatim — the deterministic generator the original (since-removed)
-// `onpair_cuda` micro-benchmark used for its synthetic 10M-URL workload.
-// Inlined rather than depending on `vortex-fsst`'s `test_utils` so the corpus
-// is regenerable from this binary alone, with no cross-crate feature coupling.
+// Mirrors `vortex_fsst::test_utils::generate_clickbench_urls` (seed 123) — the
+// deterministic generator the original (since-removed) `onpair_cuda` micro-benchmark
+// used for its synthetic 10M-URL workload. Inlined so the corpus is regenerable from
+// this binary alone. Determinism is exact for the committed `Cargo.lock`: StdRng's
+// output stream is not guaranteed stable across `rand` major versions, so regenerating
+// after a `cargo update` may shift the corpus (pin `rand` or checksum if that matters).
 // ---------------------------------------------------------------------------
 
 const CB_DOMAINS: &[&str] = &[
@@ -274,8 +275,8 @@ const CB_FRAGMENTS: &[&str] = &[
     "",
 ];
 
-/// Deterministic ClickBench-style URL generator (seed 123). Byte-identical to
-/// `vortex_fsst::test_utils::generate_clickbench_urls`.
+/// Deterministic ClickBench-style URL generator (seed 123), deterministic for the
+/// committed `Cargo.lock`. Mirrors `vortex_fsst::test_utils::generate_clickbench_urls`.
 fn generate_clickbench_urls(n: usize) -> Vec<String> {
     use rand::RngExt;
     use rand::SeedableRng;

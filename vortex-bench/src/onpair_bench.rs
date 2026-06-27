@@ -1368,9 +1368,18 @@ async fn run_gpu_kernel_bench(
         .with_context(|| format!("auto kernel {auto_kernel} was not timed"))?;
     let best = kernels
         .iter()
-        .filter(|r| r.applicable && (!config.validate || r.verified == Some(true)))
+        // Exclude the non-byte-exact `*ablate*` instrumentation builds unconditionally
+        // (they skip a decode stage, so they run faster but produce wrong bytes), and,
+        // when validation is on, any kernel that failed the byte-exact check. This keeps
+        // `best` a real shipped, byte-exact kernel even without `--gpu-validate`, matching
+        // the paper's "every reported rate is byte-exact verified" claim.
+        .filter(|r| {
+            r.applicable
+                && !r.kernel.contains("ablate")
+                && (!config.validate || r.verified == Some(true))
+        })
         .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
-        .context("no applicable verified CUDA OnPair kernels")?;
+        .context("no applicable non-ablate CUDA OnPair kernels")?;
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.

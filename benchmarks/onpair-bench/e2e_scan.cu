@@ -399,5 +399,5 @@ int main(int argc, char **argv) {
           gbps(decoded_bytes, t_h2d_dec), pcie_vs_decodescan,
           decode_ok ? "YES" : "NO", scan_ok ? "YES" : "NO",
           (unsigned long long)cpu_matches, (unsigned long long)gpu_matches);
-  return decode_ok ? 0 : 4;
+  return (decode_ok && scan_ok) ? 0 : 4;
 }
