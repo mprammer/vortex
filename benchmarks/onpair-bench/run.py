@@ -33,7 +33,7 @@ import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from columns import COLUMNS, DATA_DIR, REPO_ROOT, SRC_DIR, Column
+from columns import AMAZON_URL, COLUMNS, DATA_DIR, REPO_ROOT, SRC_DIR, Column
 
 OUT_ROOT = DATA_DIR / "onpair-bench"
 BIN = "onpair-chunk-bench"
@@ -121,6 +121,54 @@ def text_to_parquet(src: Path, dest: Path, column: str) -> None:
     tmp.rename(dest)
 
 
+# Amazon-Reviews-2023 review-text byte cap (run.py samples 1 GB; ~1.2 GB gives headroom).
+AMAZON_CAP_BYTES = int(os.environ.get("AMAZON_CAP_BYTES", 1_200_000_000))
+
+
+def amazon_to_parquet(col: Column) -> Path:
+    """Stream an Amazon-Reviews-2023 category's raw review JSONL (McAuley Lab) and write
+    its `text` field, up to AMAZON_CAP_BYTES, to a one-column parquet cache. `HF_TOKEN`
+    (if set) avoids anonymous rate limits; `AMAZON_URL_OVERRIDE` points at a mirror. The
+    corpus is non-redistributable, so it is materialized on-box and never committed."""
+    import gzip
+    import json
+    import urllib.request
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = col.cache_path()
+    url = os.environ.get("AMAZON_URL_OVERRIDE") or AMAZON_URL.format(category=col.category)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    print(f"==> streaming Amazon '{col.category}' text (cap {AMAZON_CAP_BYTES} B)\n"
+          f"        {url}\n        -> {dest}", file=sys.stderr)
+    hdr = {"User-Agent": "vortex-bench/onpair"}
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if tok:
+        hdr["Authorization"] = "Bearer " + tok
+    texts: list[str] = []
+    total = 0
+    req = urllib.request.Request(url, headers=hdr)
+    with urllib.request.urlopen(req) as resp:
+        stream = gzip.GzipFile(fileobj=resp) if url.endswith(".gz") else resp
+        for line in stream:
+            try:
+                t = json.loads(line).get("text")
+            except Exception:
+                continue
+            if not t:
+                continue
+            texts.append(t)
+            total += len(t.encode("utf-8"))
+            if total >= AMAZON_CAP_BYTES:
+                break
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    pq.write_table(pa.table({col.column: pa.array(texts, type=pa.string())}), tmp)
+    tmp.rename(dest)
+    print(f"==> wrote {len(texts)} reviews ~{total} B -> {dest}", file=sys.stderr)
+    return dest
+
+
 def ensure_parquet(binary: Path, col: Column) -> Path:
     path = col.parquet_path()
     if path.exists():
@@ -157,6 +205,8 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
             download(col.url, raw_path)
         text_to_parquet(raw_path, col.cache_path(), col.column)
         return col.cache_path()
+    if col.kind == "amazon":
+        return amazon_to_parquet(col)
     if col.kind == "synthetic":
         # Deterministic in-pipeline generation (seed 123) via the Rust binary;
         # no external source. Idempotent on the Rust side.

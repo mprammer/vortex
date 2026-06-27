@@ -14,6 +14,9 @@ Source kinds:
                 with no resolvable source is skipped by ``run.py``.
 * ``text``    — a newline-delimited raw text file converted to a single-column
                 parquet cache by ``run.py``.
+* ``amazon``  — an Amazon-Reviews-2023 review-text category (McAuley Lab); run.py
+                streams the raw ``.jsonl`` and writes its ``text`` field to a
+                one-column parquet cache (capped ~1.2 GB).
 
 All generated/downloaded data lives **under the repo** (``vortex-bench/data``),
 resolved relative to this file — so the benchmark works from any checkout
@@ -31,15 +34,28 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 DATA_DIR = REPO_ROOT / "vortex-bench" / "data"
 SRC_DIR = DATA_DIR / "onpair-bench-src"
 
-# Download URLs (the same sources Vortex's own loaders use).
+# Download URLs for the external corpora. These were the live canonical locations as of
+# 2026-06 (the paper's measurement window); each dataset's landing page is noted so a
+# reader can find the current location if a direct link has since moved. This is a
+# reproducibility harness, not an archive: we record best-effort provenance for the data,
+# not a frozen copy of it.
 CLICKBENCH_URL = "https://datasets.clickhouse.com/hits_compatible/hits.parquet"
+#   landing page: https://github.com/ClickHouse/ClickBench  (the "hits" dataset)
 FINEWEB_URL = ("https://huggingface.co/datasets/HuggingFaceFW/fineweb/"
                "resolve/v1.4.0/sample/10BT/000_00000.parquet")
+#   landing page: https://huggingface.co/datasets/HuggingFaceFW/fineweb
 # Wikipedia (English, 2023-11-01 snapshot) — long encyclopaedic free text.
 # One ~420 MB parquet shard; columns id/url/title/text.
 WIKIPEDIA_URL = ("https://huggingface.co/datasets/wikimedia/wikipedia/"
                  "resolve/main/20231101.en/train-00000-of-00041.parquet")
+#   landing page: https://huggingface.co/datasets/wikimedia/wikipedia
 DBTEXT_URL_BASE = "https://raw.githubusercontent.com/cwida/fsst/master/paper/dbtext"
+#   landing page: https://github.com/cwida/fsst  (the FSST paper's dbtext corpus)
+# Amazon-Reviews-2023 (McAuley Lab, UCSD): per-category raw review JSONL; run.py streams
+# the `text` field. Non-redistributable corpus — materialized on-box, never committed.
+#   landing page: https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023
+AMAZON_URL = ("https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/"
+              "resolve/main/raw/review_categories/{category}.jsonl")
 
 # Optional pre-existing local copies to reuse instead of downloading. Point
 # ONPAIR_LOCAL_<DATASET> (e.g. ONPAIR_LOCAL_CLICKBENCH, ONPAIR_LOCAL_BOOK_REVIEWS)
@@ -56,7 +72,7 @@ class Column:
 
     dataset_id: str
     column: str
-    kind: str  # "tpch" | "tpcds" | "parquet" | "text" | "synthetic"
+    kind: str  # "tpch" | "tpcds" | "parquet" | "text" | "amazon" | "synthetic"
     # tpch / tpcds
     scale_factor: float = 10.0
     table: str = "lineitem"
@@ -66,6 +82,8 @@ class Column:
     local: list[Path] = field(default_factory=list)
     # synthetic
     rows: int = 10_000_000  # row count for the `synthetic` generator
+    # amazon
+    category: str | None = None  # HF Amazon-Reviews-2023 category, e.g. "Books"
 
     def tpch_dir(self) -> Path:
         return SRC_DIR / f"tpch_sf{int(self.scale_factor)}"
@@ -84,7 +102,7 @@ class Column:
             return self.tpch_dir() / "parquet" / f"{self.table}_0.parquet"
         if self.kind == "tpcds":
             return self.tpcds_dir() / "parquet" / f"{self.table}.parquet"
-        if self.kind in ("parquet", "text"):
+        if self.kind in ("parquet", "text", "amazon"):
             for p in self.local:
                 if Path(p).exists():
                     return Path(p)
@@ -165,16 +183,15 @@ COLUMNS: list[Column] = [
     # FSST paper's dbtext corpus: 23 raw text columns under cwida/fsst.
     *_dbtext_cols(_DBTEXT_COLS),
     # OnPair paper's book-reviews corpus (single `text` column). Reproduced on-box
-    # from Amazon-Reviews-2023 "Books" (McAuley Lab); see the harness fetch block.
-    Column(dataset_id="book-reviews", column="text", kind="parquet",
+    # from Amazon-Reviews-2023 "Books" (McAuley Lab), streamed by run.py.
+    Column(dataset_id="book-reviews", column="text", kind="amazon", category="Books",
            cache="book_reviews.parquet", local=_local("book-reviews")),
     # Two further Amazon-Reviews-2023 categories with contrasting token profiles:
-    # Movies_and_TV (long narrative review prose) and Electronics (short product
-    # text/jargon). Same on-box materialization as book-reviews (review `text`).
-    Column(dataset_id="amazon-movies", column="text", kind="parquet",
-           cache="amazon_movies.parquet"),
-    Column(dataset_id="amazon-electronics", column="text", kind="parquet",
-           cache="amazon_electronics.parquet"),
+    # Movies_and_TV (long narrative review prose) and Electronics (short product text).
+    Column(dataset_id="amazon-movies", column="text", kind="amazon", category="Movies_and_TV",
+           cache="amazon_movies.parquet", local=_local("amazon-movies")),
+    Column(dataset_id="amazon-electronics", column="text", kind="amazon", category="Electronics",
+           cache="amazon_electronics.parquet", local=_local("amazon-electronics")),
     # Synthetic ClickBench-style URL corpus (deterministic, seed 123) — the
     # micro-benchmark workload, regenerated in-pipeline via `gen-synth-urls`
     # (no external source). Column name `url` matches the paper's synthetic row.

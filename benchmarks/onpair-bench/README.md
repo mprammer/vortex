@@ -95,22 +95,28 @@ to the source — no absolute paths). Each source is generated locally or fetche
 | FineWeb | HuggingFace `HuggingFaceFW/fineweb` (sample/10BT, v1.4.0) |
 | Wikipedia | HuggingFace `wikimedia/wikipedia` (20231101.en) |
 | `dbtext` | the FSST paper corpus, `cwida/fsst` |
-| `book-reviews`, `amazon-movies`, `amazon-electronics` | Amazon-Reviews-2023 (McAuley Lab, UCSD) — *Books / Movies_and_TV / Electronics* `text`. Non-redistributable; materialize on-box. |
+| `book-reviews`, `amazon-movies`, `amazon-electronics` | Amazon-Reviews-2023 (McAuley Lab, UCSD) — *Books / Movies_and_TV / Electronics* review `text`, streamed on-box by `run.py` (set `HF_TOKEN`). Non-redistributable corpus; never committed. |
 | OnPair codec | `encodings/onpair-sys` builds `gargiulofrancesco/onpair_cpp` (pinned SHA) — OnPair, [arXiv:2508.02280](https://arxiv.org/abs/2508.02280) |
 | nvCOMP (DE + software-Zstd baselines) | NVIDIA nvCOMP SDK 5.1, auto-downloaded by the build |
 
-For HuggingFace downloads, set `HF_TOKEN` to avoid rate limits (sent only to `huggingface.co`). To
-reuse data already on the box instead of downloading, point `ONPAIR_LOCAL_<DATASET>` (e.g.
-`ONPAIR_LOCAL_CLICKBENCH`, `ONPAIR_LOCAL_BOOK_REVIEWS`) at an absolute parquet path.
+For HuggingFace downloads (FineWeb, Wikipedia, the Amazon corpora), set `HF_TOKEN` to avoid rate
+limits (sent only to `huggingface.co`). To reuse data already on the box instead of downloading,
+point `ONPAIR_LOCAL_<DATASET>` (e.g. `ONPAIR_LOCAL_CLICKBENCH`, `ONPAIR_LOCAL_BOOK_REVIEWS`) at an
+absolute parquet path.
+
+The external download links were live as of **2026-06** (the paper's measurement window); each
+source's landing page is recorded in `columns.py` if a direct link has since moved. This is a
+reproducibility harness, not a data archive — we record best-effort provenance, not a frozen copy of
+the corpora.
 
 ## Things you may need to fiddle with on a fresh box
 
 - **libclang not found** → `export LIBCLANG_PATH=$(llvm-config --libdir)`.
 - **`sccache: Operation not permitted`** (if sccache is globally configured) → `export RUSTC_WRAPPER=`.
 - **A newer host compiler** can trip the kernels' `-Werror`; install a matching GCC/Clang or relax it.
-- **A column was skipped** — `run.py` skips a dataset whose source is absent (e.g. the Amazon sets
-  need the McAuley fetch or an `ONPAIR_LOCAL_*` path) and notes it on stderr; the run still completes
-  on whatever is present. Use `--datasets`/`--columns` to scope a run.
+- **A column was skipped** — `run.py` streams the Amazon corpora from HuggingFace automatically (set
+  `HF_TOKEN` to avoid throttling); any dataset whose source can't be fetched is skipped with a stderr
+  note and the run completes on the rest. Use `--datasets`/`--columns` to scope a run.
 
 ## Did it work?
 
