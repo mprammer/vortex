@@ -61,34 +61,44 @@
     }                                                                          \
   } while (0)
 
-// Substring-count scan: each thread tests whether `needle` (m bytes) begins at its
-// byte position. A packed <=4-byte prefix gate (`prefix4`, `pbytes` = min(4,m)) reads
-// exactly pbytes bytes/position -- the gate branches are uniform across threads (the
-// args are kernel-wide), so no warp divergence and the streaming read is coalesced;
-// every decoded byte is touched once. A 4-byte prefix collision is rare for any
-// needle, so the full compare almost never fires -> a pure bandwidth pass over the
-// decoded column (the worst case for a selective operator: it must read all of it).
+// SWAR: does the 4-byte word x contain a byte equal to n0 (broadcast bcast = n0*0x01010101)?
+__device__ inline uint32_t word_has(uint32_t x, uint32_t bcast) {
+  uint32_t y = x ^ bcast;
+  return (y - 0x01010101u) & ~y & 0x80808080u;
+}
+
+// Vectorized substring-count scan. A byte-wise scan issues ~1 memory request per byte and
+// is L1-request-bound (the very bottleneck this paper is about) -- not what we want to
+// measure. So each thread loads a 16-byte chunk (one uint4 request) and SWAR-tests all 16
+// bytes for the needle's FIRST byte. The common case is the uint4 load + 4 ALU tests: a
+// coalesced HBM-bandwidth pass that touches every decoded byte. The needle's first byte is
+// chosen rare (host side), so the candidate branch -- re-read the chunk's bytes from L1 and
+// do the full compare -- almost never fires. Reads ~1 request / 16 bytes => bandwidth-bound.
 __global__ void scan_needle(const uint8_t *__restrict__ data, uint64_t n,
                             const uint8_t *__restrict__ needle, uint32_t m,
-                            uint32_t prefix4, uint32_t pbytes,
+                            uint8_t n0, uint32_t n0bcast,
                             unsigned long long *__restrict__ count) {
-  uint64_t i = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
+  const uint64_t nchunks = n >> 4;  // 16-byte chunks; the <16 B tail can't start a match
+                                    // the CPU oracle reaches either (n%16 < m), so counts agree
+  uint64_t c = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
   const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
+  const uint4 *d4 = reinterpret_cast<const uint4 *>(data);
   unsigned long long local = 0;
-  for (; i + m <= n; i += stride) {
-    uint32_t w = data[i];
-    if (pbytes > 1) w |= (uint32_t)data[i + 1] << 8;
-    if (pbytes > 2) w |= (uint32_t)data[i + 2] << 16;
-    if (pbytes > 3) w |= (uint32_t)data[i + 3] << 24;
-    if (w == prefix4) {
-      bool hit = true;
-      for (uint32_t j = pbytes; j < m; ++j) {
-        if (data[i + j] != needle[j]) {
-          hit = false;
-          break;
+  for (; c < nchunks; c += stride) {
+    uint4 v = d4[c];
+    if (word_has(v.x, n0bcast) | word_has(v.y, n0bcast) |
+        word_has(v.z, n0bcast) | word_has(v.w, n0bcast)) {
+      const uint64_t base = c << 4;
+      for (int k = 0; k < 16; ++k) {
+        const uint64_t pos = base + (uint64_t)k;
+        if (data[pos] == n0 && pos + m <= n) {  // re-read from L1 (just loaded); no &v spill
+          bool hit = true;
+          for (uint32_t j = 1; j < m; ++j) {
+            if (data[pos + j] != needle[j]) { hit = false; break; }
+          }
+          if (hit) local++;
         }
       }
-      if (hit) local++;
     }
   }
   atomicAdd(count, local);
@@ -186,9 +196,19 @@ int main(int argc, char **argv) {
   if (needle_arg && needle_arg[0]) {  // explicit, non-empty needle
     needle.assign((const uint8_t *)needle_arg,
                   (const uint8_t *)needle_arg + strlen(needle_arg));
-  } else {  // AUTO: a 24-byte window 40% through the column -- present by construction,
-            // and on real URL/text data rare (a long substring is near-unique)
-    uint64_t pos = decoded_bytes * 2 / 5;
+  } else {  // AUTO: a 24-byte window whose FIRST byte is a rare byte value, so the vectorized
+            // scan's first-byte gate fires rarely and stays bandwidth-bound. Taken at/after
+            // 40% through; present by construction; a 24-byte string is near-unique on real data.
+    uint64_t hist[256] = {0};
+    for (uint64_t i = 0; i < decoded_bytes; ++i) hist[cpu_out[i]]++;
+    int rb = -1;
+    uint64_t bestc = 0;
+    for (int v = 0; v < 256; ++v)
+      if (hist[v] > 0 && (rb < 0 || hist[v] < bestc)) { rb = v; bestc = hist[v]; }
+    uint64_t start = decoded_bytes * 2 / 5, pos = decoded_bytes;
+    for (uint64_t i = start; i + 24 <= decoded_bytes; ++i)
+      if (cpu_out[i] == (uint8_t)rb) { pos = i; break; }
+    if (pos == decoded_bytes) pos = (start + 24 <= decoded_bytes) ? start : 0;
     uint32_t want = 24;
     if (pos + want > decoded_bytes) want = (uint32_t)(decoded_bytes - pos);
     needle.assign(&cpu_out[pos], &cpu_out[pos + want]);
@@ -227,20 +247,19 @@ int main(int argc, char **argv) {
   dim3 dblock(512);
   dim3 dgrid((unsigned)((n_chunks + 15) / 16));  // 16 warps/block, 1 warp/chunk
   int sblk = 256;
-  uint64_t sgrid64 = (decoded_bytes + sblk - 1) / sblk;
-  if (sgrid64 > 131072) sgrid64 = 131072;  // grid-stride caps the grid
+  uint64_t s_nchunks = decoded_bytes >> 4;  // one thread per 16-byte uint4 chunk
+  uint64_t sgrid64 = (s_nchunks + sblk - 1) / sblk;
+  if (sgrid64 > 262144) sgrid64 = 262144;  // grid-stride caps the grid
   dim3 sgrid((unsigned)std::max<uint64_t>(sgrid64, 1));
 
   auto launch_decode = [&]() {
     onpair_shmem_4tpt_split8read<<<dgrid, dblock>>>(
         d_codes, d_choff, d_dict_s8, d_dict_padded, d_lens, d_out, total_tokens);
   };
-  const uint32_t pbytes = m < 4u ? m : 4u;
-  uint32_t prefix4 = 0;
-  for (uint32_t j = 0; j < pbytes; ++j) prefix4 |= (uint32_t)needle[j] << (8 * j);
+  const uint8_t n0 = m ? needle[0] : 0;
+  const uint32_t n0bcast = (uint32_t)n0 * 0x01010101u;
   auto launch_scan = [&]() {
-    scan_needle<<<sgrid, sblk>>>(d_out, decoded_bytes, d_needle, m, prefix4, pbytes,
-                                 d_count);
+    scan_needle<<<sgrid, sblk>>>(d_out, decoded_bytes, d_needle, m, n0, n0bcast, d_count);
   };
 
   // ── correctness: decode once on the GPU, compare to the CPU reference ──
