@@ -101,7 +101,11 @@ __global__ void scan_needle(const uint8_t *__restrict__ data, uint64_t n,
       }
     }
   }
-  atomicAdd(count, local);
+  // Only the (rare) threads that found a match touch the global counter. An
+  // unconditional atomicAdd serializes ALL threads on one address -- with ~62 M
+  // threads that dominated the kernel (scan time scaled with thread count, ~24 GB/s);
+  // guarding it makes the scan a pure HBM-bandwidth pass for a selective needle.
+  if (local) atomicAdd(count, local);
 }
 
 static double now_s() {
