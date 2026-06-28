@@ -307,12 +307,44 @@ int main(int argc, char **argv) {
     return best;
   };
 
-  double t_decode = time_min([&]() { launch_decode(); });
-  double t_scan = time_min([&]() { launch_scan(); });
-  double t_e2e = time_min([&]() {
+  // GOLD provenance: identical to time_min, but ALSO stores every per-iteration
+  // CUDA-event duration into `out` as raw integer nanoseconds (round(ms*1e6)).
+  // The sample is recorded AFTER cudaEventElapsedTime reads the bracket, so no
+  // work is added between cudaEventRecord(ev0) and cudaEventRecord(ev1) -- the
+  // timed region is byte-for-byte the same as time_min's. Reduction (min) and
+  // unit (ns->ms->GB/s) are deferred to figure-generation, mirroring the GPU
+  // OnPair bench's `decode_ns_iters`. Returns the same min-ms scalar as time_min
+  // so the existing scalar fields are unchanged.
+  auto time_min_raw = [&](auto &&fn, std::vector<uint64_t> &out) -> double {
+    for (int w = 0; w < 3; ++w) {
+      fn();
+    }
+    CK(cudaDeviceSynchronize());
+    out.clear();
+    out.reserve((size_t)iters);
+    double best = 1e30;
+    for (int k = 0; k < iters; ++k) {
+      CK(cudaEventRecord(ev0));
+      fn();
+      CK(cudaEventRecord(ev1));
+      CK(cudaEventSynchronize(ev1));
+      float ms = 0;
+      CK(cudaEventElapsedTime(&ms, ev0, ev1));
+      // ms >= 0, so +0.5 then truncate == round-to-nearest (no <cmath> needed).
+      out.push_back((uint64_t)((double)ms * 1e6 + 0.5));
+      if (ms < best) best = ms;
+    }
+    return best;
+  };
+
+  std::vector<uint64_t> decode_ns_iters, scan_ns_iters, e2e_ns_iters;
+  std::vector<uint64_t> h2d_decompressed_ns_iters, h2d_compressed_ns_iters;
+  double t_decode = time_min_raw([&]() { launch_decode(); }, decode_ns_iters);
+  double t_scan = time_min_raw([&]() { launch_scan(); }, scan_ns_iters);
+  double t_e2e = time_min_raw([&]() {
     launch_decode();
     launch_scan();
-  });
+  }, e2e_ns_iters);
 
   // ── PCIe transfers from pinned host memory (decompressed vs compressed) ──
   const uint64_t compressed_bytes =
@@ -324,12 +356,12 @@ int main(int argc, char **argv) {
   memcpy(h_pin_dec, cpu_out.data(), decoded_bytes);
   uint8_t *d_xfer;
   CK(cudaMalloc(&d_xfer, decoded_bytes));  // big enough for both
-  double t_h2d_dec = time_min([&]() {
+  double t_h2d_dec = time_min_raw([&]() {
     cudaMemcpyAsync(d_xfer, h_pin_dec, decoded_bytes, cudaMemcpyHostToDevice);
-  });
-  double t_h2d_cmp = time_min([&]() {
+  }, h2d_decompressed_ns_iters);
+  double t_h2d_cmp = time_min_raw([&]() {
     cudaMemcpyAsync(d_xfer, h_pin_cmp, compressed_bytes, cudaMemcpyHostToDevice);
-  });
+  }, h2d_compressed_ns_iters);
 
   // ── derived rates + headline ratios ──
   auto gbps = [](uint64_t bytes, double ms) {
@@ -351,6 +383,16 @@ int main(int argc, char **argv) {
   // device name
   cudaDeviceProp prop{};
   CK(cudaGetDeviceProperties(&prop, 0));
+
+  // GOLD: emit a raw per-iteration sample vector as a JSON array of integer ns,
+  // e.g.  "decode_ns_iters": [12345, 12300, ...],   (always with a trailing comma,
+  // since these are emitted in the middle of the object).
+  auto print_ns_iters = [](const char *key, const std::vector<uint64_t> &v) {
+    printf("  \"%s\": [", key);
+    for (size_t i = 0; i < v.size(); ++i)
+      printf("%s%llu", i ? "," : "", (unsigned long long)v[i]);
+    printf("],\n");
+  };
 
   printf("{\n");
   printf("  \"gpu\": \"%s\",\n", prop.name);
@@ -374,6 +416,13 @@ int main(int argc, char **argv) {
   printf("  \"h2d_decompressed_ms\": %.5f,\n", t_h2d_dec);
   printf("  \"h2d_compressed_ms\": %.5f,\n", t_h2d_cmp);
   printf("  \"cpu_decode_ms\": %.5f,\n", cpu_decode_ms);
+  // GOLD: raw per-iteration CUDA-event samples (integer ns) for every event-timed
+  // quantity. The min of each equals the corresponding *_ms scalar above (* 1e6).
+  print_ns_iters("decode_ns_iters", decode_ns_iters);
+  print_ns_iters("scan_ns_iters", scan_ns_iters);
+  print_ns_iters("e2e_ns_iters", e2e_ns_iters);
+  print_ns_iters("h2d_decompressed_ns_iters", h2d_decompressed_ns_iters);
+  print_ns_iters("h2d_compressed_ns_iters", h2d_compressed_ns_iters);
   printf("  \"decode_gbps\": %.2f,\n", gbps(decoded_bytes, t_decode));
   printf("  \"scan_gbps\": %.2f,\n", gbps(decoded_bytes, t_scan));
   printf("  \"e2e_gbps\": %.2f,\n", gbps(decoded_bytes, t_e2e));

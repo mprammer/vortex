@@ -277,6 +277,13 @@ pub struct NvcompZstdGpuResult {
     /// unit chosen at figure-generation, mirroring FastPair's `decode_ns_iters`).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_ms_iters: Vec<f64>,
+    /// Every timed iteration's decompress-pass time as integer nanoseconds, mirroring the
+    /// OnPair kernel path's `decode_ns_iters` provenance field so both decode paths expose
+    /// the same raw shape to figure-generation (reduction/unit chosen there). Derived from
+    /// the same CUDA-event samples as `decode_ms_iters` (the nvCOMP timer reports ms, so
+    /// each sample is `ms * 1e6` rounded to the nearest ns); no extra timing is done.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub decode_ns_iters: Vec<u64>,
 }
 
 /// CUDA kernel-only OnPair decompression results loaded from existing Vortex files.
@@ -1414,6 +1421,7 @@ async fn run_gpu_kernel_bench(
             decode_gib_s: 0.0,
             compressed_gib_s: 0.0,
             decode_ms_iters: Vec::new(),
+            decode_ns_iters: Vec::new(),
         });
         let mut z = Vec::with_capacity(NVCOMP_ZSTD_LEVELS.len());
         for &level in NVCOMP_ZSTD_LEVELS {
@@ -1440,6 +1448,7 @@ async fn run_gpu_kernel_bench(
                     decode_gib_s: 0.0,
                     compressed_gib_s: 0.0,
                     decode_ms_iters: Vec::new(),
+                    decode_ns_iters: Vec::new(),
                 }),
             );
         }
@@ -1598,7 +1607,15 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let (dict_padded, lens_table) = match_each_integer_ptype!(dict_offsets_arr.ptype(), |P| {
         let offsets = dict_offsets_arr.as_slice::<P>();
         let dict_size = offsets.len().saturating_sub(1);
-        let mut padded = vec![0u8; dict_size * vortex_onpair::MAX_TOKEN_SIZE];
+        // Trailing pad of MAX_TOKEN_SIZE zero bytes: the GPU gather kernels read
+        // this buffer with fixed-width vector loads (uint4 = 16 B) at
+        // `code * MAX_TOKEN_SIZE`, so the last entry's load would otherwise end
+        // exactly at the buffer end with zero slack. The pad gives every wide
+        // load headroom. `vec![0u8; ..]` zeroes the whole allocation, so the
+        // tail bytes are already zero; the copy loop below only writes the first
+        // `dict_size * MAX_TOKEN_SIZE` bytes (indexed per entry), never the pad.
+        let mut padded =
+            vec![0u8; dict_size * vortex_onpair::MAX_TOKEN_SIZE + vortex_onpair::MAX_TOKEN_SIZE];
         let mut lens = vec![0u8; dict_size];
         for i in 0..dict_size {
             let start = offsets[i] as usize;
@@ -1775,8 +1792,15 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
         );
     }
 
-    let mut dict_s8 = vec![0u8; lens_table.len() * 8];
-    let mut dict_s4 = vec![0u8; lens_table.len() * 4];
+    // Trailing pad of MAX_TOKEN_SIZE zero bytes on the strided gather buffers:
+    // the GPU kernels read `dict_s8` with 8-byte (uint2) loads and `dict_s4`
+    // with 4-byte (uint32) loads at `code * stride`, so the last entry's load
+    // would otherwise end exactly at the buffer end with zero slack. `vec![0u8;
+    // ..]` zeroes the whole allocation, so the pad bytes are already zero; the
+    // copy loop below only writes the first `lens_table.len()` entries (indexed
+    // per entry), never the pad.
+    let mut dict_s8 = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
+    let mut dict_s4 = vec![0u8; lens_table.len() * 4 + vortex_onpair::MAX_TOKEN_SIZE];
     let mut dict_const1 = vec![0u8; lens_table.len()];
     let mut dict_const2 = vec![0u8; lens_table.len() * 2];
     for (i, len) in lens_table.iter().copied().enumerate() {
@@ -1950,6 +1974,15 @@ async fn run_nvcomp_zstd_bench(
         .iter()
         .copied()
         .fold(f64::INFINITY, f64::min);
+    // Integer-nanosecond provenance, mirroring the OnPair kernel path's
+    // `decode_ns_iters`. Derived from the same `decode_ms_iters` CUDA-event
+    // samples (no re-timing): the nvCOMP timer reports ms, so scale by 1e6 and
+    // round to the nearest ns.
+    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+    let decode_ns_iters: Vec<u64> = decode_ms_iters
+        .iter()
+        .map(|&ms| (ms * 1e6).round().max(0.0) as u64)
+        .collect();
     Ok(NvcompZstdGpuResult {
         supported: true,
         error: None,
@@ -1965,6 +1998,7 @@ async fn run_nvcomp_zstd_bench(
         decode_gib_s: gib_s(raw_bytes, decode_ms),
         compressed_gib_s: gib_s(compressed_bytes, decode_ms),
         decode_ms_iters,
+        decode_ns_iters,
     })
 }
 

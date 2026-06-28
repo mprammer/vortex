@@ -21,12 +21,14 @@ use vortex_array::ExecutionResult;
 use vortex_array::IntoArray;
 use vortex_array::Precision;
 use vortex_array::TypedArrayRef;
+use vortex_array::arrays::Primitive;
 use vortex_array::buffer::BufferHandle;
 use vortex_array::builders::ArrayBuilder;
 use vortex_array::builders::VarBinViewBuilder;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::PType;
+use vortex_array::match_each_integer_ptype;
 use vortex_array::serde::ArrayChildren;
 use vortex_array::smallvec::smallvec;
 use vortex_array::validity::Validity;
@@ -307,6 +309,36 @@ fn validate_parts(
             uncompressed_lengths.len() + 1
         );
     }
+
+    // Every dictionary entry must fit in MAX_TOKEN_SIZE bytes: the over-copy
+    // decoders (CPU `decode_rows_unchecked` and the GPU gather kernels) issue a
+    // fixed MAX_TOKEN_SIZE-wide load per token and rely on no entry exceeding
+    // that width. A `dict_offsets` delta larger than MAX_TOKEN_SIZE would mean a
+    // token's bytes are silently truncated on decode, so reject it up front.
+    //
+    // This is a once-per-array, host-side check with no kernel impact. We only
+    // inspect the offsets when they are already materialised as a `Primitive`
+    // array (the common case on the construction path, where `dict_offsets` is a
+    // freshly-built `PrimitiveArray<u32>`); when a cascading compressor has left
+    // the child in a compressed encoding we skip the value check here rather
+    // than force an expensive canonicalization in the validation path.
+    if let Some(offsets) = dict_offsets.as_opt::<Primitive>() {
+        match_each_integer_ptype!(offsets.ptype(), |P| {
+            let slice = offsets.as_slice::<P>();
+            for w in slice.windows(2) {
+                // Offsets are monotonic; widen to i128 so the delta is exact and
+                // a non-monotonic (negative) delta is also caught.
+                let len = i128::from(w[1]) - i128::from(w[0]);
+                vortex_ensure!(
+                    (0..=crate::MAX_TOKEN_SIZE as i128).contains(&len),
+                    InvalidArgument:
+                    "OnPair dict entry length {len} out of range [0, {}] (dict_offsets must be monotonic with deltas <= MAX_TOKEN_SIZE)",
+                    crate::MAX_TOKEN_SIZE
+                );
+            }
+        });
+    }
+
     Ok(())
 }
 
