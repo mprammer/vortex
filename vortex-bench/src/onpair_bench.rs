@@ -1633,10 +1633,20 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     });
     let total_tokens = codes_u16.len();
     let dict_max_len = *lens_table.iter().max().unwrap_or(&0);
-    let dict_mean_len = if lens_table.is_empty() {
+    // Occurrence-weighted mean emitted-token length: averaged over the code stream
+    // (like frac_le8 below), not over the dictionary table. Averaging over lens_table
+    // is dominated by the ~256 initial single-byte entries that are rarely emitted, which
+    // collapses the reported mean for low-cardinality columns (e.g. l_shipinstruct -> 1.4
+    // even though the tokens it actually emits are long). This pairs with frac_le8 as the
+    // same (emitted-token) population.
+    let dict_mean_len = if codes_u16.is_empty() {
         0.0
     } else {
-        lens_table.iter().map(|&v| v as u64).sum::<u64>() as f32 / lens_table.len() as f32
+        codes_u16
+            .iter()
+            .map(|&c| lens_table[c as usize] as u64)
+            .sum::<u64>() as f32
+            / codes_u16.len() as f32
     };
     let all_len_1 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 1);
     let all_len_2 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 2);
