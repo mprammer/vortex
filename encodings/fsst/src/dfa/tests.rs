@@ -770,6 +770,121 @@ fn test_folded_contains_escape_only_matcher_routing() -> VortexResult<()> {
     Ok(())
 }
 
+/// Regression: the streaming Teddy prefilter flags candidates at raw byte
+/// offsets, so a candidate can land on an escape *literal* (a non-code-boundary).
+/// `verify_from_candidate` reads `all_bytes[cand]` as a code, so that literal is
+/// misread as a code and can phantom-accept a row whose decompressed text does
+/// NOT contain the needle (observed as `%ure%` overcounting the 10M ClickBench
+/// URL column by +580). The scan must drop non-boundary candidates — and ONLY
+/// those: a candidate after an even-length escape run is a genuine boundary that
+/// the parity walk-back must keep.
+#[test]
+fn test_folded_contains_triple_teddy_drops_escape_literal_candidates() -> VortexResult<()> {
+    // Codes 0="ab", 1="cd", 2="ef"; the needle's all-code folding is [0, 1, 2].
+    let symbols = [sym(b"ab"), sym(b"cd"), sym(b"ef"), sym(b"zz")];
+    let lengths = [2u8, 2, 2, 2];
+    let dfa = FoldedContainsDfa::new(&symbols, &lengths, b"abcdef", false)?;
+    assert!(
+        dfa.scan_plan_name().starts_with("triple_streaming"),
+        "construction must exercise the Teddy triple scan, got {:?}",
+        dfa.scan_plan_name()
+    );
+
+    // Row 0 (phantom): [ESC, 0, 1, 2] decompresses to "\x00cdef" — no match.
+    //   Offset 1 is the escape's literal; misread as code 0 it chains
+    //   0("ab") 1("cd") 2("ef") = "abcdef" and phantom-accepts.
+    // Row 1 (phantom, escape mid-row): [3, ESC, 0, 1, 2] = "zz\x00cdef".
+    // Row 2 (true match): [0, 1, 2] = "abcdef".
+    // Row 3 (true match after literal-255): [ESC, ESC, 0, 1, 2] = "\xffabcdef";
+    //   the candidate at offset 2 follows an even escape run — a real boundary.
+    let rows: [&[u8]; 4] = [
+        &[ESCAPE_CODE, 0, 1, 2],
+        &[3, ESCAPE_CODE, 0, 1, 2],
+        &[0, 1, 2],
+        &[ESCAPE_CODE, ESCAPE_CODE, 0, 1, 2],
+    ];
+    let mut all_bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0u32);
+    for row in rows {
+        all_bytes.extend_from_slice(row);
+        offsets.push(u32::try_from(all_bytes.len()).expect("test data fits in u32"));
+    }
+
+    let bits = dfa.scan_to_bitbuf(4, &offsets, &all_bytes, false);
+    assert!(
+        !bits.value(0),
+        "escape-literal candidate phantom-accepted (escape run at row start)"
+    );
+    assert!(
+        !bits.value(1),
+        "escape-literal candidate phantom-accepted (escape run mid-row)"
+    );
+    assert!(bits.value(2), "true all-code match lost");
+    assert!(
+        bits.value(3),
+        "match after even escape run lost — parity walk-back dropped a real boundary"
+    );
+
+    let negated = dfa.scan_to_bitbuf(4, &offsets, &all_bytes, true);
+    assert!(negated.value(0));
+    assert!(negated.value(1));
+    assert!(!negated.value(2));
+    assert!(!negated.value(3));
+
+    Ok(())
+}
+
+/// Same phantom class through the Teddy pair scan (2-code needle folding).
+#[test]
+fn test_folded_contains_pair_teddy_drops_escape_literal_candidates() -> VortexResult<()> {
+    // Codes 0="ab", 1="cd"; the needle's all-code folding is [0, 1].
+    let symbols = [sym(b"ab"), sym(b"cd"), sym(b"zz")];
+    let lengths = [2u8, 2, 2];
+    let dfa = FoldedContainsDfa::new(&symbols, &lengths, b"abcd", false)?;
+    assert!(
+        dfa.scan_plan_name().starts_with("pair_streaming")
+            || dfa.scan_plan_name().starts_with("triple_streaming"),
+        "construction must exercise a Teddy scan, got {:?}",
+        dfa.scan_plan_name()
+    );
+
+    // Row 0 (phantom): [ESC, 0, 1] = "\x00cd" — offset 1 misread as code 0.
+    // Row 1 (phantom, escape mid-row): [2, ESC, 0, 1] = "zz\x00cd".
+    // Row 2 (true match): [0, 1] = "abcd".
+    // Row 3 (true match after literal-255): [ESC, ESC, 0, 1] = "\xffabcd".
+    let rows: [&[u8]; 4] = [
+        &[ESCAPE_CODE, 0, 1],
+        &[2, ESCAPE_CODE, 0, 1],
+        &[0, 1],
+        &[ESCAPE_CODE, ESCAPE_CODE, 0, 1],
+    ];
+    let mut all_bytes = Vec::new();
+    let mut offsets = Vec::with_capacity(rows.len() + 1);
+    offsets.push(0u32);
+    for row in rows {
+        all_bytes.extend_from_slice(row);
+        offsets.push(u32::try_from(all_bytes.len()).expect("test data fits in u32"));
+    }
+
+    let bits = dfa.scan_to_bitbuf(4, &offsets, &all_bytes, false);
+    assert!(
+        !bits.value(0),
+        "escape-literal candidate phantom-accepted (escape run at row start)"
+    );
+    assert!(
+        !bits.value(1),
+        "escape-literal candidate phantom-accepted (escape run mid-row)"
+    );
+    assert!(bits.value(2), "true all-code match lost");
+    assert!(
+        bits.value(3),
+        "match after even escape run lost — parity walk-back dropped a real boundary"
+    );
+
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // MultiContainsDfa unit tests
 // ---------------------------------------------------------------------------
