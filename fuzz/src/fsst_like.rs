@@ -35,17 +35,42 @@ use crate::error::VortexFuzzResult;
 static SESSION: LazyLock<VortexSession> =
     LazyLock::new(|| VortexSession::empty().with::<ArraySession>());
 
-/// A random string from a small alphabet (`a..=h`) with bounded length.
+/// A random string from a mixed alphabet with bounded length.
+///
+/// Mostly a dense lowercase core (`a..=h`) so FSST training still produces a
+/// rich symbol table, salted with uppercase, punctuation, and high codepoints.
+/// The salt classes are rare enough that FSST *escapes* them rather than coding
+/// them, which is what makes the escape-boundary bug class reachable: an escape
+/// literal whose byte value collides with a symbol code can be misread as that
+/// code by a scan that ignores code boundaries (the ClickBench `%ure%`
+/// phantom-accept class). The previous all-lowercase `a..=h` alphabet could
+/// never produce an escape, so that entire class was structurally unfuzzable.
+/// LIKE metacharacters (`%`, `_`, `\`) are excluded so a needle embedded in
+/// `%{needle}%` keeps its intended shape.
 #[derive(Debug)]
-struct SmallAlphabetString {
+struct MixedAlphabetString {
     max_len: usize,
 }
 
-impl SmallAlphabetString {
+/// Escape-prone ASCII salt (no LIKE metacharacters).
+const PUNCTUATION: &[char] = &['.', '/', ':', '-', '=', '?', '&', '+', ';'];
+
+impl MixedAlphabetString {
     fn generate(&self, u: &mut Unstructured<'_>) -> arbitrary::Result<String> {
         let len: usize = u.int_in_range(0..=self.max_len)?;
         (0..len)
-            .map(|_| Ok(u.int_in_range(b'a'..=b'h')? as char))
+            .map(|_| {
+                Ok(match u.int_in_range(0u8..=9)? {
+                    // Dense core: frequent enough to train real FSST symbols.
+                    0..=6 => u.int_in_range(b'a'..=b'h')? as char,
+                    7 => u.int_in_range(b'A'..=b'H')? as char,
+                    8 => *u.choose(PUNCTUATION)?,
+                    // High codepoints; each encodes to two UTF-8 bytes, both
+                    // outside the trained core, so FSST escapes them.
+                    _ => char::from_u32(u.int_in_range(0x80u32..=0xFF)?)
+                        .ok_or(arbitrary::Error::IncorrectFormat)?,
+                })
+            })
             .collect()
     }
 }
@@ -61,12 +86,12 @@ pub struct FuzzFsstLike {
 impl<'a> Arbitrary<'a> for FuzzFsstLike {
     fn arbitrary(u: &mut Unstructured<'a>) -> arbitrary::Result<Self> {
         let n_strings: usize = u.int_in_range(1..=200)?;
-        let str_gen = SmallAlphabetString { max_len: 512 };
+        let str_gen = MixedAlphabetString { max_len: 512 };
         let strings: Vec<String> = (0..n_strings)
             .map(|_| str_gen.generate(u))
             .collect::<arbitrary::Result<_>>()?;
 
-        let needle = SmallAlphabetString { max_len: 254 }.generate(u)?;
+        let needle = MixedAlphabetString { max_len: 254 }.generate(u)?;
 
         let pattern = match u.int_in_range(0..=2)? {
             0 => format!("{needle}%"),  // prefix
@@ -173,4 +198,34 @@ fn run_like_on_array(
         .into_array()
         .execute::<Canonical>(&mut SESSION.create_execution_ctx())?;
     Ok(result.into_bool())
+}
+
+#[cfg(test)]
+mod known_bugs {
+    use super::*;
+
+    /// KNOWN BUG (found by this fuzzer, 2026-07-02): the folded-contains Teddy
+    /// scan misses a match that enters mid-symbol. Here FSST trains
+    /// `code 0 = "cccc"` and the needle's only realization in the code stream
+    /// is `[0, 1, 3]` (suffix "cc" of code 0, then "c", then "e") — the DFA
+    /// verifier accepts it (`FsstMatcher::matches` on the same codes returns
+    /// true) but the triple/pair-fallback bucketing never emits a candidate at
+    /// that position, so the scan path returns false. A false NEGATIVE in
+    /// candidate generation: independent of the escape-boundary phantom-accept
+    /// (present with and without that fix), and not escape-related.
+    /// Un-ignore once the bucketing is fixed.
+    #[test]
+    #[ignore = "known false-negative in folded-contains Teddy bucketing (mid-symbol entry)"]
+    fn undercount_ccce_mid_symbol_entry() {
+        let fuzz = FuzzFsstLike {
+            strings: vec![
+                String::new(),
+                String::new(),
+                "ghcccccccccecceeeehhggeebaaaeceeece".to_string(),
+            ],
+            pattern: "%ccce%".to_string(),
+            negated: false,
+        };
+        run_fsst_like_fuzz(fuzz).unwrap();
+    }
 }
