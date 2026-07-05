@@ -1,4 +1,4 @@
-// Standalone nvCOMP hardware-decompression-engine baseline (Deflate + LZ4).
+// Standalone nvCOMP hardware-decompression-engine baseline (Deflate + LZ4 + Snappy).
 // Compresses a raw byte file with nvCOMP, then times decompression on the
 // dedicated hardware Decompression Engine (backend=HARDWARE). Reports decode
 // GiB/s over the *uncompressed* bytes (directly comparable to OnPair decode).
@@ -38,6 +38,7 @@
 #include <cuda_runtime.h>
 #include <nvcomp/deflate.h>
 #include <nvcomp/lz4.h>
+#include <nvcomp/snappy.h>
 
 #define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 #define NK(x) do{ nvcompStatus_t s=(x); if(s!=nvcompSuccess){ fprintf(stderr,"nvcomp %s:%d status=%d\n",__FILE__,__LINE__,(int)s); exit(1);} }while(0)
@@ -225,6 +226,21 @@ static void run_all_codecs(std::vector<unsigned char>& host, size_t chunk,
             nvcompBatchedLZ4CompressAsync, nvcompBatchedLZ4DecompressGetTempSizeAsync,
             nvcompBatchedLZ4DecompressAsync);
         names.push_back("LZ4");
+        results.push_back(std::move(r));
+    }
+
+    // Snappy: the remaining HW-engine codec family. Same single-pass, no-level
+    // shape as LZ4; `run` marks the config invalid if the engine rejects it.
+    nvcompBatchedSnappyDecompressOpts_t sdo = nvcompBatchedSnappyDecompressDefaultOpts;
+    sdo.backend = NVCOMP_DECOMPRESS_BACKEND_HARDWARE;
+    {
+        CodecResult r;
+        run<nvcompBatchedSnappyCompressOpts_t,nvcompBatchedSnappyDecompressOpts_t>(
+            "Snappy", host, chunk, nvcompBatchedSnappyCompressDefaultOpts, sdo, r,
+            nvcompBatchedSnappyCompressGetTempSizeAsync, nvcompBatchedSnappyCompressGetMaxOutputChunkSize,
+            nvcompBatchedSnappyCompressAsync, nvcompBatchedSnappyDecompressGetTempSizeAsync,
+            nvcompBatchedSnappyDecompressAsync);
+        names.push_back("Snappy");
         results.push_back(std::move(r));
     }
 }
