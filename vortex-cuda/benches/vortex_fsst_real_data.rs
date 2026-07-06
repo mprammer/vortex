@@ -171,6 +171,111 @@ fn build_varbin(
     }
 }
 
+/// Collect the raw (uncompressed) bytes of a string column, in the same build
+/// order as `build_varbin`, capped to `row_cap` rows. Used only by the dump
+/// hook below.
+fn collect_strings(
+    batches: &[arrow_array::RecordBatch],
+    col_idx: usize,
+    row_cap: usize,
+) -> Vec<Vec<u8>> {
+    let mut out: Vec<Vec<u8>> = Vec::with_capacity(row_cap);
+    for b in batches {
+        if out.len() >= row_cap {
+            break;
+        }
+        let col = b.column(col_idx);
+        macro_rules! push {
+            ($t:ty) => {{
+                let s = col.as_any().downcast_ref::<$t>().unwrap();
+                for i in 0..s.len() {
+                    if out.len() >= row_cap {
+                        break;
+                    }
+                    out.push(s.value(i).as_bytes().to_vec());
+                }
+            }};
+        }
+        if col.as_any().is::<arrow_array::StringArray>() {
+            push!(arrow_array::StringArray);
+        } else if col.as_any().is::<arrow_array::LargeStringArray>() {
+            push!(arrow_array::LargeStringArray);
+        } else if col.as_any().is::<arrow_array::StringViewArray>() {
+            push!(arrow_array::StringViewArray);
+        }
+    }
+    out
+}
+
+/// Env-gated dump of the tree's FSST encoding of one column, for the standalone
+/// `fsst_scan.cu` bench (the FSST analog of `ONPAIR_DUMP_E2E` in onpair_bench).
+/// Encodes with the SAME encoder the GPU path uses (`fsst_train_compressor` +
+/// per-string `Compressor::compress`), so the standalone decodes byte-identical
+/// data. Format (little-endian):
+///   "FST1" | num_strings:u64 | num_input_bytes:u64 | num_symbols:u32
+///          | symbols[num_symbols]:u64 | symbol_lengths[num_symbols]:u8
+///          | codes_bytes:u8 | codes_offsets[num_strings+1]:u64
+///          | output_offsets[num_strings+1]:u64
+fn dump_fsst(path: &std::path::Path, strings: &[Vec<u8>]) -> anyhow::Result<()> {
+    use std::io::Write;
+
+    // Train on the column itself (same corpus the GPU path trains on).
+    let refs: Vec<&[u8]> = strings.iter().map(|s| s.as_slice()).collect();
+    let dtype = DType::Utf8(Nullability::NonNullable);
+    let vbn = VarBinArray::from_iter(refs.iter().map(|s| Some(*s)), dtype);
+    let compressor = fsst_train_compressor(&vbn);
+
+    let symbols = compressor.symbol_table();
+    let symbol_lengths = compressor.symbol_lengths();
+    assert_eq!(
+        symbols.len(),
+        symbol_lengths.len(),
+        "symbol table / lengths length mismatch"
+    );
+    assert!(symbols.len() <= 255, "symbol table > 255 entries");
+    let num_symbols = symbols.len() as u32;
+
+    let mut codes_bytes: Vec<u8> = Vec::new();
+    let mut codes_offsets: Vec<u64> = vec![0];
+    let mut output_offsets: Vec<u64> = vec![0];
+    for s in strings {
+        let c = compressor.compress(s);
+        codes_bytes.extend_from_slice(&c);
+        codes_offsets.push(codes_bytes.len() as u64);
+        let last = *output_offsets.last().unwrap();
+        output_offsets.push(last + s.len() as u64);
+    }
+
+    let file = std::fs::File::create(path)?;
+    let mut w = std::io::BufWriter::new(file);
+    w.write_all(b"FST1")?;
+    w.write_all(&(strings.len() as u64).to_le_bytes())?;
+    w.write_all(&(codes_bytes.len() as u64).to_le_bytes())?;
+    w.write_all(&num_symbols.to_le_bytes())?;
+    for sym in symbols {
+        w.write_all(&sym.to_u64().to_le_bytes())?;
+    }
+    w.write_all(symbol_lengths)?;
+    w.write_all(&codes_bytes)?;
+    for o in &codes_offsets {
+        w.write_all(&o.to_le_bytes())?;
+    }
+    for o in &output_offsets {
+        w.write_all(&o.to_le_bytes())?;
+    }
+    w.flush()?;
+
+    eprintln!(
+        "FSST_DUMP: wrote {} ({} strings, {} code bytes, {} symbols, {} decoded bytes)",
+        path.display(),
+        strings.len(),
+        codes_bytes.len(),
+        num_symbols,
+        output_offsets.last().unwrap(),
+    );
+    Ok(())
+}
+
 #[derive(Debug, Clone)]
 struct ColResult {
     name: String,
@@ -335,6 +440,18 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         let Some(vbn) = build_varbin(&batches, col_idx, row_cap) else {
             continue;
         };
+        // Env-gated dump for the standalone fsst_scan.cu bench. Writes one file
+        // per eligible column as `<FSST_DUMP>.<column>.fsstbin`, then skips the
+        // criterion bench (dumping and benching are separate use-cases). Pick
+        // the target column by its emitted filename, e.g. l_comment.
+        if let Ok(dump_base) = env::var("FSST_DUMP") {
+            let strings = collect_strings(&batches, col_idx, row_cap);
+            let out = PathBuf::from(format!("{dump_base}.{}.fsstbin", field.name()));
+            if let Err(e) = dump_fsst(&out, &strings) {
+                println!("[vortex-fsst-real-data]   FSST_DUMP failed for {}: {e}", field.name());
+            }
+            continue;
+        }
         let iters: u64 = if raw_bytes < 10_000_000 {
             50
         } else if raw_bytes < 100_000_000 {
