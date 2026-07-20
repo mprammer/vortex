@@ -727,59 +727,10 @@ fn bench_column(
         });
     }
 
-    // Byte-exact direct-store counterfactual for 4tpt: same gather and scans,
-    // but no shared staging or aligned global drain.
-    {
-        let total_chunks_128 = total_tokens.div_ceil(128);
-        let cfg_4tpt = LaunchConfig {
-            grid_dim: (
-                u32::try_from(total_chunks_128.div_ceil(warps as usize)).unwrap(),
-                1,
-                1,
-            ),
-            block_dim: (warps * 32, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let timed = TimedLaunchStrategy::default();
-        let timer = timed.timer();
-        let mut bench_ctx = CudaSession::create_execution_ctx(&VortexSession::empty())?
-            .with_launch_strategy(Arc::new(timed));
-        let function = bench_ctx.load_function("onpair_shmem_4tpt_directstore", &[])?;
-        for _ in 0..2 {
-            bench_ctx.launch_kernel_config(&function, cfg_4tpt, total_tokens, |args| {
-                args.arg(&codes_v)
-                    .arg(&chunk_offsets_128_v)
-                    .arg(&dict_padded_v)
-                    .arg(&lens_v)
-                    .arg(&output_v)
-                    .arg(&total_tokens_u64);
-            })?;
-        }
-        timer.store(0, Ordering::Relaxed);
-        for _ in 0..iters {
-            bench_ctx.launch_kernel_config(&function, cfg_4tpt, total_tokens, |args| {
-                args.arg(&codes_v)
-                    .arg(&chunk_offsets_128_v)
-                    .arg(&dict_padded_v)
-                    .arg(&lens_v)
-                    .arg(&output_v)
-                    .arg(&total_tokens_u64);
-            })?;
-        }
-        let kernel_time_ms = (timer.load(Ordering::Relaxed) as f64) / 1_000_000.0 / iters as f64;
-        results.push(ColResult {
-            name: format!("{name} [4tpt-directstore]"),
-            rows,
-            raw_bytes,
-            compressed_bytes,
-            ratio,
-            tokens: total_tokens,
-            dict_entries,
-            avg_token_len,
-            kernel_time_ms,
-            throughput_gib_s: to_gib_s(kernel_time_ms),
-        });
-    }
+    // (E3 directstore is timed only on the gold-min gpu-decode path in
+    // vortex-bench/onpair_bench.rs, not here: this criterion bench reports a mean
+    // (accumulated timer / iters), which is not comparable to the paper's min
+    // estimator. Keeping a single directstore timing path avoids that mismatch.)
 
     // s8_8tpt: stride-8 + 8 tokens per thread (256 tokens per warp).
     if pad_to_8 {

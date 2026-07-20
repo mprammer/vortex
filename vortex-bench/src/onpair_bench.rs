@@ -1759,13 +1759,19 @@ async fn run_gpu_kernel_bench(
         // when validation is on, any kernel that failed the byte-exact check. This keeps
         // `best` a real shipped, byte-exact kernel even without `--gpu-validate`, matching
         // the paper's "every reported rate is byte-exact verified" claim.
+        //
+        // Also exclude `*directstore*`: it is byte-exact but is the E3 drain
+        // counterfactual (exact-length disjoint global stores, no staged drain), not a
+        // shipped kernel. It is consumed only via its own named row; letting it into the
+        // generic `best` would leak an experimental baseline into the paper's shipped cells.
         .filter(|r| {
             r.applicable
                 && !r.kernel.contains("ablate")
+                && !r.kernel.contains("directstore")
                 && (!config.validate || r.verified == Some(true))
         })
         .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
-        .context("no applicable non-ablate CUDA OnPair kernels")?;
+        .context("no applicable shipped (non-ablate, non-directstore) CUDA OnPair kernels")?;
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.
