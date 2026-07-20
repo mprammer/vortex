@@ -278,6 +278,26 @@ fn onpair_shmem_4tpt_matches_host_decode() {
     assert_eq!(actual, expected);
 }
 
+/// The direct-store drain counterfactual remains byte-exact while avoiding the
+/// production kernel's shared-memory staging and aligned global drain.
+#[vortex_cuda_macros::test]
+fn onpair_shmem_4tpt_directstore_matches_host_decode() {
+    let (padded, lens) = build_test_dict();
+    // Crosses two full chunks and leaves a partial third, exercising inactive
+    // lanes and every direct-store byte ladder length used by this test dict.
+    let codes = build_test_codes(300);
+    let expected = host_decode(&codes, &lens, &padded);
+    let actual = launch_variant(
+        "onpair_shmem_4tpt_directstore",
+        128,
+        &codes,
+        &padded,
+        &lens,
+        expected.len() as u64,
+    );
+    assert_eq!(actual, expected);
+}
+
 #[vortex_cuda_macros::test]
 fn onpair_shmem_const1_matches_host_decode() {
     let dict = [b'A', b'B', b'C', b'D'];

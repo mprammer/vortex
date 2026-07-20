@@ -327,6 +327,7 @@ fn candidates_for(stride: usize) -> &'static [(&'static str, usize, u32)] {
             ("onpair_shmem", 32, 16),
             ("onpair_shmem_2tpt", 64, 16),
             ("onpair_shmem_4tpt", 128, 16),
+            ("onpair_shmem_4tpt_directstore", 128, 16),
         ],
         8 => &[
             ("onpair_shmem_s8", 32, 16),

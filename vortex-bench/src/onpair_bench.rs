@@ -1294,6 +1294,14 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
     },
+    // Byte-exact counterfactual for the staged aligned drain: retain the
+    // 4tpt decode and scan, but store each token's true-length bytes directly.
+    KernelVariant {
+        name: "onpair_shmem_4tpt_directstore",
+        layout: KernelLayout::Stride16,
+        chunk_size: 128,
+        block_warps: 16,
+    },
     KernelVariant {
         name: "onpair_shmem_4tpt_wpb8",
         layout: KernelLayout::Stride16,
