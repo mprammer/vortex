@@ -46,6 +46,7 @@ vortex-io = { workspace = true }
 vortex-layout = { workspace = true }
 vortex-mask = { workspace = true }
 vortex-metrics = { workspace = true }
+vortex-onpair = { workspace = true, optional = true }
 vortex-pco = { workspace = true }
 vortex-runend = { workspace = true }
 vortex-scan = { workspace = true }
@@ -69,6 +70,8 @@ workspace = true
 
 [features]
 object_store = ["dep:object_store", "vortex-io/object_store", "tokio"]
+# OnPair short-string compression (see vortex-btrblocks for build details).
+onpair = ["dep:vortex-onpair", "vortex-btrblocks/onpair"]
 tokio = [
     "dep:tokio",
     "vortex-error/tokio",

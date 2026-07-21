@@ -30,6 +30,7 @@ vortex-error = { workspace = true }
 vortex-fastlanes = { workspace = true }
 vortex-fsst = { workspace = true }
 vortex-mask = { workspace = true }
+vortex-onpair = { workspace = true, optional = true }
 vortex-pco = { workspace = true, optional = true }
 vortex-runend = { workspace = true }
 vortex-sequence = { workspace = true }
@@ -49,6 +50,10 @@ vortex-session = { workspace = true }
 [features]
 # This feature enabled unstable encodings for which we don't guarantee stability.
 unstable_encodings = ["dep:vortex-tensor", "vortex-zstd?/unstable_encodings"]
+# OnPair short-string compression. Pulls in a C++ build dependency (CMake +
+# C++20). Off by default so wasm / minimal-deps builds work; the umbrella
+# `vortex` crate enables it in its own defaults.
+onpair = ["dep:vortex-onpair"]
 pco = ["dep:pco", "dep:vortex-pco"]
 zstd = ["dep:vortex-zstd"]
 
