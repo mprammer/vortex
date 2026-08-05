@@ -100,6 +100,7 @@ impl SplitRange {
 /// starts a new run. A run that exactly repeats the previous surviving run — common when sibling
 /// columns share chunk boundaries — is dropped as it completes, and the final sort is skipped
 /// when only a single run survives (the boundaries are then already ascending).
+#[derive(Default)]
 pub struct RowSplits {
     splits: Vec<u64>,
     /// Start index of the run currently being appended.
@@ -162,8 +163,14 @@ impl RowSplits {
         self.splits.reserve(additional);
     }
 
-    /// Create a new RowSplits with preallocated "capacity"
-    pub(crate) fn new_capacity(capacity: usize) -> Self {
+    /// Create a `RowSplits` with room for `capacity` row boundaries.
+    ///
+    /// Public so an out-of-tree [`LayoutReader`] can build one. `register_splits` hands a reader a
+    /// `RowSplits` to push into, but a reader that delegates to a child in a *different coordinate
+    /// space* has to build its own — Vortex's list layout reader does exactly that for
+    /// element-coordinate splits, and a third-party reader over a nested format needs the same move.
+    /// [`Default`] covers the case where the count is not known ahead of time.
+    pub fn with_capacity(capacity: usize) -> Self {
         Self {
             splits: Vec::with_capacity(capacity),
             run_start: 0,
@@ -171,7 +178,12 @@ impl RowSplits {
         }
     }
 
-    pub(crate) fn into_sorted_deduped(mut self) -> Vec<u64> {
+    /// Consume the collected boundaries and return them in ascending order without duplicates.
+    ///
+    /// This completes the lifecycle started by [`with_capacity`](Self::with_capacity) for readers
+    /// that collect a child's boundaries in a different coordinate space before translating them
+    /// into the parent reader's [`RowSplits`].
+    pub fn into_sorted_deduped(mut self) -> Vec<u64> {
         let final_run_dropped = self.drop_repeated_run();
         // Surviving runs always have a descent between them, so the boundaries are ascending
         // iff a single run survived: no run before the final one (`prev_run_start == 0`) and
@@ -413,7 +425,7 @@ mod tests {
     // No pushes at all.
     #[case(vec![])]
     fn into_sorted_deduped_matches_model(#[case] runs: Vec<Vec<u64>>) {
-        let mut splits = RowSplits::new_capacity(16);
+        let mut splits = RowSplits::with_capacity(16);
         let mut model = Vec::new();
         for run in &runs {
             for &row in run {
@@ -424,5 +436,23 @@ mod tests {
         model.sort_unstable();
         model.dedup();
         assert_eq!(splits.into_sorted_deduped(), model);
+    }
+
+    /// `with_capacity` and `Default` must agree on behaviour, differing only in allocation.
+    ///
+    /// Both are now public, and a divergence would make the resulting boundaries depend on how the
+    /// collection was created.
+    #[test]
+    fn with_capacity_matches_default_behaviour() {
+        let mut preallocated = RowSplits::with_capacity(16);
+        let mut defaulted = RowSplits::default();
+        for row in [7, 9, 2, 9] {
+            preallocated.push(row);
+            defaulted.push(row);
+        }
+        assert_eq!(
+            preallocated.into_sorted_deduped(),
+            defaulted.into_sorted_deduped()
+        );
     }
 }

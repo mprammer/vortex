@@ -368,7 +368,7 @@ impl LayoutReader for ListReader {
 
         let element_row_count = self.elements.row_count();
         if element_row_count != 0 {
-            let mut element_splits = RowSplits::new_capacity(128);
+            let mut element_splits = RowSplits::with_capacity(128);
             self.elements.register_splits(
                 &[FieldMask::All],
                 &SplitRange::root(0..element_row_count)?,
