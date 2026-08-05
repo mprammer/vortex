@@ -84,8 +84,16 @@ impl AggregateSpecProto {
     }
 }
 
-/// Return the auxiliary stats-table schema for a zoned layout.
-pub(crate) fn aggregate_stats_table_dtype(
+/// Return the format-defining auxiliary stats-table dtype for a zoned layout.
+///
+/// Supported aggregates contribute nullable fields in input order, named by the aggregate's
+/// display representation; unsupported aggregates are omitted. A scalar [`Sum`] stores its return
+/// dtype, while other aggregates store their state dtype. Extension dtypes fall back to their
+/// storage dtype when the aggregate does not support the extension directly.
+///
+/// Zoned-layout writers and readers must derive the auxiliary child dtype with this function so
+/// that the stored fields, names, and order agree exactly.
+pub fn aggregate_stats_table_dtype(
     column_dtype: &DType,
     aggregate_fns: &[AggregateFnRef],
 ) -> DType {
@@ -204,9 +212,11 @@ pub(crate) fn default_bounded_stat_max_bytes() -> std::num::NonZeroUsize {
 #[cfg(test)]
 mod tests {
     use vortex_array::aggregate_fn::AggregateFnVTableExt;
+    use vortex_array::aggregate_fn::EmptyOptions;
     use vortex_array::aggregate_fn::NumericalAggregateOpts;
     use vortex_array::aggregate_fn::fns::max::Max;
     use vortex_array::aggregate_fn::fns::min::Min;
+    use vortex_array::aggregate_fn::fns::nan_count::NanCount;
     use vortex_array::aggregate_fn::fns::sum::Sum;
     use vortex_array::aggregate_fn::fns::sum::SumAggregateOpts;
     use vortex_array::dtype::DType;
@@ -286,6 +296,34 @@ mod tests {
                 Min.bind(NumericalAggregateOpts::skip_nans()).to_string(),
                 Sum.bind(SumAggregateOpts::skip_nans()).to_string(),
             ]
+        );
+    }
+
+    #[test]
+    fn aggregate_stats_table_dtype_omits_unsupported_aggregates() {
+        let nan_count = NanCount.bind(EmptyOptions);
+        let dtype = aggregate_stats_table_dtype(
+            &DType::Primitive(PType::I32, Nullability::NonNullable),
+            &[nan_count],
+        );
+
+        assert_eq!(dtype.as_struct_fields().nfields(), 0);
+    }
+
+    #[test]
+    fn aggregate_stats_table_dtype_falls_back_to_extension_storage() {
+        let column_dtype =
+            DType::Extension(Date::new(TimeUnit::Days, Nullability::NonNullable).erased());
+        let sum = Sum.bind(SumAggregateOpts::default());
+        let expected = sum
+            .state_dtype(column_dtype.as_extension().storage_dtype())
+            .expect("sum supports the date extension's integer storage dtype")
+            .as_nullable();
+        let dtype = aggregate_stats_table_dtype(&column_dtype, std::slice::from_ref(&sum));
+
+        assert_eq!(
+            dtype.as_struct_fields().field(sum.to_string()),
+            Some(expected)
         );
     }
 
