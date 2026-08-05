@@ -14,7 +14,11 @@ use itertools::Itertools;
 use vortex_array::ArrayRef;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::FieldMask;
+use vortex_array::dtype::FieldPath;
 use vortex_array::expr::Expression;
+use vortex_array::expr::stats::Precision;
+use vortex_array::expr::stats::Stat;
+use vortex_array::stats::StatsSet;
 use vortex_buffer::ByteBuffer;
 use vortex_error::VortexResult;
 use vortex_layout::LayoutReader;
@@ -22,7 +26,11 @@ use vortex_layout::scan::layout::LayoutReaderDataSource;
 use vortex_layout::scan::scan_builder::ScanBuilder;
 use vortex_layout::scan::split_by::SplitBy;
 use vortex_layout::segments::SegmentSource;
+use vortex_scan::DataSource;
 use vortex_scan::DataSourceRef;
+use vortex_scan::DataSourceScanRef;
+use vortex_scan::PartitionRef;
+use vortex_scan::ScanRequest;
 use vortex_session::VortexSession;
 use vortex_utils::aliases::hash_map::HashMap;
 
@@ -203,13 +211,20 @@ impl VortexFile {
     ///
     /// Wraps the file's layout reader with [`FileStatsLayoutReader`] (when file-level
     /// statistics are available) and [`LayoutReaderDataSource`].
+    ///
+    /// The result answers [`DataSource::field_statistics`] from the footer.
+    /// [`LayoutReaderDataSource`] cannot: a layout reader alone has no route to the file's statistics
+    /// segment, so it returns an empty [`StatsSet`] for every field. That is why a query answerable
+    /// purely from metadata — `SELECT MIN(c), MAX(c)`, say — otherwise reads the column in full even
+    /// though the bounds were in the footer the whole time.
     pub fn data_source(&self) -> VortexResult<DataSourceRef> {
         let reader = self.layout_reader()?;
 
-        Ok(Arc::new(LayoutReaderDataSource::new(
-            reader,
-            self.session.clone(),
-        )))
+        Ok(Arc::new(FileDataSource {
+            inner: LayoutReaderDataSource::new(reader, self.session.clone()),
+            statistics: self.footer.statistics().cloned(),
+            dtype: self.footer.dtype().clone(),
+        }))
     }
 
     /// Initiate a scan of the file, returning a builder for projection, filtering, selection, and
@@ -255,5 +270,122 @@ impl VortexFile {
             .tuple_windows()
             .map(|(start, end)| start..end)
             .collect())
+    }
+}
+
+/// A [`DataSource`] over a Vortex file that can answer per-field statistics from the footer.
+///
+/// Scanning is delegated to [`LayoutReaderDataSource`]; this wrapper adds
+/// [`field_statistics`](DataSource::field_statistics) because the footer, not the layout reader,
+/// owns the file-level [`StatsSet`] values.
+struct FileDataSource {
+    inner: LayoutReaderDataSource,
+    /// The file's per-field statistics, absent for a file written without them.
+    statistics: Option<FileStatistics>,
+    /// The file's (unprojected) dtype, used to resolve a field name to a statistics index.
+    dtype: DType,
+}
+
+#[async_trait::async_trait]
+impl DataSource for FileDataSource {
+    fn dtype(&self) -> &DType {
+        self.inner.dtype()
+    }
+
+    fn row_count(&self) -> Precision<u64> {
+        self.inner.row_count()
+    }
+
+    fn byte_size(&self) -> Precision<u64> {
+        self.inner.byte_size()
+    }
+
+    fn serialize(&self) -> VortexResult<Option<Vec<u8>>> {
+        self.inner.serialize()
+    }
+
+    fn deserialize_partition(
+        &self,
+        data: &[u8],
+        session: &VortexSession,
+    ) -> VortexResult<PartitionRef> {
+        self.inner.deserialize_partition(data, session)
+    }
+
+    async fn scan(&self, scan_request: ScanRequest) -> VortexResult<DataSourceScanRef> {
+        self.inner.scan(scan_request).await
+    }
+
+    async fn field_statistics(&self, field_path: &FieldPath) -> VortexResult<StatsSet> {
+        let Some(statistics) = &self.statistics else {
+            return Ok(StatsSet::default());
+        };
+
+        // File statistics are recorded per top-level field, so only a single-component path can be
+        // answered. A nested path is not wrong to ask about, there is simply nothing recorded for it.
+        let [field] = field_path.parts() else {
+            return Ok(StatsSet::default());
+        };
+        let Some(name) = field.as_name() else {
+            return Ok(StatsSet::default());
+        };
+        let Some(fields) = self.dtype.as_struct_fields_opt() else {
+            return Ok(StatsSet::default());
+        };
+        // Resolved by name, so an ambiguous name must not be resolved at all.
+        //
+        // Duplicate field names are legal in a struct dtype, and `position` would silently hand back
+        // the first match — publishing one field's bounds for another. When the two happen to share
+        // a dtype nothing downstream can detect the substitution, and these bounds are exact enough
+        // for DataFusion to rewrite an aggregate into a literal on. An absent statistic costs an
+        // optimisation; a confidently wrong one costs a correct answer.
+        let mut matches = fields
+            .names()
+            .iter()
+            .zip(fields.fields())
+            .enumerate()
+            .filter(|(_, (field_name, _))| field_name.as_ref() == name);
+        let Some((idx, (_, field_dtype))) = matches.next() else {
+            return Ok(StatsSet::default());
+        };
+        if matches.next().is_some() {
+            return Ok(StatsSet::default());
+        }
+        let Some(stats) = statistics.stats_sets().get(idx) else {
+            return Ok(StatsSet::default());
+        };
+
+        // The dtype is taken from the FILE's own field list, not from the statistics sidecar.
+        //
+        // `FileStatistics::get` returns a dtype alongside each set, but public construction allows
+        // that to disagree with the file dtype this lookup resolved against. Deciding "is this a
+        // float?" from the sidecar would let a mismatched one steer the gate below and publish exact
+        // extrema for a float column. The authoritative answer is the field we actually matched.
+        let mut stats = stats.clone();
+
+        // Extrema whose NaN semantics differ from DataFusion's are withheld unless the column is
+        // provably NaN-free.
+        //
+        // Vortex computes MIN/MAX and SUM skipping NaNs, while DataFusion orders NaN as an ordinary
+        // value under Arrow's total order — where negative NaN sorts below every finite value and
+        // positive NaN above them. Over `[1.0, NaN]`, Vortex records a maximum of 1.0, so the only
+        // safe exact extrema are those accompanied by proof that the column contains no NaNs.
+        //
+        // Lists, structs, and extension storage are inspected recursively. `NaNCount` is not defined
+        // for NaN-bearing composite logical dtypes, so they remain unproven and their extrema are
+        // withheld rather than letting a floating leaf through unexamined.
+        if !stats.is_nan_free(&field_dtype) {
+            stats.clear(Stat::Min);
+            stats.clear(Stat::Max);
+        }
+
+        // A zero NaN count is not enough to make a floating SUM exact. Vortex adds sequentially,
+        // whereas Arrow/DataFusion use a differently parenthesised lane reduction. IEEE addition is
+        // non-associative even for finite values, so no floating footer sum is published.
+        if field_dtype.may_contain_nan() {
+            stats.clear(Stat::Sum);
+        }
+
+        Ok(stats)
     }
 }

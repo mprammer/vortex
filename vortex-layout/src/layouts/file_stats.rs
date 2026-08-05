@@ -160,6 +160,14 @@ impl StatsAccumulator {
                     // upper bound, so aggregating by skipping nulls would be unsound.
                     continue;
                 }
+                Stat::Sum if !values.all_valid(ctx)? => {
+                    // Exactly the same hazard, one stat over. A null per-chunk `Sum` means either
+                    // an empty chunk or a chunk whose sum overflowed its type, and summing the rest
+                    // skips it as though it were empty. For chunks `[i64::MAX, 1]` and `[7]` the
+                    // file would report 7 — and report it as exact, which is enough for a query
+                    // engine to answer `SUM(x)` with it.
+                    continue;
+                }
                 Stat::Min | Stat::Max | Stat::Sum => {
                     if let Some(s) = values.statistics().compute_stat(stat, ctx)?
                         && let Some(v) = s.into_value()
@@ -634,5 +642,20 @@ mod tests {
             .execute::<BoolArray>(&mut ctx)
             .unwrap();
         assert_eq!(field3_bool.to_bit_buffer(), BitBuffer::from(vec![false]));
+    }
+
+    #[test]
+    fn overflowed_chunk_sum_withholds_the_file_sum() -> VortexResult<()> {
+        let mut ctx = array_session().create_execution_ctx();
+        let overflowing = buffer![i64::MAX, 1i64].into_array();
+        let finite = buffer![7i64].into_array();
+        let mut acc = StatsAccumulator::new(overflowing.dtype(), &[Stat::Sum], 12);
+
+        acc.push_chunk(&overflowing, &mut ctx)?;
+        acc.push_chunk(&finite, &mut ctx)?;
+
+        let stats = acc.as_stats_set(&[Stat::Sum], &mut ctx)?;
+        assert_eq!(stats.get(Stat::Sum), Precision::Absent);
+        Ok(())
     }
 }

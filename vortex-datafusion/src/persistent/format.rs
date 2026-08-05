@@ -45,10 +45,8 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use vortex::VortexSessionDefault;
 use vortex::array::memory::MemorySessionExt;
+use vortex::array::stats::extrema_cast_is_value_preserving;
 use vortex::dtype::DType;
-use vortex::dtype::Nullability;
-use vortex::dtype::PType;
-use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
 use vortex::expr::stats::Precision;
@@ -70,7 +68,10 @@ use super::source::VortexSource;
 use crate::PrecisionExt as _;
 use crate::convert::ExpressionConvertor;
 use crate::convert::TryToDataFusion;
+use crate::convert::stats::bool_stat;
 use crate::convert::stats::is_constant_to_distinct_count;
+use crate::convert::stats::u64_precision_as_usize;
+use crate::convert::stats::u64_stat_as_usize;
 
 const DEFAULT_FOOTER_INITIAL_READ_SIZE_BYTES: usize = MAX_POSTSCRIPT_SIZE as usize + EOF_SIZE;
 
@@ -531,7 +532,10 @@ impl FileFormat for VortexFormat {
                     let inferred_schema = session.arrow().to_arrow_schema(vxf.dtype())?;
                     VortexResult::Ok((object.location, inferred_schema))
                 })
-                .map(|f| f.vortex_expect("Failed to spawn infer_schema"))
+                .map(|result| match result {
+                    Ok(result) => result,
+                    Err(error) => Err(vortex_err!("Failed to join infer_schema task: {error}")),
+                })
             })
             .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
             .try_collect::<Vec<_>>()
@@ -615,25 +619,21 @@ impl FileFormat for VortexFormat {
                 }
             };
 
-            let struct_dtype = dtype
-                .as_struct_fields_opt()
-                .vortex_expect("dtype is not a struct");
+            let row_count = u64_precision_as_usize(&Precision::Exact(row_count));
+            let unknown_statistics = || Statistics {
+                num_rows: row_count.to_df(),
+                total_byte_size: DFPrecision::Absent,
+                column_statistics: vec![ColumnStatistics::default(); table_schema.fields().len()],
+            };
+
+            let Some(struct_dtype) = dtype.as_struct_fields_opt() else {
+                return Ok(unknown_statistics());
+            };
 
             // Evaluate the statistics for each column that we are able to return to DataFusion.
             let Some(file_stats) = file_stats else {
                 // If the file has no column stats, the best we can do is return a row count.
-                return Ok(Statistics {
-                    num_rows: DFPrecision::Exact(
-                        usize::try_from(row_count)
-                            .map_err(|_| vortex_err!("Row count overflow"))
-                            .vortex_expect("Row count overflow"),
-                    ),
-                    total_byte_size: DFPrecision::Absent,
-                    column_statistics: vec![
-                        ColumnStatistics::default();
-                        table_schema.fields().len()
-                    ],
-                });
+                return Ok(unknown_statistics());
             };
 
             let mut column_statistics = Vec::with_capacity(table_schema.fields().len());
@@ -641,16 +641,28 @@ impl FileFormat for VortexFormat {
             for field in table_schema.fields().iter() {
                 // If the column does not exist, continue. This can happen if the schema has evolved
                 // but we have not yet updated the Vortex file.
-                let Some(col_idx) = struct_dtype.find(field.name()) else {
+                let mut matches = struct_dtype
+                    .names()
+                    .iter()
+                    .zip(struct_dtype.fields())
+                    .enumerate()
+                    .filter(|(_, (name, _))| name.as_ref() == field.name());
+                let Some((col_idx, (_, stats_dtype))) = matches.next() else {
                     // The default sets all statistics to `Precision<Absent>`.
                     column_statistics.push(ColumnStatistics::default());
                     continue;
                 };
-                let (stats_set, stats_dtype) = file_stats.get(col_idx);
+                if matches.next().is_some() {
+                    column_statistics.push(ColumnStatistics::default());
+                    continue;
+                }
+                let Some(stats_set) = file_stats.stats_sets().get(col_idx) else {
+                    column_statistics.push(ColumnStatistics::default());
+                    continue;
+                };
 
                 // Update the total size in bytes.
-                let column_size =
-                    stats_set.get_as::<usize>(Stat::UncompressedSizeInBytes, &PType::U64.into());
+                let column_size = u64_stat_as_usize(stats_set, Stat::UncompressedSizeInBytes);
 
                 let target_dtype =
                     session
@@ -662,21 +674,38 @@ impl FileFormat for VortexFormat {
                                 field.name()
                             ))
                         })?;
-                let min = scalar_stat_to_df(
-                    Stat::Min,
-                    stats_set.get(Stat::Min),
-                    stats_dtype,
-                    &target_dtype,
-                );
+                let (min, max) = if stats_set.is_nan_free(&stats_dtype) {
+                    (
+                        scalar_stat_to_df(
+                            Stat::Min,
+                            stats_set.get(Stat::Min),
+                            &stats_dtype,
+                            &target_dtype,
+                        ),
+                        scalar_stat_to_df(
+                            Stat::Max,
+                            stats_set.get(Stat::Max),
+                            &stats_dtype,
+                            &target_dtype,
+                        ),
+                    )
+                } else {
+                    (Precision::Absent, Precision::Absent)
+                };
+                let min = min
+                    .and_then(|value| (value.data_type() == *field.data_type()).then_some(value));
+                let max = max
+                    .and_then(|value| (value.data_type() == *field.data_type()).then_some(value));
 
-                let max = scalar_stat_to_df(
-                    Stat::Max,
-                    stats_set.get(Stat::Max),
-                    stats_dtype,
-                    &target_dtype,
-                );
-
-                let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
+                let null_count = u64_stat_as_usize(stats_set, Stat::NullCount);
+                let null_count = if matches!(
+                    (&null_count, &row_count),
+                    (Precision::Exact(nulls), Precision::Exact(rows)) if nulls > rows
+                ) {
+                    Precision::Absent
+                } else {
+                    null_count
+                };
 
                 column_statistics.push(ColumnStatistics {
                     null_count: null_count.to_df(),
@@ -684,10 +713,9 @@ impl FileFormat for VortexFormat {
                     max_value: max.to_df(),
                     sum_value: DFPrecision::Absent,
                     distinct_count: is_constant_to_distinct_count(
-                        stats_set.get_as::<bool>(
-                            Stat::IsConstant,
-                            &DType::Bool(Nullability::NonNullable),
-                        ),
+                        bool_stat(stats_set, Stat::IsConstant),
+                        &null_count,
+                        &row_count,
                     ),
                     byte_size: column_size.to_df(),
                 })
@@ -698,17 +726,13 @@ impl FileFormat for VortexFormat {
                 .fold(DFPrecision::Exact(0), |acc, cs| acc.add(&cs.byte_size));
 
             Ok(Statistics {
-                num_rows: DFPrecision::Exact(
-                    usize::try_from(row_count)
-                        .map_err(|_| vortex_err!("Row count overflow"))
-                        .vortex_expect("Row count overflow"),
-                ),
+                num_rows: row_count.to_df(),
                 total_byte_size,
                 column_statistics,
             })
         })
         .await
-        .vortex_expect("Failed to spawn infer_stats")
+        .map_err(|e| DataFusionError::Execution(format!("Failed to join infer_stats task: {e}")))?
     }
 
     async fn create_physical_plan(
@@ -768,15 +792,30 @@ fn scalar_stat_to_df(
     let Some(stat_dtype) = stat.dtype(stats_dtype) else {
         return Precision::Absent;
     };
+    if !extrema_cast_is_value_preserving(&stat_dtype, target_dtype) {
+        return Precision::Absent;
+    }
 
-    value
+    match value
         .map(|stat_value| {
             Scalar::try_new(stat_dtype, Some(stat_value))?
                 .cast(target_dtype)?
                 .try_to_df()
         })
         .transpose()
-        .unwrap_or(Precision::Absent)
+    {
+        Ok(value) => value,
+        Err(error) => {
+            tracing::warn!(
+                %stat,
+                %stats_dtype,
+                %target_dtype,
+                %error,
+                "ignoring malformed or incompatible Vortex statistic"
+            );
+            Precision::Absent
+        }
+    }
 }
 
 #[cfg(test)]
@@ -794,12 +833,79 @@ mod tests {
     use datafusion_physical_expr::expressions as df_expr;
     use datafusion_physical_expr::projection::ProjectionExprs;
     use datafusion_physical_plan::filter_pushdown::PushedDown;
+    use vortex::dtype::DecimalDType;
+    use vortex::dtype::Nullability;
+    use vortex::dtype::PType;
     use vortex::expr::Expression;
+    use vortex::extension::datetime::TimeUnit;
+    use vortex::extension::datetime::Timestamp;
+    use vortex::scalar::DecimalValue;
 
     use super::*;
     use crate::common_tests::TestSessionContext;
     use crate::convert::DefaultExpressionConvertor;
     use crate::convert::ProcessedProjection;
+
+    #[test]
+    fn exact_extrema_survive_only_value_preserving_schema_adaptation() {
+        let source = DType::Primitive(PType::I64, Nullability::NonNullable);
+        let target = source.as_nullable();
+        assert_eq!(
+            scalar_stat_to_df(
+                Stat::Min,
+                Precision::exact(VortexScalarValue::from(7i64)),
+                &source,
+                &target,
+            ),
+            Precision::exact(DFScalarValue::Int64(Some(7)))
+        );
+    }
+
+    #[test]
+    fn temporal_unit_changes_withhold_exact_extrema() {
+        let milliseconds = DType::Extension(
+            Timestamp::new(TimeUnit::Milliseconds, Nullability::NonNullable).erased(),
+        );
+        let seconds =
+            DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullability::NonNullable).erased());
+
+        assert!(
+            scalar_stat_to_df(
+                Stat::Max,
+                Precision::exact(VortexScalarValue::from(1_500i64)),
+                &milliseconds,
+                &seconds,
+            )
+            .is_absent()
+        );
+    }
+
+    #[test]
+    fn decimal_cross_schema_casts_withhold_exact_extrema() {
+        let large = VortexScalarValue::Decimal(DecimalValue::I128(9_007_199_254_740_993));
+        let decimal_scale_zero = DType::Decimal(DecimalDType::new(38, 0), Nullability::NonNullable);
+        let decimal_scale_two = DType::Decimal(DecimalDType::new(38, 2), Nullability::NonNullable);
+        let integer = DType::Primitive(PType::I64, Nullability::NonNullable);
+
+        assert!(
+            scalar_stat_to_df(
+                Stat::Min,
+                Precision::exact(large.clone()),
+                &decimal_scale_zero,
+                &integer,
+            )
+            .is_absent()
+        );
+        assert!(
+            scalar_stat_to_df(
+                Stat::Max,
+                Precision::exact(large),
+                &decimal_scale_zero,
+                &decimal_scale_two,
+            )
+            .is_absent()
+        );
+    }
 
     #[derive(Clone, Copy)]
     enum PushdownMode {

@@ -122,6 +122,29 @@ impl StatsSet {
         self.values.is_empty()
     }
 
+    /// Return whether these statistics prove that values of `dtype` contain no NaNs.
+    ///
+    /// Dtypes that cannot recursively contain a float are NaN-free by construction. For primitive
+    /// floats, only a well-typed, exact zero [`Stat::NaNCount`] is proof; an absent, inexact, or
+    /// malformed count is not. NaN-bearing composites and extensions are conservatively unproven
+    /// when `NaNCount` is not defined for their logical dtype.
+    pub fn is_nan_free(&self, dtype: &DType) -> bool {
+        if !dtype.may_contain_nan() {
+            return true;
+        }
+
+        let Some(count_dtype) = Stat::NaNCount.dtype(dtype) else {
+            return false;
+        };
+        let count = self.get(Stat::NaNCount).and_then(|value| {
+            Scalar::try_new(count_dtype.clone(), Some(value))
+                .ok()?
+                .as_primitive_opt()?
+                .as_opt::<u64>()?
+        });
+        count == Precision::Exact(0)
+    }
+
     /// Get scalar value of a given dtype
     pub fn get_as<T: for<'a> TryFrom<&'a Scalar, Error = VortexError>>(
         &self,
@@ -560,9 +583,12 @@ impl MutTypedStatsSetRef<'_, '_> {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
     use enum_iterator::all;
     use itertools::Itertools;
     use smallvec::smallvec;
+    use vortex_error::VortexResult;
 
     use crate::VortexSessionExecute;
     use crate::array_session;
@@ -573,6 +599,9 @@ mod test {
     use crate::dtype::NativeDecimalType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
+    use crate::dtype::StructFields;
+    use crate::dtype::extension::ExtId;
+    use crate::dtype::extension::ForeignExtDType;
     use crate::dtype::i256;
     use crate::expr::stats::IsConstant;
     use crate::expr::stats::Precision;
@@ -583,6 +612,87 @@ mod test {
     use crate::scalar::ScalarValue;
     use crate::stats::StatsSet;
     use crate::stats::stats_set::Scalar;
+
+    #[test]
+    fn nan_freedom_requires_an_exact_zero_count_for_float_dtypes() {
+        let dtype = DType::Primitive(PType::F64, Nullability::NonNullable);
+        let mut stats = StatsSet::default();
+        assert!(!stats.is_nan_free(&dtype));
+
+        stats.set(Stat::NaNCount, Precision::inexact(ScalarValue::from(0u64)));
+        assert!(!stats.is_nan_free(&dtype));
+
+        stats.set(Stat::NaNCount, Precision::exact(ScalarValue::from(true)));
+        assert!(!stats.is_nan_free(&dtype));
+
+        stats.set(Stat::NaNCount, Precision::exact(ScalarValue::from(0u64)));
+        assert!(stats.is_nan_free(&dtype));
+
+        stats.set(Stat::NaNCount, Precision::exact(ScalarValue::from(1u64)));
+        assert!(!stats.is_nan_free(&dtype));
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test-only extension id")]
+    fn float_storage_extensions_without_a_logical_nan_count_are_unproven() {
+        let dtype = DType::Extension(
+            ForeignExtDType::from_parts(
+                ExtId::new("vortex.test.float_backed"),
+                vec![],
+                DType::Primitive(PType::F32, Nullability::NonNullable),
+            )
+            .unwrap(),
+        );
+        let mut stats = StatsSet::default();
+        stats.set(Stat::NaNCount, Precision::exact(ScalarValue::from(0u64)));
+
+        assert!(dtype.may_contain_nan());
+        assert!(!stats.is_nan_free(&dtype));
+    }
+
+    #[test]
+    #[expect(clippy::disallowed_methods, reason = "test-only extension ids")]
+    fn nan_bearing_domain_is_recursive_and_composites_remain_unproven() -> VortexResult<()> {
+        let float = DType::Primitive(PType::F64, Nullability::NonNullable);
+        let list = DType::List(Arc::new(float), Nullability::NonNullable);
+        let struct_ = DType::Struct(
+            StructFields::from_iter([("values", list.clone())]),
+            Nullability::NonNullable,
+        );
+        let inner_extension = DType::Extension(ForeignExtDType::from_parts(
+            ExtId::new("vortex.test.nan_inner"),
+            vec![],
+            struct_.clone(),
+        )?);
+        let nested_extension = DType::Extension(ForeignExtDType::from_parts(
+            ExtId::new("vortex.test.nan_outer"),
+            vec![],
+            inner_extension,
+        )?);
+
+        let mut zero_nan_count = StatsSet::default();
+        zero_nan_count.set(Stat::NaNCount, Precision::exact(ScalarValue::from(0u64)));
+        for (name, dtype) in [
+            ("list", list),
+            ("struct", struct_),
+            ("nested extension", nested_extension),
+        ] {
+            assert!(dtype.may_contain_nan(), "{name} must be NaN-bearing");
+            assert!(
+                !zero_nan_count.is_nan_free(&dtype),
+                "a shallow count must not prove {name} recursively NaN-free"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn non_float_dtypes_are_nan_free_without_a_count() {
+        assert!(
+            StatsSet::default()
+                .is_nan_free(&DType::Primitive(PType::I64, Nullability::NonNullable))
+        );
+    }
 
     #[test]
     fn test_iter() {

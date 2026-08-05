@@ -246,6 +246,24 @@ impl DType {
         false
     }
 
+    /// Check whether values of this dtype may recursively contain an IEEE floating-point NaN.
+    ///
+    /// Unlike [`Self::is_float`], this follows nested children and extension storage dtypes. A
+    /// composite value can therefore be NaN-bearing even though its logical root is not primitive.
+    /// [`DType::Variant`] is conservatively included because each value carries its own dtype.
+    pub fn may_contain_nan(&self) -> bool {
+        match self {
+            Primitive(ptype, _) => ptype.is_float(),
+            List(element, _) | FixedSizeList(element, ..) => element.may_contain_nan(),
+            Map(map, _) => map.key_dtype().may_contain_nan() || map.value_dtype().may_contain_nan(),
+            Struct(fields, _) => fields.fields().any(|field| field.may_contain_nan()),
+            Union(variants, _) => variants.variants().any(|variant| variant.may_contain_nan()),
+            Variant(_) => true,
+            Extension(ext) => ext.storage_dtype().may_contain_nan(),
+            Null | Bool(_) | Decimal(..) | Utf8(_) | Binary(_) => false,
+        }
+    }
+
     /// Check if `self` is a [`DType::Decimal`].
     pub fn is_decimal(&self) -> bool {
         matches!(self, Decimal(..))

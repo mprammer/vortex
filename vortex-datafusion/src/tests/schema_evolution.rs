@@ -11,9 +11,13 @@ use arrow_schema::Fields;
 use arrow_schema::Schema;
 use datafusion::arrow::array::Array;
 use datafusion::arrow::array::ArrayRef as ArrowArrayRef;
+use datafusion::arrow::array::Decimal128Array;
 use datafusion::arrow::array::DictionaryArray;
+use datafusion::arrow::array::Int64Array;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::array::StructArray;
+use datafusion::arrow::array::TimestampMillisecondArray;
+use datafusion::arrow::array::TimestampSecondArray;
 use datafusion::arrow::datatypes::UInt16Type;
 use datafusion::arrow::datatypes::UInt32Type;
 use datafusion::assert_batches_sorted_eq;
@@ -23,9 +27,193 @@ use datafusion_common::record_batch;
 use datafusion_expr::col;
 use datafusion_expr::lit;
 use datafusion_functions::expr_fn::get_field;
+use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
+use datafusion_physical_plan::projection::ProjectionExec;
 use rstest::rstest;
 
 use crate::common_tests::TestSessionContext;
+
+fn is_metadata_only_projection(plan: &Arc<dyn datafusion_physical_plan::ExecutionPlan>) -> bool {
+    plan.downcast_ref::<ProjectionExec>()
+        .is_some_and(|projection| projection.input().is::<PlaceholderRowExec>())
+}
+
+async fn register_listing_table(
+    ctx: &TestSessionContext,
+    name: &str,
+    location: &str,
+    schema: Arc<Schema>,
+) -> anyhow::Result<()> {
+    let provider = ctx.table_provider(name, location, schema).await?;
+    ctx.session.register_table(name, provider)?;
+    Ok(())
+}
+
+#[tokio::test]
+async fn listing_extrema_do_not_rewrap_timestamp_units() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::default();
+    let values: ArrowArrayRef = Arc::new(TimestampMillisecondArray::from(vec![1_500]));
+    ctx.write_arrow_batch(
+        "timestamp-cast/data.vortex",
+        &RecordBatch::try_from_iter([("x", values)])?,
+    )
+    .await?;
+    register_listing_table(
+        &ctx,
+        "timestamp_cast",
+        "/timestamp-cast/",
+        Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Timestamp(arrow_schema::TimeUnit::Second, None),
+            false,
+        )])),
+    )
+    .await?;
+
+    let plan = ctx
+        .session
+        .sql("SELECT MAX(x) FROM timestamp_cast")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(!is_metadata_only_projection(&plan));
+
+    let batches = ctx
+        .session
+        .sql("SELECT MAX(x) FROM timestamp_cast")
+        .await?
+        .collect()
+        .await?;
+    let result = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<TimestampSecondArray>()
+        .ok_or_else(|| anyhow::anyhow!("MAX(x) did not produce TimestampSecond"))?;
+    assert_eq!(result.value(0), 1);
+    Ok(())
+}
+
+#[tokio::test]
+async fn listing_extrema_do_not_round_decimal_to_integer_above_2_pow_53() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::default();
+    let value = 9_007_199_254_740_993i128;
+    let values: ArrowArrayRef =
+        Arc::new(Decimal128Array::from(vec![value]).with_precision_and_scale(38, 0)?);
+    ctx.write_arrow_batch(
+        "decimal-integer/data.vortex",
+        &RecordBatch::try_from_iter([("x", values)])?,
+    )
+    .await?;
+    register_listing_table(
+        &ctx,
+        "decimal_integer",
+        "/decimal-integer/",
+        Arc::new(Schema::new(vec![Field::new("x", DataType::Int64, false)])),
+    )
+    .await?;
+
+    let plan = ctx
+        .session
+        .sql("SELECT MAX(x) FROM decimal_integer")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(!is_metadata_only_projection(&plan));
+
+    let batches = ctx
+        .session
+        .sql("SELECT MAX(x) FROM decimal_integer")
+        .await?
+        .collect()
+        .await?;
+    let result = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .ok_or_else(|| anyhow::anyhow!("MAX(x) did not produce Int64"))?;
+    let expected = i64::try_from(value)?;
+    assert_eq!(result.value(0), expected);
+    Ok(())
+}
+
+#[tokio::test]
+async fn listing_extrema_do_not_reinterpret_or_hide_decimal_scale_casts() -> anyhow::Result<()> {
+    let ctx = TestSessionContext::default();
+    let rescaled: ArrowArrayRef =
+        Arc::new(Decimal128Array::from(vec![100i128]).with_precision_and_scale(3, 0)?);
+    let overflows: ArrowArrayRef =
+        Arc::new(Decimal128Array::from(vec![10i128.pow(38) - 1]).with_precision_and_scale(38, 0)?);
+    ctx.write_arrow_batch(
+        "decimal-scale/rescaled.vortex",
+        &RecordBatch::try_from_iter([("x", rescaled)])?,
+    )
+    .await?;
+    ctx.write_arrow_batch(
+        "decimal-overflow/overflow.vortex",
+        &RecordBatch::try_from_iter([("x", overflows)])?,
+    )
+    .await?;
+
+    register_listing_table(
+        &ctx,
+        "decimal_scale",
+        "/decimal-scale/",
+        Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Decimal128(5, 2),
+            false,
+        )])),
+    )
+    .await?;
+    let plan = ctx
+        .session
+        .sql("SELECT MAX(x) FROM decimal_scale")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(!is_metadata_only_projection(&plan));
+    let batches = ctx
+        .session
+        .sql("SELECT MAX(x) FROM decimal_scale")
+        .await?
+        .collect()
+        .await?;
+    let result = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Decimal128Array>()
+        .ok_or_else(|| anyhow::anyhow!("MAX(x) did not produce Decimal128"))?;
+    assert_eq!(result.value(0), 10_000, "100 at scale 0 becomes 100.00");
+
+    register_listing_table(
+        &ctx,
+        "decimal_overflow",
+        "/decimal-overflow/",
+        Arc::new(Schema::new(vec![Field::new(
+            "x",
+            DataType::Decimal128(38, 2),
+            false,
+        )])),
+    )
+    .await?;
+    let plan = ctx
+        .session
+        .sql("SELECT MAX(x) FROM decimal_overflow")
+        .await?
+        .create_physical_plan()
+        .await?;
+    assert!(!is_metadata_only_projection(&plan));
+    assert!(
+        ctx.session
+            .sql("SELECT MAX(x) FROM decimal_overflow")
+            .await?
+            .collect()
+            .await
+            .is_err(),
+        "metadata must not hide an overflowing scan-time decimal rescale"
+    );
+    Ok(())
+}
 
 #[rstest]
 #[tokio::test]
