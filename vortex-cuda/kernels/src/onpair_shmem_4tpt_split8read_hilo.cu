@@ -13,8 +13,11 @@
 // table whose low half duplicates `dict_s8`. Device footprint is therefore
 // 32 KB + 64 KB = 96 KB at 4,096 entries. This variant reads the high half from a
 // dedicated stride-8 `dict_hi` (bytes 8..16 of each entry), so the two tables are
-// disjoint and total 64 KB. L1 capacity is exactly the resource `split8read`
-// buys, so removing the redundancy should compound the mechanism.
+// disjoint. That is 64 KB of dictionary READ WORKING SET at 4,096 entries against
+// the shipped kernel's 96 KB; it is not an allocation saving, since the host still
+// builds and copies `dict_padded` for the other variants in the same run. L1
+// capacity is exactly the resource `split8read` buys, so removing the redundancy
+// should compound the mechanism.
 //
 // Counter-hypothesis on record: the high path is exercised so rarely that most of
 // `dict_padded` never becomes L1-resident, so this may recover nothing. A null
@@ -30,11 +33,12 @@
 // is only ~31% (the 64 KB dict thrashes against the streaming codes/output).
 //
 // Most tokens are short (mean dict len ~6). This variant reads the common case
-// from the **32 KB** `dict_s8` array (first 8 bytes/entry, `uint2`) and only
-// touches the 64 KB `dict_padded` for the rare `len > 8` tokens. Halving the
-// hot dict working set aims to raise the dict L1 hit rate, cutting L2 sectors
-// and L1/TEX-request pressure. As a bonus, holding `uint2 lo[4]` (32 B) instead
-// of `uint4 t[4]` (64 B) lowers register pressure.
+// from the **32 KB** `dict_s8` (logical bytes 0..8 per entry, `uint2`) and, for
+// the rare `len > 8` tokens, the **32 KB** `dict_hi` (logical bytes 8..16, also
+// stride 8). The two are disjoint, so nothing is stored twice: 64 KB of read
+// working set at 4,096 entries against the shipped kernel's 96 KB. Holding
+// `uint2 lo[4]` (32 B) instead of `uint4 t[4]` (64 B) also lowers register
+// pressure.
 //
 // Identical scan/drain to `onpair_shmem_4tpt`; only the token-byte source
 // changes.

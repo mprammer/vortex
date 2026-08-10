@@ -945,8 +945,11 @@ struct GpuOnPairChunk {
     codes_offsets: vortex::array::buffer::BufferHandle,
     dict_padded: vortex::array::buffer::BufferHandle,
     dict_s8: vortex::array::buffer::BufferHandle,
-    /// E-B: bytes 8..16 of each entry at stride 8, the disjoint high half of
-    /// `dict_s8`. Only read by `KernelLayout::SplitRead8HiLo`.
+    /// E-B high table. Authoritative layout: `dict_s8` holds an entry's logical
+    /// bytes 0..8 and `dict_hi` holds its logical bytes 8..16, both at stride 8 and
+    /// both zero-padded past the entry's true length. Together they carry the same
+    /// bytes as one 16-byte `dict_padded` slot with no duplication. Read only by
+    /// `KernelLayout::SplitRead8HiLo`.
     dict_hi: vortex::array::buffer::BufferHandle,
     dict_s4: vortex::array::buffer::BufferHandle,
     dict_const1: vortex::array::buffer::BufferHandle,
@@ -1142,8 +1145,11 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
     },
-    // E1b/E-A/E-B (2026-08-10). See docs/notes/2026-08-10-experiments-log.md in the
-    // paper repo. All three mirror the shipped 512-thread split8read operating point.
+    // E1b/E-A/E-B experiment variants (2026-08-10), branch mp/onpair-expts-0810.
+    // All mirror the shipped 512-thread split8read operating point. Retirement: the
+    // `_bounds*` probes are deleted once E-A is settled either way; `_ldcs` and
+    // `_hilo` are promoted into the shipped set only if they win, else deleted.
+    // Rationale and results: vortex-cuda/kernels/src/README-experiments-0810.md.
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_ldcs",
         layout: KernelLayout::SplitRead8,
@@ -1158,6 +1164,14 @@ const GPU_KERNELS: &[KernelVariant] = &[
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_bounds",
+        layout: KernelLayout::SplitRead8Bounds,
+        chunk_size: 128,
+        block_warps: 16,
+    },
+    // Control: identical but overruns by one byte, so it MUST trap. If it completes
+    // cleanly the instrument is broken and the E-A result is void.
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_bounds_faultinj",
         layout: KernelLayout::SplitRead8Bounds,
         chunk_size: 128,
         block_warps: 16,
@@ -1530,10 +1544,14 @@ async fn run_gpu_kernel_bench(
         .filter(|r| {
             r.applicable
                 && !r.kernel.contains("ablate")
+                // E-A probes carry hot-path bounds guards; their rate is not a
+                // decode measurement, and the fault-injection control is expected
+                // to trap. Never let either become `best`.
+                && !r.kernel.contains("_bounds")
                 && (!config.validate || r.verified == Some(true))
         })
         .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
-        .context("no applicable non-ablate CUDA OnPair kernels")?;
+        .context("no applicable non-ablate, non-probe CUDA OnPair kernels")?;
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.
@@ -2653,6 +2671,10 @@ fn time_kernel_variant(
     if std::env::var("ONPAIR_L2_PERSIST").is_ok() {
         if let Some(c) = chunks.first() {
             let (dict, dict_len) = match variant.layout {
+                // Low-table-only semantics: HiLo also reads `dict_hi`, which this
+                // window does not cover. The window is a single contiguous region,
+                // and the low table is the hot one, so pinning it is the intended
+                // approximation rather than an oversight.
                 KernelLayout::SplitRead8
                 | KernelLayout::SplitRead8HiLo
                 | KernelLayout::SplitRead8Bounds => (&c.dict_s8, c.dict_s8.len()),

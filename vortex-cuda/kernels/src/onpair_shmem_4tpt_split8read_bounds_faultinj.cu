@@ -7,7 +7,10 @@
 #include <string.h>
 #include <stdio.h>
 
-// E-A (2026-08-10): `split8read` instrumented to test Joe's 2026-08-05 claim that a
+// E-A FAULT-INJECTION CONTROL (2026-08-10): identical to
+// `onpair_shmem_4tpt_split8read_bounds` but claims one byte more than it writes on
+// the tail store, so it MUST trap. If this kernel completes cleanly the instrument
+// is broken and the E-A result is void. `split8read` instrumented to test Joe's 2026-08-05 claim that a
 // warp's drain writes past its exclusive output region and clobbers the next
 // warp's first byte.
 //
@@ -55,7 +58,7 @@
 #endif
 #define WARP_BUF_BYTES 2080u
 
-__device__ inline uint32_t warp_inclusive_scan_u32_8read_bounds(uint32_t x, int lane) {
+__device__ inline uint32_t warp_inclusive_scan_u32_nds_faultinj(uint32_t x, int lane) {
     constexpr unsigned mask = 0xffffffffu;
 #pragma unroll
     for (int offset = 1; offset < 32; offset <<= 1) {
@@ -84,7 +87,7 @@ __device__ inline void s8rb_check(uint64_t chunk, uint64_t addr, uint32_t width,
     }
 }
 
-extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_bounds(
+extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_bounds_faultinj(
     const uint16_t *__restrict codes, const uint64_t *__restrict chunk_offsets,
     const uint8_t *__restrict dict_s8, const uint8_t *__restrict dict_padded,
     const uint8_t *__restrict lens, uint8_t *__restrict output_bytes,
@@ -124,7 +127,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_bou
     uint32_t acc_base = 0u;
 #pragma unroll
     for (int k = 0; k < 4; ++k) {
-        const uint32_t incl = warp_inclusive_scan_u32_8read_bounds(l[k], lane);
+        const uint32_t incl = warp_inclusive_scan_u32_nds_faultinj(l[k], lane);
         excl[k] = acc_base + (incl - l[k]);
         acc_base += __shfl_sync(mask, incl, 31);
     }
@@ -193,7 +196,8 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_bou
 
     const uint32_t tail_start = head + (body_chunks << 4);
     if ((uint32_t)lane < warp_total - tail_start) {
-        s8rb_check(chunk, out_start + (uint64_t)tail_start + (uint64_t)lane, 1u,
+        // FAULT INJECTION: deliberately claim one byte more than written.
+        s8rb_check(chunk, out_start + (uint64_t)tail_start + (uint64_t)lane, 1u + 1u,
                    out_start, region_end, 3);
         output_bytes[out_start + (uint64_t)tail_start + (uint64_t)lane] =
             s_buf[tail_start + lane];
