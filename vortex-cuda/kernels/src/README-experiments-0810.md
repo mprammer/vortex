@@ -38,3 +38,56 @@ instrument is broken and the run is void.
   drain can silently diverge. Accepted deliberately: factoring the shipped kernel
   is a change to the thing being measured, which is exactly what an experiment
   branch must not do.
+
+---
+
+## E-A is BLOCKED (2026-08-10) — two review rounds killed two designs
+
+`--depth max` gauntlet, runs `cli-gauntlet-0fd3f381815c` then `cli-gauntlet-b0b7042a27d4`
+(verdict: reject). Both probe kernels are **deregistered** from `onpair_bench.rs`; the
+sources remain for the redesign.
+
+**Round 1.** Checking each store against `warp_total` was a tautology: every store
+predicate is *derived* from `warp_total`, so `rel + width <= warp_total` holds by
+construction at all three sites. A clean run would have "refuted" the claim while
+proving nothing.
+
+**Round 2.** Switching the bound to `[chunk_offsets[c], chunk_offsets[c+1])` did not
+fix it, because the probe also traps unless `region_end - out_start == warp_total`.
+Any execution that survives that check has made the two quantities equal, so the
+per-store checks reduce to the round-1 tautology again.
+
+The general lesson: **inside the kernel, the drain's write extent and the offsets'
+allotment are the same quantity computed the same way.** No in-kernel predicate over
+them can be independent. The overrun Joe describes could only arise from the offsets
+disagreeing with the lengths, which is a host-side data property, not a kernel one.
+
+Two further defects found in round 2, both real:
+
+- **The fault-injection control passes vacuously.** The widened check sits in the
+  tail branch, so inputs with no tail (128 one-byte tokens; a single 16-byte token)
+  complete without trapping. A control that can silently not fire is worse than none.
+- **`__trap()` poisons the process-wide CUDA context.** The harness shares one
+  context across all kernels, so an expected trap aborts the benchmark before results
+  are written *and* compromises every later kernel in the run. This is why the probes
+  are deregistered rather than merely left unused: including them in a sweep risks the
+  whole run's results, not just their own.
+
+### Redesign specification
+
+Report through a buffer, never a trap, and verify on the host:
+
+1. Kernel records, per chunk, the minimum and maximum absolute output address it
+   actually wrote, into a device array (`uint64 [2 * n_chunks]`). No predicates, no
+   traps, no early exits.
+2. Host checks, against its own `chunk_offsets`: (a) each chunk's recorded interval
+   equals `[chunk_offsets[c], chunk_offsets[c+1])`, and (b) the intervals are pairwise
+   disjoint and cover the output exactly once.
+
+This is genuinely independent because the comparison happens outside the kernel
+against data the kernel never reads, and it makes the control trivial: perturb one
+recorded bound and the host check must fail.
+
+Cost: one extra buffer argument and its `KernelLayout`, plus a host verification pass.
+Also worth checking the offsets table itself against the output allocation in release
+builds; today that invariant is only a `debug_assert_eq!` in `chunk_offsets()`.

@@ -1162,20 +1162,14 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
     },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8read_bounds",
-        layout: KernelLayout::SplitRead8Bounds,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    // Control: identical but overruns by one byte, so it MUST trap. If it completes
-    // cleanly the instrument is broken and the E-A result is void.
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8read_bounds_faultinj",
-        layout: KernelLayout::SplitRead8Bounds,
-        chunk_size: 128,
-        block_warps: 16,
-    },
+    // E-A bounds probes are DEREGISTERED pending redesign (gauntlet
+    // cli-gauntlet-b0b7042a27d4, verdict reject). Two problems make them unsafe to
+    // run in this registry: (a) __trap() raises a fatal device exception that
+    // poisons the process-wide CUDA context, so an expected trap would abort the
+    // benchmark before results are recorded AND compromise every later kernel in
+    // the same process; (b) the checks still cannot fire, see
+    // README-experiments-0810.md. The .cu files stay for the redesign; they must
+    // not be listed here until the probe reports through a buffer instead of a trap.
     // Track B": split8read at finer granularity (256-thread blocks).
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_occ",
