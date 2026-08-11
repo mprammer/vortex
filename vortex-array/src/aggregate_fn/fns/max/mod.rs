@@ -14,10 +14,12 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::bounded_max::BoundedMax;
 use crate::aggregate_fn::fns::min_max::MinMax;
 use crate::aggregate_fn::fns::min_max::min_max;
+use crate::aggregate_fn::fns::min_max::minmax_nan_supported_dtype;
 use crate::aggregate_fn::fns::min_max::nan_scalar;
 use crate::aggregate_fn::fns::min_max::scalar_is_nan;
 use crate::dtype::DType;
@@ -30,8 +32,9 @@ use crate::scalar::Scalar;
 
 /// Compute the maximum non-null value of an array.
 ///
-/// NaN handling for float inputs is controlled by [`NumericalAggregateOpts`]: with `skip_nans` (the
-/// default) NaN values are ignored, otherwise any NaN value poisons the maximum to NaN.
+/// NaN handling for primitive floats and extensions over them is controlled by
+/// [`NumericalAggregateOpts`]: with `skip_nans` (the default) NaN values are ignored, otherwise any
+/// NaN value poisons the maximum to NaN.
 #[derive(Clone, Debug)]
 pub struct Max;
 
@@ -68,7 +71,7 @@ impl MaxPartial {
     }
 
     fn is_poisoned(&self) -> bool {
-        self.element_dtype.is_float() && self.max.as_ref().is_some_and(scalar_is_nan)
+        self.max.as_ref().is_some_and(scalar_is_nan)
     }
 }
 
@@ -79,6 +82,14 @@ impl AggregateFnVTable for Max {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.max");
         *ID
+    }
+
+    fn nan_handling(&self, options: &Self::Options) -> NaNHandling {
+        if options.skip_nans {
+            NaNHandling::Skips
+        } else {
+            NaNHandling::Includes
+        }
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
@@ -161,9 +172,9 @@ impl AggregateFnVTable for Max {
         batch: &ArrayRef,
         _ctx: &mut ExecutionCtx,
     ) -> VortexResult<bool> {
-        // NaN-aware shortcircuits only apply to the NaN-including float maximum; everything else
-        // takes the default dispatch path.
-        if partial.skip_nans || !partial.element_dtype.is_float() {
+        // NaN-aware shortcircuits apply only when Max can represent a poisoned result: primitive
+        // floats and extension wrappers over them. Everything else takes the default dispatch path.
+        if partial.skip_nans || !minmax_nan_supported_dtype(&partial.element_dtype) {
             return Ok(false);
         }
         match batch.statistics().get_as::<u64>(Stat::NaNCount) {

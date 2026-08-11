@@ -22,7 +22,9 @@ pub(super) fn accumulate_extension(
     let local = min_max(
         array.storage_array(),
         ctx,
-        NumericalAggregateOpts::default(),
+        NumericalAggregateOpts {
+            skip_nans: partial.skip_nans,
+        },
     )?
     .map(|MinMaxResult { min, max }| MinMaxResult {
         min: Scalar::extension_ref(non_nullable_ext_dtype.clone(), min),

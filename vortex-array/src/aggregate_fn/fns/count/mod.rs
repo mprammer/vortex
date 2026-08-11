@@ -12,6 +12,7 @@ use crate::Columnar;
 use crate::ExecutionCtx;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::nan_count::nan_count;
 use crate::dtype::DType;
@@ -44,6 +45,14 @@ impl AggregateFnVTable for Count {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.count");
         *ID
+    }
+
+    fn nan_handling(&self, options: &Self::Options) -> NaNHandling {
+        if options.skip_nans {
+            NaNHandling::Skips
+        } else {
+            NaNHandling::Includes
+        }
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

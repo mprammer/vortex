@@ -22,6 +22,7 @@ use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AccumulatorRef;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::NaNHandling;
 use crate::builtins::ArrayBuiltins;
 use crate::dtype::DType;
 use crate::dtype::FieldName;
@@ -147,6 +148,13 @@ impl<T: BinaryCombined> AggregateFnVTable for Combined<T> {
 
     fn id(&self) -> AggregateFnId {
         self.0.id()
+    }
+
+    fn nan_handling(&self, options: &Self::Options) -> NaNHandling {
+        self.0
+            .left()
+            .nan_handling(&options.0)
+            .combine(self.0.right().nan_handling(&options.1))
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

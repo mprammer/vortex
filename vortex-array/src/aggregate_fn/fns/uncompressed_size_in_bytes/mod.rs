@@ -42,6 +42,7 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::NaNHandling;
 use crate::array::ArrayView;
 use crate::arrays::Constant;
 use crate::arrays::ConstantArray;
@@ -108,6 +109,10 @@ impl AggregateFnVTable for UncompressedSizeInBytes {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.uncompressed_size_in_bytes");
         *ID
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::NotApplicable
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

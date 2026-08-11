@@ -19,6 +19,7 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::GroupedAccumulatorRef;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::options::AggregateFnOptions;
 use crate::aggregate_fn::typed::AggregateFnInner;
 use crate::aggregate_fn::typed::DynAggregateFn;
@@ -38,6 +39,11 @@ impl AggregateFnRef {
     /// Returns the ID of this aggregate function.
     pub fn id(&self) -> AggregateFnId {
         self.0.id()
+    }
+
+    /// Return how this bound aggregate treats NaN input values.
+    pub fn nan_handling(&self) -> NaNHandling {
+        self.0.nan_handling()
     }
 
     /// Returns whether the aggregate function is of the given vtable type.

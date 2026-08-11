@@ -53,15 +53,18 @@ use vortex_array::expr::lt_eq;
 use vortex_array::expr::or;
 use vortex_array::expr::root;
 use vortex_array::expr::select;
+use vortex_array::expr::stats::Stat;
 use vortex_array::extension::datetime::TimeUnit;
 use vortex_array::extension::datetime::Timestamp;
 use vortex_array::extension::datetime::TimestampOptions;
 use vortex_array::field_path;
+use vortex_array::scalar::DecimalValue;
 use vortex_array::scalar::Scalar;
 use vortex_array::scalar_fn::ScalarFnVTableExt;
 use vortex_array::scalar_fn::fns::pack::Pack;
 use vortex_array::scalar_fn::fns::pack::PackOptions;
 use vortex_array::stats::PRUNING_STATS;
+use vortex_array::stats::StatsSet;
 use vortex_array::stream::ArrayStreamAdapter;
 use vortex_array::stream::ArrayStreamExt;
 use vortex_array::validity::Validity;
@@ -75,6 +78,7 @@ use vortex_buffer::buffer;
 use vortex_edition::EditionSession;
 use vortex_error::VortexExpect;
 use vortex_error::VortexResult;
+use vortex_error::vortex_err;
 use vortex_flatbuffers::footer as fb;
 use vortex_io::session::RuntimeSession;
 use vortex_layout::DynLayout;
@@ -2718,6 +2722,104 @@ async fn test_can_prune_composite_predicates() -> VortexResult<()> {
     assert!(!file.can_prune(&eq(col("age"), lit(18)))?);
     assert!(!file.can_prune(&and(gt(col("age"), lit(20)), gt(col("price"), lit(100))))?);
 
+    Ok(())
+}
+
+async fn write_single_field_file(array: ArrayRef) -> VortexResult<VortexFile> {
+    let array = StructArray::from_fields(&[("x", array)])?.into_array();
+    let mut buf = ByteBufferMut::empty();
+    SESSION
+        .write_options()
+        .write(&mut buf, array.to_array_stream())
+        .await?;
+    SESSION.open_options().open_buffer(buf)
+}
+
+fn written_x_stats(file: &VortexFile) -> VortexResult<&StatsSet> {
+    file.file_stats()
+        .and_then(|statistics| statistics.stats_sets().first())
+        .ok_or_else(|| vortex_err!("written file did not contain statistics for x"))
+}
+
+#[tokio::test]
+async fn file_can_prune_does_not_rewrap_timestamp_extrema() -> VortexResult<()> {
+    let storage = PrimitiveArray::from_iter([1_500i64]).into_array();
+    let timestamps =
+        TemporalArray::new_timestamp(storage, TimeUnit::Milliseconds, None).into_array();
+    let file = write_single_field_file(timestamps).await?;
+    assert!(written_x_stats(&file)?.get(Stat::Min).as_exact().is_some());
+
+    let seconds =
+        DType::Extension(Timestamp::new(TimeUnit::Seconds, Nullability::NonNullable).erased());
+    let one_hundred_seconds = Scalar::extension::<Timestamp>(
+        TimestampOptions {
+            unit: TimeUnit::Seconds,
+            tz: None,
+        },
+        Scalar::from(100i64),
+    );
+    let filter = lt(cast(col("x"), seconds), lit(one_hundred_seconds));
+
+    // The scan rescales 1,500ms to 1s, which matches. Rewrapping the footer value as 1,500s would
+    // incorrectly prove the file empty.
+    assert!(!file.can_prune(&filter)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_can_prune_does_not_round_large_decimal_extrema_to_integer() -> VortexResult<()> {
+    let value = 9_007_199_254_740_993i128;
+    let decimals = DecimalArray::new(
+        buffer![value],
+        DecimalDType::new(38, 0),
+        Validity::NonNullable,
+    )
+    .into_array();
+    let file = write_single_field_file(decimals).await?;
+    assert!(written_x_stats(&file)?.get(Stat::Max).as_exact().is_some());
+
+    let filter = gt(
+        cast(
+            col("x"),
+            DType::Primitive(PType::I64, Nullability::NonNullable),
+        ),
+        lit(9_007_199_254_740_992i64),
+    );
+
+    // The array cast keeps this i64-representable value exact; the old scalar conversion rounded
+    // through f64 and could turn the matching row into a false file-level prune proof.
+    assert!(!file.can_prune(&filter)?);
+    Ok(())
+}
+
+#[tokio::test]
+async fn file_can_prune_does_not_reinterpret_or_hide_decimal_scale_casts() -> VortexResult<()> {
+    let source = DecimalDType::new(3, 0);
+    let target = DecimalDType::new(5, 2);
+    let rescaled = DecimalArray::new(buffer![100i32], source, Validity::NonNullable).into_array();
+    let file = write_single_field_file(rescaled).await?;
+    assert!(written_x_stats(&file)?.get(Stat::Max).as_exact().is_some());
+
+    let target_dtype = DType::Decimal(target, Nullability::NonNullable);
+    let fifty = Scalar::decimal(DecimalValue::I128(5_000), target, Nullability::NonNullable);
+    let filter = gt(cast(col("x"), target_dtype), lit(fifty));
+    // 100 at scale 0 becomes 100.00, so the row matches `> 50.00`; the footer's raw 100 must not
+    // be interpreted directly at scale 2.
+    assert!(!file.can_prune(&filter)?);
+
+    let source = DecimalDType::new(38, 0);
+    let target = DecimalDType::new(38, 2);
+    let overflow =
+        DecimalArray::new(buffer![10i128.pow(38) - 1], source, Validity::NonNullable).into_array();
+    let file = write_single_field_file(overflow).await?;
+    assert!(written_x_stats(&file)?.get(Stat::Max).as_exact().is_some());
+
+    let target_dtype = DType::Decimal(target, Nullability::NonNullable);
+    let zero = Scalar::decimal(DecimalValue::I128(0), target, Nullability::NonNullable);
+    let filter = gt(cast(col("x"), target_dtype), lit(zero));
+    // The scan-time rescale overflows. File metadata must not replace that error with a pruning
+    // decision derived from a scalar conversion with different behavior.
+    assert!(!file.can_prune(&filter)?);
     Ok(())
 }
 

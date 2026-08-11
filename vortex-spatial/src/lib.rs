@@ -11,6 +11,7 @@ use vortex_arrow::ArrowSessionExt;
 use vortex_session::VortexSession;
 
 use crate::aggregate_fn::GeometryAabb;
+use crate::aggregate_fn::LegacyGeometryAabb;
 use crate::extension::LineString;
 use crate::extension::MultiLineString;
 use crate::extension::MultiPoint;
@@ -71,6 +72,7 @@ pub fn initialize(session: &VortexSession) {
 
     // The axis-aligned bounding-box (AABB) aggregate; self-declares as a per-chunk zone stat for
     // geometry columns.
+    session.aggregate_fns().register(LegacyGeometryAabb);
     session.aggregate_fns().register(GeometryAabb);
 
     // Register the spatial pruning rules that use that AABB.

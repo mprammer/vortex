@@ -23,6 +23,40 @@ use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
 
+/// How an aggregate treats NaN input values.
+///
+/// This capability is explicit on every aggregate vtable so consumers of stored aggregate state
+/// do not have to maintain a closed list of NaN-skipping implementations.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum NaNHandling {
+    /// NaNs participate in, or are directly observed by, the aggregate.
+    Includes,
+    /// NaNs are omitted from the values contributing to the aggregate result.
+    Skips,
+    /// The aggregate result is independent of input values and their NaN status.
+    NotApplicable,
+    /// The aggregate's NaN semantics are not known locally.
+    Unknown,
+}
+
+impl NaNHandling {
+    /// Whether using this aggregate result against raw float semantics requires proof that the
+    /// input contains no NaNs.
+    pub const fn requires_nan_free_input(self) -> bool {
+        matches!(self, Self::Skips | Self::Unknown)
+    }
+
+    /// Combine the capabilities of child aggregates used to compute one result.
+    pub const fn combine(self, other: Self) -> Self {
+        match (self, other) {
+            (Self::Unknown, _) | (_, Self::Unknown) => Self::Unknown,
+            (Self::Skips, _) | (_, Self::Skips) => Self::Skips,
+            (Self::Includes, _) | (_, Self::Includes) => Self::Includes,
+            (Self::NotApplicable, Self::NotApplicable) => Self::NotApplicable,
+        }
+    }
+}
+
 /// Defines the interface for aggregate function vtables.
 ///
 /// This trait is non-object-safe and allows the implementer to make use of associated types
@@ -41,6 +75,22 @@ pub trait AggregateFnVTable: 'static + Sized + Clone + Send + Sync {
 
     /// Returns the ID of the aggregate function vtable.
     fn id(&self) -> AggregateFnId;
+
+    /// Declare how this aggregate treats NaN input values under `options`.
+    ///
+    /// Defaults to [`NaNHandling::Unknown`], which is the conservative answer: it
+    /// [requires a NaN-free proof](NaNHandling::requires_nan_free_input) before the result may be
+    /// used against raw float semantics, and dominates in [`NaNHandling::combine`]. An aggregate
+    /// that does not answer therefore suppresses pruning rather than enabling it.
+    ///
+    /// A default is provided deliberately. Requiring every implementor to answer would be a source
+    /// break for aggregates outside this repository, and the safe direction does not need to be
+    /// compulsory to be correct — an implementor who says nothing gets the guard, and one who wants
+    /// their aggregate to prune must opt in by declaring semantics. In-tree aggregates all declare
+    /// theirs explicitly.
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::Unknown
+    }
 
     /// Serialize the options for this aggregate function.
     ///
@@ -250,3 +300,22 @@ pub trait AggregateFnVTableExt: AggregateFnVTable {
     }
 }
 impl<V: AggregateFnVTable> AggregateFnVTableExt for V {}
+
+#[cfg(test)]
+mod nan_handling_default_tests {
+    use super::NaNHandling;
+
+    /// An aggregate that declares nothing must get the guard, not bypass it.
+    #[test]
+    fn the_default_is_conservative() {
+        assert!(NaNHandling::Unknown.requires_nan_free_input());
+        for other in [
+            NaNHandling::Includes,
+            NaNHandling::Skips,
+            NaNHandling::NotApplicable,
+        ] {
+            assert_eq!(NaNHandling::Unknown.combine(other), NaNHandling::Unknown);
+            assert_eq!(other.combine(NaNHandling::Unknown), NaNHandling::Unknown);
+        }
+    }
+}

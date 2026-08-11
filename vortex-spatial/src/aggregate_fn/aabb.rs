@@ -13,6 +13,7 @@ use vortex_array::aggregate_fn::AggregateFnRef;
 use vortex_array::aggregate_fn::AggregateFnVTable;
 use vortex_array::aggregate_fn::AggregateFnVTableExt;
 use vortex_array::aggregate_fn::EmptyOptions;
+use vortex_array::aggregate_fn::NaNHandling;
 use vortex_array::dtype::DType;
 use vortex_array::dtype::Nullability;
 use vortex_array::dtype::extension::ExtDType;
@@ -37,6 +38,12 @@ use crate::extension::is_native_geometry;
 /// columns (via `zone_stat_default`).
 #[derive(Clone, Debug)]
 pub struct GeometryAabb;
+
+/// Reader for AABBs written under the old NaN-skipping semantics. It stays registered under the
+/// original aggregate ID so existing files open, but it is never selected for new zone stats and
+/// cannot satisfy a request for the new [`GeometryAabb`] ID.
+#[derive(Clone, Debug)]
+pub(crate) struct LegacyGeometryAabb;
 
 /// Running union of geometry AABBs, or `None` until the first row. A transient
 /// `geo::Rect` value - the persisted stat is the native box (see `to_scalar`).
@@ -76,9 +83,24 @@ fn aabb_storage_dtype() -> DType {
     box_storage_dtype(Dimension::Xy, Nullability::Nullable)
 }
 
+/// An AABB that cannot prove any finite spatial bound.
+fn whole_plane_aabb() -> SpatialRect<f64> {
+    SpatialRect::new(
+        (f64::NEG_INFINITY, f64::NEG_INFINITY),
+        (f64::INFINITY, f64::INFINITY),
+    )
+}
+
 /// The AABB of the raw `x`/`y` slices, or `None` when empty.
+///
+/// Any NaN coordinate widens the result to the whole plane. The scan outcome for a NaN-bearing
+/// geometry is not represented by a finite Euclidean bound, so silently omitting that row could
+/// change either predicate results or scan errors.
 fn aabb_of(xs: &[f64], ys: &[f64]) -> Option<SpatialRect<f64>> {
     (!xs.is_empty()).then(|| {
+        if xs.iter().chain(ys).copied().any(f64::is_nan) {
+            return whole_plane_aabb();
+        }
         let [xmin, ymin, xmax, ymax] = box_corners(xs, ys);
         SpatialRect::new((xmin, ymin), (xmax, ymax))
     })
@@ -124,11 +146,17 @@ impl AggregateFnVTable for GeometryAabb {
     type Partial = AabbPartial;
 
     fn id(&self) -> AggregateFnId {
-        static ID: CachedId = CachedId::new("vortex.st.aabb");
+        static ID: CachedId = CachedId::new("vortex.st.aabb.nan_inclusive");
         *ID
     }
 
-    // Serializable so the zoned writer can persist this as a per-chunk stat. No options to encode.
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        // NaN coordinates widen the AABB to the whole plane, so their inability to provide a
+        // finite bound is represented in the aggregate rather than omitted.
+        NaNHandling::Includes
+    }
+
+    // The aggregate ID versions the semantics; there are no per-instance options to encode.
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
         Ok(Some(vec![]))
     }
@@ -227,13 +255,93 @@ impl AggregateFnVTable for GeometryAabb {
     }
 }
 
+impl AggregateFnVTable for LegacyGeometryAabb {
+    type Options = EmptyOptions;
+    type Partial = AabbPartial;
+
+    fn id(&self) -> AggregateFnId {
+        static ID: CachedId = CachedId::new("vortex.st.aabb");
+        *ID
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::Skips
+    }
+
+    fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
+        Ok(Some(vec![]))
+    }
+
+    fn deserialize(
+        &self,
+        _metadata: &[u8],
+        _session: &VortexSession,
+    ) -> VortexResult<Self::Options> {
+        Ok(EmptyOptions)
+    }
+
+    fn return_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
+        GeometryAabb.return_dtype(options, input_dtype)
+    }
+
+    fn partial_dtype(&self, options: &Self::Options, input_dtype: &DType) -> Option<DType> {
+        GeometryAabb.partial_dtype(options, input_dtype)
+    }
+
+    fn empty_partial(
+        &self,
+        options: &Self::Options,
+        input_dtype: &DType,
+    ) -> VortexResult<Self::Partial> {
+        GeometryAabb.empty_partial(options, input_dtype)
+    }
+
+    fn combine_partials(&self, partial: &mut Self::Partial, other: Scalar) -> VortexResult<()> {
+        GeometryAabb.combine_partials(partial, other)
+    }
+
+    fn to_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
+        GeometryAabb.to_scalar(partial)
+    }
+
+    fn reset(&self, partial: &mut Self::Partial) {
+        GeometryAabb.reset(partial);
+    }
+
+    fn is_saturated(&self, partial: &Self::Partial) -> bool {
+        GeometryAabb.is_saturated(partial)
+    }
+
+    fn accumulate(
+        &self,
+        partial: &mut Self::Partial,
+        batch: &Columnar,
+        ctx: &mut ExecutionCtx,
+    ) -> VortexResult<()> {
+        // This vtable is read-only in normal use. Delegating to the safer implementation keeps an
+        // explicitly constructed accumulator conservative while its capability remains `Skips`.
+        GeometryAabb.accumulate(partial, batch, ctx)
+    }
+
+    fn finalize(&self, partials: ArrayRef) -> VortexResult<ArrayRef> {
+        GeometryAabb.finalize(partials)
+    }
+
+    fn finalize_scalar(&self, partial: &Self::Partial) -> VortexResult<Scalar> {
+        GeometryAabb.finalize_scalar(partial)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use geo::Rect as SpatialRect;
     use vortex_array::ArrayRef;
     use vortex_array::VortexSessionExecute;
     use vortex_array::aggregate_fn::Accumulator;
+    use vortex_array::aggregate_fn::AggregateFnRef;
+    use vortex_array::aggregate_fn::AggregateFnSatisfaction;
     use vortex_array::aggregate_fn::AggregateFnVTable;
+    use vortex_array::aggregate_fn::AggregateFnVTableExt;
     use vortex_array::aggregate_fn::DynAccumulator;
     use vortex_array::aggregate_fn::EmptyOptions;
     use vortex_array::aggregate_fn::session::AggregateFnSessionExt;
@@ -241,10 +349,12 @@ mod tests {
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
     use vortex_array::scalar::Scalar;
+    use vortex_array::stats::StatsSet;
     use vortex_error::VortexResult;
 
     use super::AabbPartial;
     use super::GeometryAabb;
+    use super::LegacyGeometryAabb;
     use super::aabb_dtype;
     use super::rect_from_storage;
     use crate::test_harness::linestring_column;
@@ -273,12 +383,25 @@ mod tests {
     /// The aggregate must be serializable so the zoned writer can persist its zone-stat descriptor.
     #[test]
     fn serializes_for_zone_storage() -> VortexResult<()> {
-        let session = vortex_array::array_session();
-        let metadata = GeometryAabb
-            .serialize(&EmptyOptions)?
-            .expect("GeometryAabb must be serializable to be stored as a zone statistic");
-        GeometryAabb.deserialize(&metadata, &session)?;
+        let session = spatial_session();
+        for aggregate in [
+            GeometryAabb.bind(EmptyOptions),
+            LegacyGeometryAabb.bind(EmptyOptions),
+        ] {
+            let proto = aggregate.serialize_proto()?;
+            assert_eq!(AggregateFnRef::from_proto(&proto, &session)?, aggregate);
+        }
         Ok(())
+    }
+
+    #[test]
+    fn legacy_nan_skipping_aabb_cannot_satisfy_the_new_pruning_stat() {
+        let legacy = LegacyGeometryAabb.bind(EmptyOptions);
+        let current = GeometryAabb.bind(EmptyOptions);
+
+        assert_ne!(legacy.to_string(), current.to_string());
+        assert_eq!(legacy.can_satisfy(&current), AggregateFnSatisfaction::No);
+        assert!(current.can_satisfy(&current).is_exact());
     }
 
     /// The AABB result's corners as `(xmin, ymin, xmax, ymax)`.
@@ -425,9 +548,8 @@ mod tests {
         Ok(())
     }
 
-    /// All-NaN coordinates: `f64::min`/`max` skip the NaNs and `geo::Rect` normalizes the result to
-    /// a valid (whole-plane) box, so such a chunk is always kept. Sound - NaN-coordinate rows can
-    /// never satisfy `distance <= r` anyway.
+    /// All-NaN coordinates explicitly widen the AABB to the whole plane, so no finite distance
+    /// bound can prune the zone.
     #[test]
     fn all_nan_coordinates_kept() -> VortexResult<()> {
         let session = vortex_array::array_session();
@@ -437,8 +559,48 @@ mod tests {
         let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
         acc.accumulate(&column, &mut ctx)?;
 
-        let (xmin, ymin, xmax, ymax) = aabb(&acc.finish()?)?;
-        assert!(xmin <= xmax && ymin <= ymax);
+        assert_eq!(
+            aabb(&acc.finish()?)?,
+            (
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            )
+        );
+        Ok(())
+    }
+
+    /// One NaN point invalidates a finite upper bound for the whole zone, even when another point
+    /// has ordinary finite coordinates.
+    #[test]
+    fn mixed_nan_coordinates_widen_to_the_whole_plane() -> VortexResult<()> {
+        let session = vortex_array::array_session();
+        let mut ctx = session.create_execution_ctx();
+
+        let column = point_column(vec![0.0, f64::NAN], vec![0.0, f64::NAN])?;
+        let mut acc = Accumulator::try_new(GeometryAabb, EmptyOptions, column.dtype().clone())?;
+        acc.accumulate(&column, &mut ctx)?;
+
+        assert_eq!(
+            aabb(&acc.finish()?)?,
+            (
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+                f64::INFINITY,
+                f64::INFINITY,
+            )
+        );
+        Ok(())
+    }
+
+    /// Native point storage is an extension over a struct of floats, so the recursive NaN domain
+    /// must recognize it even though the logical dtype is not itself a primitive float.
+    #[test]
+    fn geometry_dtype_is_recursively_nan_bearing() -> VortexResult<()> {
+        let dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        assert!(dtype.may_contain_nan());
+        assert!(!StatsSet::default().is_nan_free(&dtype));
         Ok(())
     }
 
@@ -458,14 +620,14 @@ mod tests {
         let session = spatial_session();
 
         for column in every_native_column(&[(0.0, 0.0), (1.0, 1.0)])? {
-            assert!(
-                !session
-                    .aggregate_fns()
-                    .zone_stat_defaults(column.dtype())
-                    .is_empty(),
-                "a geometry zone-stat default should be discovered for {}",
-                column.dtype()
+            let defaults = session.aggregate_fns().zone_stat_defaults(column.dtype());
+            assert_eq!(
+                defaults.len(),
+                1,
+                "exactly one geometry zone-stat default should be discovered for {}",
+                column.dtype(),
             );
+            assert_eq!(defaults[0].id(), GeometryAabb.id());
         }
         let i32_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
         assert!(

@@ -42,6 +42,7 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
 use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::fns::all_non_distinct::variant::check_variant_identical;
 use crate::arrays::StructArray;
 use crate::arrays::struct_::StructArrayExt;
@@ -126,6 +127,10 @@ impl AggregateFnVTable for AllNonDistinct {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.all_non_distinct");
         *ID
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::Includes
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

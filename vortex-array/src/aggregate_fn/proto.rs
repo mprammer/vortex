@@ -74,6 +74,7 @@ mod tests {
     use crate::aggregate_fn::AggregateFnVTable;
     use crate::aggregate_fn::AggregateFnVTableExt;
     use crate::aggregate_fn::EmptyOptions;
+    use crate::aggregate_fn::NaNHandling;
     use crate::aggregate_fn::NumericalAggregateOpts;
     use crate::aggregate_fn::fns::sum::Sum;
     use crate::aggregate_fn::fns::sum::SumAggregateOpts;
@@ -93,6 +94,10 @@ mod tests {
         #[expect(clippy::disallowed_methods, reason = "test-only id")]
         fn id(&self) -> AggregateFnId {
             AggregateFnId::new("vortex.test.proto")
+        }
+
+        fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+            NaNHandling::NotApplicable
         }
 
         fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

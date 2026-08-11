@@ -48,6 +48,7 @@ use crate::scalar_fn::fns::operators::CompareOperator;
 use crate::scalar_fn::fns::operators::Operator;
 use crate::scalar_fn::internal::row_count::RowCount;
 use crate::stats::bound::stat;
+use crate::stats::extrema_cast_is_value_preserving;
 use crate::stats::rewrite::StatsRewriteCtx;
 use crate::stats::rewrite::StatsRewriteRule;
 use crate::stats::session::StatsSession;
@@ -690,7 +691,13 @@ fn cast_stat(
     ctx: &StatsRewriteCtx<'_>,
 ) -> Option<BoundExpression> {
     match stat {
-        Stat::Min | Stat::Max => stat_expr(expr, stat, ctx).map(|stat| cast(stat, dtype.clone())),
+        Stat::Min | Stat::Max => {
+            let source_dtype = ctx.return_dtype(expr).ok()?;
+            if !extrema_cast_is_value_preserving(&source_dtype, dtype) {
+                return None;
+            }
+            stat_expr(expr, stat, ctx).map(|stat| cast(stat, dtype.clone()))
+        }
         Stat::NaNCount | Stat::Sum | Stat::UncompressedSizeInBytes => stat_expr(expr, stat, ctx),
         Stat::NullCount | Stat::IsConstant | Stat::IsSorted | Stat::IsStrictSorted => None,
     }
@@ -709,9 +716,6 @@ mod tests {
     use vortex_session::VortexSession;
 
     use crate::aggregate_fn::AggregateFnRef;
-    use crate::aggregate_fn::AggregateFnVTableExt;
-    use crate::aggregate_fn::EmptyOptions as AggregateEmptyOptions;
-    use crate::aggregate_fn::fns::all_non_nan::AllNonNan;
     use crate::dtype::DType;
     use crate::dtype::Nullability;
     use crate::dtype::PType;
@@ -803,19 +807,6 @@ mod tests {
         ($actual:expr, $expected:expr) => {
             assert_eq!($actual, bind_expected($expected)?)
         };
-    }
-
-    fn nan_guarded(expr: Expression, value_predicate: Expression) -> Expression {
-        or(
-            and(
-                eq(stat(expr.clone(), Stat::NaNCount), lit(0u64)),
-                value_predicate.clone(),
-            ),
-            and(
-                stat_fn(expr, AllNonNan.bind(AggregateEmptyOptions)),
-                value_predicate,
-            ),
-        )
     }
 
     #[test]
@@ -1036,17 +1027,11 @@ mod tests {
     }
 
     #[test]
-    fn nan_guard_tracks_cast_source_dtype() -> VortexResult<()> {
+    fn unsafe_float_cast_has_no_extrema_rewrite() -> VortexResult<()> {
         let dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let expr = gt(cast(col("f"), dtype.clone()), lit(5i32));
+        let expr = gt(cast(col("f"), dtype), lit(5i32));
 
-        assert_rewrite_eq!(
-            falsify(&expr)?,
-            Some(nan_guarded(
-                col("f"),
-                lt_eq(cast(stat(col("f"), Stat::Max), dtype), lit(5i32)),
-            ))
-        );
+        assert_rewrite_eq!(falsify(&expr)?, None);
         Ok(())
     }
 

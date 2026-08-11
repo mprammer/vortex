@@ -28,6 +28,7 @@ use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::GroupedAccumulator;
 use crate::aggregate_fn::GroupedAccumulatorRef;
+use crate::aggregate_fn::NaNHandling;
 use crate::dtype::DType;
 
 /// An object-safe, sealed trait for bound aggregate function dispatch.
@@ -38,6 +39,7 @@ pub(super) trait DynAggregateFn: 'static + Send + Sync + super::sealed::Sealed {
     fn as_any(&self) -> &dyn Any;
     fn id(&self) -> AggregateFnId;
     fn options_any(&self) -> &dyn Any;
+    fn nan_handling(&self) -> NaNHandling;
 
     fn coerce_args(&self, input_dtype: &DType) -> VortexResult<DType>;
     fn can_satisfy(&self, requested: &AggregateFnRef) -> AggregateFnSatisfaction;
@@ -76,6 +78,10 @@ impl<V: AggregateFnVTable> DynAggregateFn for AggregateFnInner<V> {
 
     fn options_any(&self) -> &dyn Any {
         &self.options
+    }
+
+    fn nan_handling(&self) -> NaNHandling {
+        V::nan_handling(&self.vtable, &self.options)
     }
 
     fn coerce_args(&self, input_dtype: &DType) -> VortexResult<DType> {

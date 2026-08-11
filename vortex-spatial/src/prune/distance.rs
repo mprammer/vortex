@@ -71,8 +71,9 @@ impl StatsRewriteRule for SpatialDistancePrune {
         let Ok(radius) = f64::try_from(radius) else {
             return Ok(None);
         };
-        // A NaN radius has no sound proof: `distance <op> NaN` is not a total order, so the chunk
-        // must be scanned, not pruned.
+        // A NaN radius admits no sound proof. Arrow's comparison *is* a total order over NaN, but
+        // the bound this pruner reasons with is a numeric distance, and no finite distance is
+        // ordered against NaN in the way the proof assumes — so the chunk must be scanned.
         if radius.is_nan() {
             return Ok(None);
         }
@@ -147,6 +148,8 @@ mod tests {
     use super::SpatialDistancePrune;
     use crate::prune::test_harness::aabb_zone_map;
     use crate::prune::test_harness::empty_zone_map;
+    use crate::prune::test_harness::legacy_aabb_zone_map;
+    use crate::prune::test_harness::zoned_pruning_mask;
     use crate::scalar_fn::distance::SpatialDistance;
     use crate::test_harness::point_column;
     use crate::test_harness::spatial_session;
@@ -315,6 +318,27 @@ mod tests {
         Ok(())
     }
 
+    /// Exercise the same writer/reader path as the NaN regressions with ordinary finite points, so
+    /// a conservative NaN guard cannot silently disable spatial zoned pruning altogether.
+    #[test]
+    fn finite_zoned_layout_still_prunes() -> VortexResult<()> {
+        let session = spatial_session();
+        let mut ctx = session.create_execution_ctx();
+        let column = point_column(vec![100.0, 101.0], vec![100.0, 101.0])?;
+        let dtype = column.dtype().clone();
+        let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
+        let distance = SpatialDistance.new_expr(EmptyOptions, [root(), lit(origin)]);
+        let predicate = lt_eq(distance, lit(1.0f64)).bind(&dtype)?;
+
+        assert_eq!(
+            zoned_pruning_mask(&column, &predicate)?
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![false; column.len()]
+        );
+        Ok(())
+    }
+
     /// The true-distance prune skips a chunk that is *diagonally* farther than `r`, even though
     /// neither axis alone exceeds `r`, the case a per-axis box-overlap test would wrongly keep.
     #[test]
@@ -373,6 +397,50 @@ mod tests {
         Ok(())
     }
 
+    /// The production zoned writer and reader must retain zones with NaN coordinates for every
+    /// supported ordered comparison. A finite AABB proof cannot represent the scan semantics of a
+    /// NaN-bearing geometry; the mixed zone also contains an ordinary matching row for `<`/`<=`.
+    #[rstest]
+    #[case::mixed_lte(true, Operator::Lte)]
+    #[case::mixed_lt(true, Operator::Lt)]
+    #[case::mixed_gte(true, Operator::Gte)]
+    #[case::mixed_gt(true, Operator::Gt)]
+    #[case::all_nan_lte(false, Operator::Lte)]
+    #[case::all_nan_lt(false, Operator::Lt)]
+    #[case::all_nan_gte(false, Operator::Gte)]
+    #[case::all_nan_gt(false, Operator::Gt)]
+    fn nan_coordinate_zones_are_not_pruned(
+        #[case] mixed_with_finite: bool,
+        #[case] operator: Operator,
+    ) -> VortexResult<()> {
+        let session = spatial_session();
+        let mut ctx = session.create_execution_ctx();
+        let positive_nan = f64::from_bits(0x7ff8_0000_0000_0000);
+        let column = if mixed_with_finite {
+            point_column(vec![0.0, positive_nan], vec![0.0, positive_nan])?
+        } else {
+            point_column(
+                vec![positive_nan, positive_nan],
+                vec![positive_nan, positive_nan],
+            )?
+        };
+        let dtype = column.dtype().clone();
+        let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
+        let distance = SpatialDistance.new_expr(EmptyOptions, [root(), lit(origin)]);
+        let predicate = Binary
+            .new_expr(operator, [distance, lit(1.0f64)])
+            .bind(&dtype)?;
+
+        assert_eq!(
+            zoned_pruning_mask(&column, &predicate)?
+                .iter()
+                .collect::<Vec<_>>(),
+            vec![true; column.len()],
+            "{operator:?} removed rows from a zone containing NaN coordinates"
+        );
+        Ok(())
+    }
+
     /// Backward compat: a zone map written without the `GeometryAabb` stat (an older file) keeps
     /// every zone, the missing stat binds to null and `null_as_false` retains the zone.
     #[test]
@@ -392,6 +460,32 @@ mod tests {
 
         let mask = zone_map.prune(&proof, &session)?;
         assert_eq!(mask.iter().collect::<Vec<bool>>(), vec![false, false]);
+        Ok(())
+    }
+
+    /// Empty aggregate metadata identifies an older NaN-skipping AABB. Even a finite legacy box
+    /// cannot satisfy the new NaN-inclusive statistic requested by the pruning rule.
+    #[test]
+    fn legacy_nan_skipping_aabb_keeps_the_zone() -> VortexResult<()> {
+        let session = spatial_session();
+        let mut ctx = session.create_execution_ctx();
+        let point_dtype = point_column(vec![0.0], vec![0.0])?.dtype().clone();
+        let zone_map = legacy_aabb_zone_map(&point_dtype, &[[100.0, 100.0, 101.0, 101.0]])?;
+
+        let origin = point_column(vec![0.0], vec![0.0])?.execute_scalar(0, &mut ctx)?;
+        let distance = SpatialDistance.new_expr(EmptyOptions, [root(), lit(origin)]);
+        let proof = lt_eq(distance, lit(1.0f64))
+            .bind(&point_dtype)?
+            .falsify(&session)?
+            .expect("distance filter should be falsifiable");
+
+        assert_eq!(
+            zone_map
+                .prune(&proof, &session)?
+                .iter()
+                .collect::<Vec<bool>>(),
+            vec![false]
+        );
         Ok(())
     }
 }

@@ -25,6 +25,8 @@ use vortex_array::arrays::struct_::StructArrayExt;
 use vortex_array::dtype::DType;
 use vortex_array::expr::BoundExpression;
 use vortex_array::expr::Expression;
+use vortex_array::expr::bound::and as bound_and;
+use vortex_array::expr::bound::lit as bound_lit;
 use vortex_array::expr::eq;
 use vortex_array::expr::fill_null;
 use vortex_array::expr::get_item;
@@ -41,6 +43,8 @@ use vortex_array::scalar_fn::internal::row_count::contains_row_count;
 use vortex_array::scalar_fn::internal::row_count::substitute_row_count;
 use vortex_array::stats::bind::StatBinder;
 use vortex_array::stats::bind::bind_stats;
+use vortex_array::stats::bound::all_non_nan as bound_all_non_nan;
+use vortex_array::stats::expr::StatFn;
 use vortex_array::validity::Validity;
 use vortex_buffer::buffer;
 use vortex_error::VortexResult;
@@ -146,6 +150,10 @@ impl ZoneMap {
     /// `row_count` is a layout property rather than a stored stats field, and the
     /// final zone may be shorter than the nominal zone length, so it is materialized
     /// only after the predicate has been lowered to the zone-map table.
+    ///
+    /// During lowering, any NaN-skipping aggregate over a NaN-bearing dtype is additionally
+    /// guarded by an all-non-NaN proof. This keeps manually constructed stats predicates sound as
+    /// well as predicates produced by [`BoundExpression::falsify`].
     pub fn prune(
         &self,
         predicate: &BoundExpression,
@@ -168,9 +176,39 @@ impl ZoneMap {
     }
 
     fn lower_stats(&self, predicate: BoundExpression) -> VortexResult<BoundExpression> {
+        let requires_non_nan_guard = requires_non_nan_guard(&predicate);
         let binder = ZoneMapStatsBinder { zone_map: self };
-        bind_stats(predicate, &binder)
+        let predicate = bind_stats(predicate, &binder)?;
+        if !requires_non_nan_guard {
+            return Ok(predicate);
+        }
+
+        // `AllNonNan` is currently defined only for primitive floats. Composite and extension
+        // dtypes can contain floating leaves, but cannot carry a recursive proof, so conservatively
+        // disable the whole pruning predicate rather than use an unsafe bound.
+        if !self.column_dtype.is_float() {
+            return Ok(bound_lit(false));
+        }
+
+        let source_root = BoundExpression::new_root(self.column_dtype.clone());
+        let non_nan_guard = bind_stats(bound_all_non_nan(source_root), &binder)?;
+        Ok(bound_and(non_nan_guard, predicate))
     }
+}
+
+fn requires_non_nan_guard(predicate: &BoundExpression) -> bool {
+    if let Some(options) = predicate.as_opt::<StatFn>()
+        && predicate.child(0).is_root()
+        && predicate.child(0).dtype().may_contain_nan()
+        && options
+            .aggregate_fn()
+            .nan_handling()
+            .requires_nan_free_input()
+    {
+        return true;
+    }
+
+    predicate.children().iter().any(requires_non_nan_guard)
 }
 
 pub(super) fn normalize_sum_partial_fields(
@@ -274,10 +312,15 @@ impl ZoneMap {
     fn aggregate_field_expr(&self, requested: &AggregateFnRef) -> Option<Expression> {
         let field_name = requested.to_string();
         if self.array.unmasked_field_by_name_opt(&field_name).is_some() {
-            return Some(aggregate_result_expr(
-                requested,
-                get_item(field_name, root()),
-            ));
+            let state_expr = get_item(field_name, root());
+            // StatFn exposes stored partial state directly, except Sum whose public stat dtype is
+            // deliberately its scalar result. Approximate satisfaction below also needs the
+            // stored aggregate finalized into the requested aggregate's bound.
+            return Some(if requested.is::<Sum>() {
+                aggregate_result_expr(requested, state_expr)
+            } else {
+                state_expr
+            });
         }
 
         let mut approximate = None;
@@ -400,6 +443,7 @@ mod tests {
     use vortex_array::aggregate_fn::fns::sum::Sum;
     use vortex_array::aggregate_fn::fns::sum::SumAggregateOpts;
     use vortex_array::arrays::BoolArray;
+    use vortex_array::arrays::ExtensionArray;
     use vortex_array::arrays::PrimitiveArray;
     use vortex_array::arrays::StructArray;
     use vortex_array::assert_arrays_eq;
@@ -408,22 +452,30 @@ mod tests {
     use vortex_array::dtype::FieldNames;
     use vortex_array::dtype::Nullability;
     use vortex_array::dtype::PType;
+    use vortex_array::dtype::extension::ExtDType;
+    use vortex_array::dtype::extension::ExtId;
+    use vortex_array::dtype::extension::ExtVTable;
     use vortex_array::expr::BoundExpression;
     use vortex_array::expr::Expression;
     use vortex_array::expr::cast;
+    use vortex_array::expr::get_item;
     use vortex_array::expr::gt;
     use vortex_array::expr::gt_eq;
     use vortex_array::expr::is_not_null;
     use vortex_array::expr::is_null;
     use vortex_array::expr::lit;
     use vortex_array::expr::lt;
+    use vortex_array::expr::lt_eq;
     use vortex_array::expr::not_eq;
     use vortex_array::expr::root;
     use vortex_array::expr::stats::Stat;
+    use vortex_array::scalar::Scalar;
+    use vortex_array::scalar::ScalarValue;
     use vortex_array::stats::all_nan;
     use vortex_array::stats::all_non_nan;
     use vortex_array::stats::all_non_null;
     use vortex_array::stats::all_null;
+    use vortex_array::stats::stat;
     use vortex_array::validity::Validity;
     use vortex_buffer::buffer;
     use vortex_error::VortexResult;
@@ -447,6 +499,38 @@ mod tests {
     fn default_bounded_stat_max_bytes() -> NonZeroUsize {
         // SAFETY: 64 is non-zero.
         unsafe { NonZeroUsize::new_unchecked(64) }
+    }
+
+    #[derive(Clone, Debug, Default, Eq, Hash, PartialEq)]
+    struct TestFloatExt;
+
+    impl ExtVTable for TestFloatExt {
+        type Metadata = String;
+        type NativeValue<'a> = f64;
+
+        #[expect(clippy::disallowed_methods, reason = "test-only extension id")]
+        fn id(&self) -> ExtId {
+            ExtId::new("vortex.test.zoned_float")
+        }
+
+        fn serialize_metadata(&self, metadata: &Self::Metadata) -> VortexResult<Vec<u8>> {
+            Ok(metadata.as_bytes().to_vec())
+        }
+
+        fn deserialize_metadata(&self, metadata: &[u8]) -> VortexResult<Self::Metadata> {
+            Ok(String::from_utf8_lossy(metadata).into_owned())
+        }
+
+        fn validate_dtype(_ext_dtype: &ExtDType<Self>) -> VortexResult<()> {
+            Ok(())
+        }
+
+        fn unpack_native<'a>(
+            _ext_dtype: &'a ExtDType<Self>,
+            _storage_value: &'a ScalarValue,
+        ) -> VortexResult<Self::NativeValue<'a>> {
+            Ok(0.0)
+        }
     }
 
     #[test]
@@ -883,48 +967,158 @@ mod tests {
     }
 
     #[test]
-    fn float_cast_min_max_stat_fn_uses_source_nan_count() {
-        let zone_map = ZoneMap::try_new_legacy(
+    fn raw_float_extrema_predicate_is_guarded_by_nan_count() {
+        let max = Max.bind(NumericalAggregateOpts::skip_nans());
+        let nan_count = NanCount.bind(EmptyOptions);
+        let zone_map = ZoneMap::try_new(
             PType::F32.into(),
             StructArray::from_fields(&[
                 (
-                    "max",
+                    max.to_string(),
                     PrimitiveArray::new(buffer![5.0f32, 5.0], Validity::AllValid).into_array(),
                 ),
                 (
-                    "max_is_truncated",
-                    BoolArray::from_iter([false, false]).into_array(),
-                ),
-                (
-                    "min",
-                    PrimitiveArray::new(buffer![5.0f32, 5.0], Validity::AllValid).into_array(),
-                ),
-                (
-                    "min_is_truncated",
-                    BoolArray::from_iter([false, false]).into_array(),
-                ),
-                (
-                    "nan_count",
+                    nan_count.to_string(),
                     PrimitiveArray::new(buffer![1u64, 0], Validity::AllValid).into_array(),
                 ),
             ])
             .unwrap(),
-            Arc::new([Stat::Max, Stat::Min, Stat::NaNCount]),
+            Arc::new([max.clone(), nan_count]),
             4,
             8,
         )
         .unwrap();
 
-        let cast_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
-        let expr = not_eq(cast(root(), cast_dtype), lit(5i32));
-        let pruning_expr = falsify(&expr, PType::F32.into());
-
-        let mask = zone_map.prune(&pruning_expr, &SESSION).unwrap();
+        let raw_stats_predicate = lt_eq(stat(root(), max), lit(5.0f32));
+        let mask = prune(&zone_map, &raw_stats_predicate).unwrap();
         assert_arrays_eq!(
             mask.into_array(),
             BoolArray::from_iter([false, true]),
             &mut SESSION.create_execution_ctx()
         );
+    }
+
+    #[test]
+    fn float_extension_extrema_are_disabled_without_a_recursive_nan_proof() -> VortexResult<()> {
+        let ext_dtype = ExtDType::<TestFloatExt>::try_new(
+            String::new(),
+            DType::Primitive(PType::F64, Nullability::NonNullable),
+        )?
+        .erased();
+        let column_dtype = DType::Extension(ext_dtype.clone());
+        let min = Min.bind(NumericalAggregateOpts::skip_nans());
+        let min_values = ExtensionArray::new(
+            ext_dtype.with_nullability(Nullability::Nullable),
+            PrimitiveArray::from_option_iter([Some(5.0f64)]).into_array(),
+        )
+        .into_array();
+        let zone_map = ZoneMap::try_new(
+            column_dtype,
+            StructArray::from_fields(&[(min.to_string(), min_values)])?,
+            Arc::new([min.clone()]),
+            1,
+            1,
+        )?;
+        let bound = Scalar::extension_ref(ext_dtype, Scalar::from(5.0f64));
+        let raw_stats_predicate = lt_eq(stat(root(), min), lit(bound));
+
+        let mask = prune(&zone_map, &raw_stats_predicate)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([false]),
+            &mut SESSION.create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_float_bounded_min_predicate_is_guarded_by_nan_count() -> VortexResult<()> {
+        let bounded_min = BoundedMin.bind(BoundedMinOptions {
+            max_bytes: default_bounded_stat_max_bytes(),
+        });
+        let nan_count = NanCount.bind(EmptyOptions);
+        let zone_map = ZoneMap::try_new(
+            PType::F32.into(),
+            StructArray::from_fields(&[
+                (
+                    bounded_min.to_string(),
+                    PrimitiveArray::new(buffer![5.0f32, 5.0], Validity::AllValid).into_array(),
+                ),
+                (
+                    nan_count.to_string(),
+                    PrimitiveArray::new(buffer![1u64, 0], Validity::AllValid).into_array(),
+                ),
+            ])?,
+            Arc::new([bounded_min.clone(), nan_count]),
+            4,
+            8,
+        )?;
+
+        let raw_stats_predicate = lt_eq(stat(root(), bounded_min), lit(5.0f32));
+        let mask = prune(&zone_map, &raw_stats_predicate)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([false, true]),
+            &mut SESSION.create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_float_bounded_max_predicate_is_guarded_by_nan_count() -> VortexResult<()> {
+        let bounded_max = BoundedMax.bind(BoundedMaxOptions {
+            max_bytes: default_bounded_stat_max_bytes(),
+        });
+        let nan_count = NanCount.bind(EmptyOptions);
+        let bounded_max_partials = StructArray::try_from_iter_with_validity(
+            [
+                (
+                    BOUNDED_MAX_BOUND,
+                    PrimitiveArray::new(buffer![5.0f32, 5.0], Validity::AllValid).into_array(),
+                ),
+                (
+                    BOUNDED_MAX_UNKNOWN,
+                    BoolArray::from_iter([false, false]).into_array(),
+                ),
+            ],
+            Validity::AllValid,
+        )?
+        .into_array();
+        let zone_map = ZoneMap::try_new(
+            PType::F32.into(),
+            StructArray::from_fields(&[
+                (bounded_max.to_string(), bounded_max_partials),
+                (
+                    nan_count.to_string(),
+                    PrimitiveArray::new(buffer![1u64, 0], Validity::AllValid).into_array(),
+                ),
+            ])?,
+            Arc::new([bounded_max.clone(), nan_count]),
+            4,
+            8,
+        )?;
+
+        let raw_stats_predicate = lt_eq(
+            get_item(BOUNDED_MAX_BOUND, stat(root(), bounded_max)),
+            lit(5.0f32),
+        );
+        let mask = prune(&zone_map, &raw_stats_predicate)?;
+        assert_arrays_eq!(
+            mask.into_array(),
+            BoolArray::from_iter([false, true]),
+            &mut SESSION.create_execution_ctx()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn unsafe_float_to_integer_cast_has_no_extrema_rewrite() -> VortexResult<()> {
+        let cast_dtype = DType::Primitive(PType::I32, Nullability::NonNullable);
+        let expr = not_eq(cast(root(), cast_dtype), lit(5i32));
+        let expr = expr.bind(&DType::from(PType::F32))?;
+
+        assert!(expr.falsify(&SESSION)?.is_none());
+        Ok(())
     }
 
     #[test]
@@ -950,7 +1144,7 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
+        let predicate = is_null(stat(root(), max_fn));
 
         // Missing StatFn lowers to a nullable null literal, so `is_null(...)` is true for every zone.
         let mask = prune(&zone_map, &predicate).unwrap();
@@ -975,7 +1169,7 @@ mod tests {
         let max_fn = Stat::Max
             .aggregate_fn()
             .expect("max should have an aggregate function");
-        let predicate = is_null(vortex_array::stats::stat(root(), max_fn));
+        let predicate = is_null(stat(root(), max_fn));
         let error = prune(&zone_map, &predicate).unwrap_err();
 
         assert!(

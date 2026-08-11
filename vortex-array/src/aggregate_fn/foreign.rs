@@ -16,6 +16,7 @@ use crate::aggregate_fn::AggregateFn;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::NaNHandling;
 use crate::dtype::DType;
 use crate::scalar::Scalar;
 
@@ -55,6 +56,10 @@ impl AggregateFnVTable for ForeignAggregateFnVTable {
 
     fn id(&self) -> AggregateFnId {
         self.id
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::Unknown
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

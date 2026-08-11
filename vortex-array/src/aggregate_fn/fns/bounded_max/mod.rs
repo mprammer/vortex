@@ -23,6 +23,7 @@ use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnRef;
 use crate::aggregate_fn::AggregateFnSatisfaction;
 use crate::aggregate_fn::AggregateFnVTable;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::aggregate_fn::fns::max::Max;
 use crate::aggregate_fn::fns::min_max::MinMax;
@@ -128,6 +129,10 @@ impl AggregateFnVTable for BoundedMax {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.bounded_max");
         *ID
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::Skips
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

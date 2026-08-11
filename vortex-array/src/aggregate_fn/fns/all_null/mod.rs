@@ -12,6 +12,7 @@ use crate::IntoArray;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::EmptyOptions;
+use crate::aggregate_fn::NaNHandling;
 use crate::dtype::DType;
 use crate::dtype::Nullability;
 use crate::scalar::Scalar;
@@ -29,6 +30,10 @@ impl AggregateFnVTable for AllNull {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.all_null");
         *ID
+    }
+
+    fn nan_handling(&self, _options: &Self::Options) -> NaNHandling {
+        NaNHandling::NotApplicable
     }
 
     fn serialize(&self, _options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {

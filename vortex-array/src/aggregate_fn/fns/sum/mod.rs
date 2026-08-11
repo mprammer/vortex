@@ -34,6 +34,7 @@ use crate::aggregate_fn::Accumulator;
 use crate::aggregate_fn::AggregateFnId;
 use crate::aggregate_fn::AggregateFnVTable;
 use crate::aggregate_fn::DynAccumulator;
+use crate::aggregate_fn::NaNHandling;
 use crate::aggregate_fn::NumericalAggregateOpts;
 use crate::arrays::ConstantArray;
 use crate::arrays::StructArray;
@@ -185,6 +186,14 @@ impl AggregateFnVTable for Sum {
     fn id(&self) -> AggregateFnId {
         static ID: CachedId = CachedId::new("vortex.sum");
         *ID
+    }
+
+    fn nan_handling(&self, options: &Self::Options) -> NaNHandling {
+        if options.skip_nans {
+            NaNHandling::Skips
+        } else {
+            NaNHandling::Includes
+        }
     }
 
     fn serialize(&self, options: &Self::Options) -> VortexResult<Option<Vec<u8>>> {
