@@ -1,7 +1,8 @@
 # Experiment kernels, 2026-08-10 (branch `mp/onpair-expts-0810`)
 
-Forked from the frozen harness `9b4714c2a`. All four mirror the shipped
-512-thread `split8read` operating point (`chunk_size` 128, `block_warps` 16).
+Forked from the frozen harness `9b4714c2a`. The first four mirror the shipped
+512-thread `split8read` operating point (`chunk_size` 128, `block_warps` 16); the
+fifth has its own launch contract and is not registered.
 
 | kernel | question | retirement |
 |---|---|---|
@@ -9,6 +10,7 @@ Forked from the frozen harness `9b4714c2a`. All four mirror the shipped
 | `onpair_shmem_4tpt_split8read_hilo` | Does a disjoint stride-8 `dict_hi` (64 KB read working set vs 96 KB) beat the shipped kernel's duplicated low half? | promote if it wins, else delete |
 | `onpair_shmem_4tpt_split8read_bounds` | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once E-A is settled either way |
 | `onpair_shmem_4tpt_split8read_bounds_faultinj` | Control. Identical but claims one byte more than it writes, so it MUST trap. | delete with the above |
+| `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **NOT REGISTERED, never compiled, never run.** | promote only after a differential test and a warp-wide look-back; else delete |
 
 ## Why the bounds probe checks what it checks
 
@@ -91,3 +93,33 @@ recorded bound and the host check must fail.
 Cost: one extra buffer argument and its `KernelLayout`, plus a host verification pass.
 Also worth checking the offsets table itself against the output allocation in release
 builds; today that invariant is only a `debug_assert_eq!` in `chunk_offsets()`.
+
+
+---
+
+## The look-back draft is REJECTED as written (gauntlet `cli-gauntlet-9e1f2c8dc41f`)
+
+Fixed since the review:
+
+- **Payload race (the real bug).** `part_value` was reused for both the `A`
+  aggregate and the `P` inclusive prefix, so a successor could observe `A`, then
+  read a value the owner had *since overwritten* with its prefix, and double-count
+  every block before it. Split into two write-once arrays `part_agg` / `part_inc`,
+  so the payload a flag refers to is immutable.
+- **Memory model.** `volatile` + `__threadfence()` does not establish inter-block
+  happens-before, and `__threadfence_block()` in the spin was the wrong scope
+  entirely. Flags now use device-scope `st.release.gpu` / `ld.acquire.gpu`.
+- **Launch contract** (block shape, descriptor capacity = `gridDim.x`, ticket and
+  flag zeroing per launch, grid must cover the input) is now stated in the header.
+  The kernel cannot check any of it.
+
+Still outstanding, and why no number from this kernel means anything yet:
+
+- No caller, no compilation evidence, no differential test against the shipped
+  kernel, no scratch lifecycle implementation.
+- The look-back is serial in one thread where CUB uses a warp ballot over 32
+  predecessors. **A win despite that scaffolding would be informative; a loss would
+  establish nothing** about whether an optimised fused look-back is competitive.
+  Do not let a slow draft close this question.
+- Timing must report kernel-only *and* reset-inclusive cost, since zeroing the
+  descriptors is work the stored-offsets path never pays.

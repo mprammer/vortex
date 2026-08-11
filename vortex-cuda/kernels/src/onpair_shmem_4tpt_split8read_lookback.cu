@@ -47,14 +47,31 @@
 // Kernel signature differs from every other variant: there is NO chunk_offsets
 // argument. The three scratch buffers replace it.
 //
-// KNOWN GAPS IN THIS DRAFT (all deliberate, none load-bearing for feasibility):
-//   - The look-back is serial in one thread. CUB inspects 32 predecessors per step
-//     with a warp-wide ballot. Expect this draft to be materially slower than the
-//     achievable rate; it establishes correctness and shape, not the number.
-//   - Descriptor reads use volatile + __threadfence(). CUB uses acquire/release
-//     atomics, which are cheaper and are the right end state.
-//   - part_flag / part_value must be zeroed before every launch.
-//   - No fallback when a column has more chunks than the descriptor array.
+// LAUNCH CONTRACT — the caller MUST honour all of it; the kernel cannot check it:
+//   - 1-D block, threads a multiple of 32, 32..512 (the warp mask, the `warps`
+//     computation and the fixed 16-warp shared arrays all assume this).
+//   - part_agg, part_inc and part_flag each hold at least gridDim.x entries. They
+//     are indexed by the DYNAMIC block id, which ranges over gridDim.x, NOT by a
+//     chunk count. A short buffer corrupts memory.
+//   - ticket == 0 and every used part_flag entry == LB_X before EVERY launch. A
+//     retained ticket skips work, indexes out of bounds, or waits forever on a
+//     descriptor no live block will publish. Scratch must be launch-private, or
+//     synchronised across streams.
+//   - The grid must cover total_tokens exactly: there is no grid-stride loop, so an
+//     undersized grid silently drops input.
+//
+// BLOCKERS BEFORE ANY NUMBER FROM THIS KERNEL MEANS ANYTHING (gauntlet
+// cli-gauntlet-9e1f2c8dc41f, verdict reject — these are NOT cosmetic):
+//   - Never compiled, never run, no differential test against the shipped kernel,
+//     no caller. build.rs compiles every .cu in this directory, so its presence
+//     here is not evidence that it works.
+//   - The look-back is serial in ONE thread; CUB inspects 32 predecessors per step
+//     with a warp ballot. This draft's RATE is therefore not the achievable rate.
+//     A WIN despite this scaffolding would be informative; a LOSS would establish
+//     nothing about whether an optimised fused look-back is competitive. That
+//     asymmetry is the whole reason to be careful with this kernel's numbers.
+//   - Timing must report both kernel-only and reset-inclusive cost, since zeroing
+//     the descriptors is real work the stored-offsets path does not pay.
 
 #ifndef WARPS_PER_BLOCK_MAX
 #define WARPS_PER_BLOCK_MAX 16u
@@ -68,6 +85,18 @@
 #define LB_X 0u  // invalid: this block has published nothing yet
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
+
+// Device-scope release store / acquire load. volatile + __threadfence() does NOT
+// establish inter-block happens-before, and __threadfence_block() is the wrong
+// scope entirely: a successor can consume a flag without its payload.
+__device__ __forceinline__ void lb_store_flag_release(uint32_t *p, uint32_t v) {
+    asm volatile("st.release.gpu.u32 [%0], %1;" ::"l"(p), "r"(v) : "memory");
+}
+__device__ __forceinline__ uint32_t lb_load_flag_acquire(const uint32_t *p) {
+    uint32_t v;
+    asm volatile("ld.acquire.gpu.u32 %0, [%1];" : "=r"(v) : "l"(p) : "memory");
+    return v;
+}
 
 __device__ inline uint32_t warp_inclusive_scan_u32_lb(uint32_t x, int lane) {
     constexpr unsigned mask = 0xffffffffu;
@@ -85,8 +114,8 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     const uint16_t *__restrict codes, const uint8_t *__restrict dict_s8,
     const uint8_t *__restrict dict_padded, const uint8_t *__restrict lens,
     uint8_t *__restrict output_bytes, uint64_t total_tokens,
-    uint32_t *__restrict ticket, uint64_t *__restrict part_value,
-    uint32_t *__restrict part_flag) {
+    uint32_t *__restrict ticket, uint64_t *__restrict part_agg,
+    uint64_t *__restrict part_inc, uint32_t *__restrict part_flag) {
     constexpr unsigned mask = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.x >> 5;
@@ -146,41 +175,37 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
             block_total += s_warp_tot[w];
         }
 
-        volatile uint64_t *pv = part_value;
-        volatile uint32_t *pf = part_flag;
-
         uint64_t exclusive = 0;
         if (blk == 0u) {
-            pv[0] = block_total;
-            __threadfence();
-            pf[0] = LB_P;
+            // Head: aggregate IS the inclusive prefix. Both payloads written before
+            // the release store, so any observer that sees the flag sees the values.
+            part_agg[0] = block_total;
+            part_inc[0] = block_total;
+            lb_store_flag_release(&part_flag[0], LB_P);
         } else {
-            // Publish our own aggregate first so successors can start.
-            pv[blk] = block_total;
-            __threadfence();
-            pf[blk] = LB_A;
+            part_agg[blk] = block_total;
+            lb_store_flag_release(&part_flag[blk], LB_A);
 
-            // Walk back until we meet someone who knows their inclusive prefix.
             uint32_t i = blk - 1u;
             for (;;) {
-                uint32_t f = pf[i];
-                while (f == LB_X) {  // predecessor has not published yet
-                    __threadfence_block();
-                    f = pf[i];
+                uint32_t f = lb_load_flag_acquire(&part_flag[i]);
+                while (f == LB_X) {
+                    f = lb_load_flag_acquire(&part_flag[i]);
                 }
-                const uint64_t v = pv[i];
-                exclusive += v;
+                // Each payload is written exactly once and never mutated, so the
+                // flag we observed cannot go stale against the value we read.
                 if (f == LB_P) {
-                    break;  // v was an inclusive prefix: done
+                    exclusive += part_inc[i];
+                    break;
                 }
+                exclusive += part_agg[i];
                 if (i == 0u) {
-                    break;  // reached the head with only aggregates
+                    break;
                 }
                 --i;
             }
-            pv[blk] = exclusive + block_total;
-            __threadfence();
-            pf[blk] = LB_P;
+            part_inc[blk] = exclusive + block_total;
+            lb_store_flag_release(&part_flag[blk], LB_P);
         }
         s_block_excl = exclusive;
     }
