@@ -945,6 +945,17 @@ struct GpuOnPairChunk {
     codes_offsets: vortex::array::buffer::BufferHandle,
     dict_padded: vortex::array::buffer::BufferHandle,
     dict_s8: vortex::array::buffer::BufferHandle,
+    /// Fused-positioning scratch (`KernelLayout::FusedPositions`). `ticket` is a
+    /// single u32 the blocks atomically claim dynamic ids from; the three descriptor
+    /// arrays are indexed by that id and are therefore sized by GRID width, not by
+    /// chunk count. Zeroed once here; the kernel's epoch tag makes per-launch
+    /// clearing unnecessary, so the only per-launch reset is the 4-byte ticket.
+    lb_ticket: vortex::array::buffer::BufferHandle,
+    lb_part_agg: vortex::array::buffer::BufferHandle,
+    lb_part_inc: vortex::array::buffer::BufferHandle,
+    lb_part_flag: vortex::array::buffer::BufferHandle,
+    /// Grid width the descriptor arrays were sized for.
+    lb_capacity: usize,
     /// E-B high table. Authoritative layout: `dict_s8` holds an entry's logical
     /// bytes 0..8 and `dict_hi` holds its logical bytes 8..16, both at stride 8 and
     /// both zero-padded past the entry's true length. Together they carry the same
@@ -1027,6 +1038,11 @@ enum KernelLayout {
     /// dedicated stride-8 `dict_hi` instead of `dict_padded + code*16 + 8`, so the
     /// two tables are disjoint (64 KB total at 4,096 entries, against 96 KB).
     SplitRead8HiLo,
+    /// Fused output positioning: no `chunk_offsets` argument at all. Each block
+    /// claims a dynamic id and derives its output base by decoupled look-back over
+    /// per-block partial sums, so positions are produced DURING the decode rather
+    /// than read from the sidecar or regenerated in a separate pass.
+    FusedPositions,
     /// E-A: `SplitRead8` with in-kernel drain-bounds assertions. Instrumented, not
     /// shipped; its rate is not a decode measurement.
     SplitRead8Bounds,
@@ -1049,6 +1065,13 @@ fn shdict8_shared_bytes(dict_entries: usize, block_warps: u32) -> usize {
 /// `ONPAIR_CLUSTER_N` in `onpair_shmem_4tpt_cluster_dsmem.cu`.
 #[cfg(feature = "cuda")]
 const ONPAIR_CLUSTER_N: u32 = 8;
+
+/// Strictly-increasing launch epoch for `KernelLayout::FusedPositions`. The kernel
+/// packs it into the high 30 bits of each descriptor flag so stale descriptors from a
+/// previous launch read as unpublished, which is what lets us skip clearing
+/// gridDim.x entries per launch. Wraps at 2^30 launches, far past any benchmark.
+#[cfg(feature = "cuda")]
+static FUSED_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
 /// Dynamic-shared cap for `ClusterDsmem` (Blackwell allows ~227 KB/block; stay
 /// under it with margin). A cluster slice + warp staging above this is rejected.
@@ -1159,6 +1182,12 @@ const GPU_KERNELS: &[KernelVariant] = &[
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_hilo",
         layout: KernelLayout::SplitRead8HiLo,
+        chunk_size: 128,
+        block_warps: 16,
+    },
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_lookback",
+        layout: KernelLayout::FusedPositions,
         chunk_size: 128,
         block_warps: 16,
     },
@@ -2067,6 +2096,10 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let mut dict_s8 = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
     // E-B: disjoint high half, bytes 8..16 of each entry at stride 8.
     let mut dict_hi = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
+    // Descriptor capacity: the fused-positioning kernel indexes by dynamic block id,
+    // so it needs one entry per BLOCK in the widest grid we might launch. The
+    // narrowest registered block is 2 warps, so chunks/2 + slack bounds every case.
+    let lb_cap = (total_tokens as usize).div_ceil(128).div_ceil(2) + 64;
     let mut dict_s4 = vec![0u8; lens_table.len() * 4 + vortex_onpair::MAX_TOKEN_SIZE];
     let mut dict_const1 = vec![0u8; lens_table.len()];
     let mut dict_const2 = vec![0u8; lens_table.len() * 2];
@@ -2151,6 +2184,11 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
         dict_padded: ctx.copy_to_device::<u8, _>(dict_padded)?.await?,
         dict_s8: ctx.copy_to_device::<u8, _>(dict_s8)?.await?,
         dict_hi: ctx.copy_to_device::<u8, _>(dict_hi)?.await?,
+        lb_ticket: ctx.copy_to_device::<u32, _>(vec![0u32; 1])?.await?,
+        lb_part_agg: ctx.copy_to_device::<u64, _>(vec![0u64; lb_cap])?.await?,
+        lb_part_inc: ctx.copy_to_device::<u64, _>(vec![0u64; lb_cap])?.await?,
+        lb_part_flag: ctx.copy_to_device::<u32, _>(vec![0u32; lb_cap])?.await?,
+        lb_capacity: lb_cap,
         dict_s4: ctx.copy_to_device::<u8, _>(dict_s4)?.await?,
         dict_const1: ctx.copy_to_device::<u8, _>(dict_const1)?.await?,
         dict_const2: ctx.copy_to_device::<u8, _>(dict_const2)?.await?,
@@ -2409,6 +2447,7 @@ fn inapplicable_reason(variant: KernelVariant, chunks: &[GpuOnPairChunk]) -> Opt
         | KernelLayout::SplitRead8
         | KernelLayout::SplitRead8HiLo
         | KernelLayout::SplitRead8Bounds
+        | KernelLayout::FusedPositions
         | KernelLayout::SplitRead4
         | KernelLayout::RegCache => None,
         KernelLayout::Stride8 => chunks
@@ -2671,7 +2710,8 @@ fn time_kernel_variant(
                 // approximation rather than an oversight.
                 KernelLayout::SplitRead8
                 | KernelLayout::SplitRead8HiLo
-                | KernelLayout::SplitRead8Bounds => (&c.dict_s8, c.dict_s8.len()),
+                | KernelLayout::SplitRead8Bounds
+                | KernelLayout::FusedPositions => (&c.dict_s8, c.dict_s8.len()),
                 KernelLayout::LenBucket => (&c.dict_lenbucket, c.dict_lenbucket.len()),
                 _ => (&c.dict_padded, c.dict_padded.len()),
             };
@@ -2917,6 +2957,50 @@ fn launch_variant(
                     .arg(&lens)
                     .arg(&output)
                     .arg(&total_tokens);
+            })?;
+        }
+        KernelLayout::FusedPositions => {
+            let dict_s8 = chunk.dict_s8.cuda_view::<u8>()?;
+            let dict_padded = chunk.dict_padded.cuda_view::<u8>()?;
+            let lens = chunk.lens.cuda_view::<u8>()?;
+            let cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
+            let blocks = cfg.grid_dim.0 as usize;
+            if blocks > chunk.lb_capacity {
+                anyhow::bail!(
+                    "fused-positioning descriptors hold {} entries, grid needs {blocks}",
+                    chunk.lb_capacity
+                );
+            }
+            // NOTHING is reset between launches, which matters for the comparison:
+            // a per-launch clear of gridDim.x descriptors would be work the
+            // stored-offsets path never pays, and would sit inside the timed region.
+            // Two devices avoid it:
+            //   - descriptor flags are tagged with `epoch`; a mismatched tag reads as
+            //     unpublished, so last launch's entries are inert.
+            //   - the ticket is never rewound. Each launch is handed the base its
+            //     dynamic ids start from, and the kernel subtracts it. Exact because
+            //     every launch through this layout uses the same grid width, so the
+            //     ticket advances by exactly `blocks` each time.
+            // Both are why `epoch` must be strictly increasing and never reused.
+            let ticket = chunk.lb_ticket.cuda_view::<u32>()?;
+            let epoch = FUSED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let ticket_base = (epoch - 1) * (blocks as u32);
+            let part_agg = chunk.lb_part_agg.cuda_view::<u64>()?;
+            let part_inc = chunk.lb_part_inc.cuda_view::<u64>()?;
+            let part_flag = chunk.lb_part_flag.cuda_view::<u32>()?;
+            ctx.launch_kernel_config(function, cfg, chunk.total_tokens, |args| {
+                args.arg(&codes)
+                    .arg(&dict_s8)
+                    .arg(&dict_padded)
+                    .arg(&lens)
+                    .arg(&output)
+                    .arg(&total_tokens)
+                    .arg(&ticket)
+                    .arg(&part_agg)
+                    .arg(&part_inc)
+                    .arg(&part_flag)
+                    .arg(&epoch)
+                    .arg(&ticket_base);
             })?;
         }
         KernelLayout::SplitRead8HiLo => {

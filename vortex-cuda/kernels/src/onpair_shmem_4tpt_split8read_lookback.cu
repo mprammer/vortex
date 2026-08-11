@@ -53,10 +53,16 @@
 //   - part_agg, part_inc and part_flag each hold at least gridDim.x entries. They
 //     are indexed by the DYNAMIC block id, which ranges over gridDim.x, NOT by a
 //     chunk count. A short buffer corrupts memory.
-//   - ticket == 0 and every used part_flag entry == LB_X before EVERY launch. A
-//     retained ticket skips work, indexes out of bounds, or waits forever on a
-//     descriptor no live block will publish. Scratch must be launch-private, or
-//     synchronised across streams.
+//   - `ticket_base` equal to the ticket's value before this launch, i.e. the total
+//     number of blocks all previous launches through this buffer consumed. The
+//     ticket is monotonic and never rewound, so nothing needs resetting; getting the
+//     base wrong makes blocks claim ids outside the descriptor array.
+//   - `epoch` STRICTLY INCREASING across launches that share the descriptor arrays,
+//     and never reused. Descriptors do NOT need clearing: a flag whose tagged epoch
+//     differs from the current one reads as LB_X. The arrays need zeroing exactly
+//     once, at allocation, so that epoch 0 sees no false positives.
+//   - Scratch must be launch-private, or the epoch must be advanced under the same
+//     synchronisation that orders the launches.
 //   - The grid must cover total_tokens exactly: there is no grid-stride loop, so an
 //     undersized grid silently drops input.
 //
@@ -65,13 +71,8 @@
 //   - Never compiled, never run, no differential test against the shipped kernel,
 //     no caller. build.rs compiles every .cu in this directory, so its presence
 //     here is not evidence that it works.
-//   - The look-back is serial in ONE thread; CUB inspects 32 predecessors per step
-//     with a warp ballot. This draft's RATE is therefore not the achievable rate.
-//     A WIN despite this scaffolding would be informative; a LOSS would establish
-//     nothing about whether an optimised fused look-back is competitive. That
-//     asymmetry is the whole reason to be careful with this kernel's numbers.
-//   - Timing must report both kernel-only and reset-inclusive cost, since zeroing
-//     the descriptors is real work the stored-offsets path does not pay.
+//   - Timing: the only per-launch reset is the 4-byte ticket, by construction of the
+//     epoch scheme, so kernel-only timing is not hiding a descriptor-clearing cost.
 
 #ifndef WARPS_PER_BLOCK_MAX
 #define WARPS_PER_BLOCK_MAX 16u
@@ -81,10 +82,18 @@
 #endif
 #define WARP_BUF_BYTES 2080u
 
-// Partition-descriptor flags.
-#define LB_X 0u  // invalid: this block has published nothing yet
+// Partition-descriptor states, stored in the low 2 bits of a flag word whose high
+// 30 bits carry the LAUNCH EPOCH. A flag whose epoch differs from the current one is
+// a leftover from a previous launch and reads as LB_X. That removes the requirement
+// to clear gridDim.x descriptors before every launch, which would otherwise be real
+// work the stored-offsets path never pays and would confound the comparison. Only
+// the 4-byte ticket needs resetting per launch.
+#define LB_X 0u  // nothing published yet (or stale epoch)
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
+#define LB_TAG(epoch, st) (((epoch) << 2) | (st))
+#define LB_EPOCH_OF(w) ((w) >> 2)
+#define LB_STATE_OF(w) ((w) & 3u)
 
 // Device-scope release store / acquire load. volatile + __threadfence() does NOT
 // establish inter-block happens-before, and __threadfence_block() is the wrong
@@ -115,7 +124,8 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     const uint8_t *__restrict dict_padded, const uint8_t *__restrict lens,
     uint8_t *__restrict output_bytes, uint64_t total_tokens,
     uint32_t *__restrict ticket, uint64_t *__restrict part_agg,
-    uint64_t *__restrict part_inc, uint32_t *__restrict part_flag) {
+    uint64_t *__restrict part_inc, uint32_t *__restrict part_flag,
+    uint32_t epoch, uint32_t ticket_base) {
     constexpr unsigned mask = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.x >> 5;
@@ -126,7 +136,10 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     __shared__ uint64_t s_warp_tot[WARPS_PER_BLOCK_MAX];
     __shared__ uint64_t s_block_excl;
     if (threadIdx.x == 0) {
-        s_blk = atomicAdd(ticket, 1u);
+        // The ticket is never rewound between launches; the host hands us the
+        // base this launch's ids start from, so no reset is needed and no clearing
+        // work lands inside the timed region.
+        s_blk = atomicAdd(ticket, 1u) - ticket_base;
     }
     __syncthreads();
     const uint32_t blk = s_blk;
@@ -168,8 +181,11 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     }
     __syncthreads();
 
-    // ---- 4. decoupled look-back, performed by thread 0 -------------------------
-    if (threadIdx.x == 0) {
+    // ---- 4. decoupled look-back, warp-wide -------------------------------------
+    // Warp 0 inspects 32 predecessors per step, as CUB does. A serial walk would
+    // make a SLOW result uninterpretable: it could not distinguish "fused
+    // positioning is uncompetitive" from "this look-back is a toy".
+    if (warp_id == 0u) {
         uint64_t block_total = 0;
         for (uint32_t w = 0; w < warps; ++w) {
             block_total += s_warp_tot[w];
@@ -177,37 +193,73 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
 
         uint64_t exclusive = 0;
         if (blk == 0u) {
-            // Head: aggregate IS the inclusive prefix. Both payloads written before
-            // the release store, so any observer that sees the flag sees the values.
-            part_agg[0] = block_total;
-            part_inc[0] = block_total;
-            lb_store_flag_release(&part_flag[0], LB_P);
-        } else {
-            part_agg[blk] = block_total;
-            lb_store_flag_release(&part_flag[blk], LB_A);
-
-            uint32_t i = blk - 1u;
-            for (;;) {
-                uint32_t f = lb_load_flag_acquire(&part_flag[i]);
-                while (f == LB_X) {
-                    f = lb_load_flag_acquire(&part_flag[i]);
-                }
-                // Each payload is written exactly once and never mutated, so the
-                // flag we observed cannot go stale against the value we read.
-                if (f == LB_P) {
-                    exclusive += part_inc[i];
-                    break;
-                }
-                exclusive += part_agg[i];
-                if (i == 0u) {
-                    break;
-                }
-                --i;
+            if (lane == 0) {
+                // Both payloads are written before the release store, so any
+                // observer that sees the flag also sees the values.
+                part_agg[0] = block_total;
+                part_inc[0] = block_total;
+                lb_store_flag_release(&part_flag[0], LB_TAG(epoch, LB_P));
             }
-            part_inc[blk] = exclusive + block_total;
-            lb_store_flag_release(&part_flag[blk], LB_P);
+        } else {
+            if (lane == 0) {
+                part_agg[blk] = block_total;
+                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch, LB_A));
+            }
+            __syncwarp();
+
+            // Window of 32 predecessors, closest first: lane 0 inspects blk-1.
+            int64_t window_end = (int64_t)blk;  // exclusive
+            for (;;) {
+                const int64_t idx = window_end - 1 - (int64_t)lane;
+                uint32_t st;
+                uint64_t v;
+                if (idx < 0) {
+                    // Off the left end of the grid: an empty prefix, which is a
+                    // known inclusive value of zero. Terminates the walk.
+                    st = LB_P;
+                    v = 0;
+                } else {
+                    // Poll this lane's own predecessor until it publishes. The warp
+                    // advances only when NO lane still sees LB_X, which is what
+                    // makes the flag/payload pairing safe to read below.
+                    for (;;) {
+                        const uint32_t w = lb_load_flag_acquire(&part_flag[idx]);
+                        st = (LB_EPOCH_OF(w) == epoch) ? LB_STATE_OF(w) : LB_X;
+                        if (__all_sync(mask, st != LB_X)) {
+                            break;
+                        }
+                    }
+                    v = (st == LB_P) ? part_inc[idx] : part_agg[idx];
+                }
+
+                // The closest predecessor holding an inclusive prefix ends the walk.
+                // Summing v over lanes 0..firstP is exactly the exclusive prefix,
+                // because that lane contributes an inclusive value and the lanes
+                // nearer to us contribute aggregates.
+                const unsigned pmask = __ballot_sync(mask, st == LB_P);
+                const int firstP = (pmask == 0u) ? 32 : (__ffs((int)pmask) - 1);
+                uint64_t contrib = ((int)lane <= firstP) ? v : 0;
+#pragma unroll
+                for (int off = 16; off > 0; off >>= 1) {
+                    contrib += __shfl_down_sync(mask, contrib, off);
+                }
+                contrib = __shfl_sync(mask, contrib, 0);
+                exclusive += contrib;
+
+                if (pmask != 0u) {
+                    break;
+                }
+                window_end -= 32;
+            }
+
+            if (lane == 0) {
+                part_inc[blk] = exclusive + block_total;
+                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch, LB_P));
+            }
         }
-        s_block_excl = exclusive;
+        if (lane == 0) {
+            s_block_excl = exclusive;
+        }
     }
     __syncthreads();
 
