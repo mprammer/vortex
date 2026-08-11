@@ -67,6 +67,7 @@
 //! [`DataSourceRef`]: vortex::scan::DataSourceRef
 //! [`ScanRequest`]: vortex::scan::ScanRequest
 
+use std::any::Any;
 use std::fmt;
 use std::fmt::Formatter;
 use std::sync::Arc;
@@ -91,6 +92,7 @@ use datafusion_functions_aggregate::sum::sum_udaf;
 use datafusion_physical_expr::EquivalenceProperties;
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::Column;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_common::sort_expr::LexOrdering;
@@ -120,8 +122,9 @@ use vortex::io::session::RuntimeSessionExt;
 use vortex::scan::DataSourceRef;
 use vortex::scan::ScanRequest;
 use vortex::session::VortexSession;
+use vortex::utils::aliases::hash_map::HashMap;
+use vortex::utils::aliases::hash_set::HashSet;
 use vortex_arrow::ArrowSessionExt;
-use vortex_utils::aliases::hash_map::HashMap;
 use vortex_utils::parallelism::get_available_parallelism;
 
 use crate::PrecisionExt;
@@ -251,19 +254,19 @@ impl VortexDataSourceBuilder {
         };
 
         // Whether the Arrow schema and the Vortex fields describe the same columns in the same
-        // order.
+        // order — checked, rather than assumed or blanket-refused.
         //
         // `with_arrow_schema` is documented as unvalidated against the Vortex dtype, and
         // `vortex-arrow`'s struct executor zips the two *positionally*. A supplied schema of
         // `[b, a]` over a Vortex dtype of `[a, b]` therefore emits Vortex field `a` under Arrow
-        // name `b`, while the statistics below are computed in Vortex field order and installed
-        // positionally against the Arrow schema — so one field's exact bounds would be published
-        // for another. Harmless while every statistic was unknown; not once a file answers them.
+        // name `b`: data identity is positional while statistics resolve by name, and nothing
+        // downstream reconciles that.
         //
         // Refusing whenever a schema was supplied would be sound and useless: `VortexTable::scan`
         // always supplies one, so it would disable footer statistics on the only public path that
         // has them. The supplied schema is virtually always *derived* from this same dtype, in
         // which case both identities agree, so the agreement is verified instead.
+        let schema_matches_dtype = schema_names_match(&arrow_schema, &fields);
         let Some(source_fields) = self.data_source.dtype().as_struct_fields_opt() else {
             vortex_bail!("Statistics require a struct data source");
         };
@@ -297,24 +300,56 @@ impl VortexDataSourceBuilder {
             }
         }
 
-        // Type-checked before publication: the Arrow mapping and the scalar conversion are produced
-        // by different code, so a Vortex string column can surface as `Utf8View` while its bounds
-        // convert to `Utf8`, or a decimal as `Decimal128` against `Decimal32` bounds.
-        let initial_leftover_statistics: Vec<ColumnStatistics> = statistics
-            .iter()
-            .zip(arrow_schema.fields())
-            .map(|(stat, field)| retain_type_compatible(stat, field.data_type()))
-            .collect();
+        // The scan selects a pushed-down column by name, so retain the statistics and source Arrow
+        // type under that identity. Duplicate names are ambiguous and removed.
+        //
+        // A caller-supplied Arrow schema is unvalidated and is paired with Vortex fields
+        // positionally during conversion. When its names do not agree with the projected Vortex
+        // fields, `field_indices` is empty and no name-based statistics are published. A matching
+        // supplied schema remains usable; `VortexTable::scan` always supplies one.
+        let mut statistics_by_name: HashMap<String, NamedColumnStatistics> = HashMap::new();
+        let mut ambiguous: HashSet<String> = HashSet::new();
+        for &idx in &field_indices {
+            let name = fields.names()[idx].to_string();
+            if statistics_by_name
+                .insert(
+                    name.clone(),
+                    NamedColumnStatistics {
+                        data_type: arrow_schema.field(idx).data_type().clone(),
+                        statistics: statistics[idx].clone(),
+                    },
+                )
+                .is_some()
+            {
+                ambiguous.insert(name);
+            }
+        }
+        for name in &ambiguous {
+            statistics_by_name.remove(name);
+        }
+
+        // Type-checked here as well as on swap: a source that is never swapped still publishes
+        // these, and the Arrow mapping may have chosen a view or wider decimal type than the scalar
+        // conversion produced.
+        let initial_leftover_statistics: Vec<ColumnStatistics> = if !schema_matches_dtype {
+            vec![ColumnStatistics::new_unknown(); arrow_schema.fields().len()]
+        } else {
+            statistics
+                .iter()
+                .zip(arrow_schema.fields())
+                .map(|(stat, field)| retain_type_compatible(stat, field.data_type()))
+                .collect()
+        };
 
         Ok(VortexDataSource {
             data_source: self.data_source,
             session: self.session,
             initial_schema: Arc::clone(&arrow_schema),
             initial_projection: projection.clone(),
-            initial_statistics: statistics.clone(),
+            initial_statistics_by_name: Arc::new(statistics_by_name),
+            projection_pushdown_phase: ProjectionPushdownPhase::Initial,
             projected_projection: projection.clone(),
             projected_schema: Arc::clone(&arrow_schema),
-            projected_statistics: statistics,
             leftover_projection: None,
             leftover_schema: arrow_schema,
             leftover_statistics: initial_leftover_statistics,
@@ -324,6 +359,16 @@ impl VortexDataSourceBuilder {
             num_partitions: get_available_parallelism().unwrap_or(1),
         })
     }
+}
+
+/// Whether the Arrow output names agree positionally with the projected Vortex fields.
+fn schema_names_match(schema: &Schema, fields: &StructFields) -> bool {
+    schema.fields().len() == fields.nfields()
+        && schema
+            .fields()
+            .iter()
+            .zip(fields.names().iter())
+            .all(|(arrow_field, vortex_name)| arrow_field.name() == vortex_name.as_ref())
 }
 
 /// Return the source-field positions whose footer statistics can be installed safely.
@@ -337,13 +382,7 @@ fn statistics_field_indices(
     source_fields: &StructFields,
     session: &VortexSession,
 ) -> Vec<usize> {
-    if schema.fields().len() != fields.nfields()
-        || schema
-            .fields()
-            .iter()
-            .zip(fields.names().iter())
-            .any(|(arrow_field, vortex_name)| arrow_field.name() != vortex_name.as_ref())
-    {
+    if !schema_names_match(schema, fields) {
         return Vec::new();
     }
 
@@ -379,6 +418,18 @@ impl VortexDataSource {
     }
 }
 
+#[derive(Clone)]
+struct NamedColumnStatistics {
+    data_type: DataType,
+    statistics: ColumnStatistics,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ProjectionPushdownPhase {
+    Initial,
+    Swapped,
+}
+
 /// DataFusion [`DataSource`] backed by a Vortex [`DataSourceRef`].
 ///
 /// `VortexDataSource` is the core execution adapter for the `v2` integration.
@@ -407,9 +458,10 @@ pub struct VortexDataSource {
     initial_schema: SchemaRef,
     /// The initial Vortex projection expression (e.g. column selection from the builder).
     initial_projection: Expression,
-    /// Column statistics for the initial projection columns.
-    #[expect(dead_code)]
-    initial_statistics: Vec<ColumnStatistics>,
+    /// Statistics and source types keyed by the Vortex field name used for scan resolution.
+    initial_statistics_by_name: Arc<HashMap<String, NamedColumnStatistics>>,
+    /// Whether DataFusion has already swapped a projection through this source.
+    projection_pushdown_phase: ProjectionPushdownPhase,
 
     // --- Phase 2: Projected (pushed into the Vortex scan) ---
     /// The Vortex projection expression sent in the [`ScanRequest`].
@@ -417,13 +469,12 @@ pub struct VortexDataSource {
     projected_projection: Expression,
     /// The Arrow schema of the Vortex scan output (before any leftover projection).
     projected_schema: SchemaRef,
-    /// Column statistics for the projected (scan output) columns.
-    projected_statistics: Vec<ColumnStatistics>,
 
     // --- Phase 3: Leftover (applied by DataFusion after the scan) ---
     /// DataFusion projection expressions that could not be pushed into the Vortex scan.
     /// Applied after converting arrays to record batches in [`DataSource::open`].
-    /// `None` when all projection expressions were successfully pushed down.
+    /// Set after the first projection swap, including when the expression set is empty; this option
+    /// controls projector construction and is not the projection-pushdown phase marker.
     leftover_projection: Option<ProjectionExprs>,
     /// The Arrow schema after applying the leftover projection.
     /// This is the output schema seen by DataFusion.
@@ -650,6 +701,14 @@ impl DataSource for VortexDataSource {
         &self,
         projection: &ProjectionExprs,
     ) -> DFResult<Option<Arc<dyn DataSource>>> {
+        // A projection handed to this method is expressed against the current output schema. This
+        // implementation can compose only with the builder's initial projection, so accepting a
+        // second swap would resolve its indices and output types against the wrong schema. Leave
+        // the later ProjectionExec above this source instead.
+        if self.projection_pushdown_phase == ProjectionPushdownPhase::Swapped {
+            return Ok(None);
+        }
+
         tracing::debug!(
             "VortexScanSource: trying to swap with projection: {}",
             projection
@@ -689,14 +748,16 @@ impl DataSource for VortexDataSource {
         let final_schema = Arc::new(projected_schema);
 
         let mut this = self.clone();
+        this.projection_pushdown_phase = ProjectionPushdownPhase::Swapped;
         this.projected_projection = scan_projection;
         this.projected_schema = Arc::clone(&scan_output_schema);
-        this.projected_statistics =
-            vec![ColumnStatistics::new_unknown(); scan_output_schema.fields().len()];
         this.leftover_projection = Some(leftover_projection);
         this.leftover_schema = Arc::clone(&final_schema);
-        this.leftover_statistics =
-            vec![ColumnStatistics::new_unknown(); final_schema.fields().len()];
+        this.leftover_statistics = project_statistics(
+            &self.initial_statistics_by_name,
+            projection,
+            final_schema.as_ref(),
+        );
 
         Ok(Some(Arc::new(this)))
     }
@@ -709,6 +770,15 @@ impl DataSource for VortexDataSource {
         if filters.is_empty() {
             return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
                 vec![],
+            ));
+        }
+
+        // DataFusion supplies filters in terms of this source's current output schema. After a
+        // projection swap, this implementation would still resolve them against `initial_schema`,
+        // potentially filtering on a different source field. Keep the FilterExec above the source.
+        if self.projection_pushdown_phase == ProjectionPushdownPhase::Swapped {
+            return Ok(FilterPushdownPropagation::with_parent_pushdown_result(
+                vec![PushedDown::No; filters.len()],
             ));
         }
 
@@ -794,15 +864,64 @@ fn sanitise_against_row_count(
     out
 }
 
-/// Drops any scalar statistic whose type disagrees with the column it describes.
+/// Carries the source's column statistics through a projection, where that is provably exact.
 ///
-/// The Arrow schema and the scalar conversion are produced by different code paths, so a Vortex
-/// string column can surface as `Utf8View` while its bounds convert to `Utf8`, or a decimal as
-/// `Decimal128` while its bounds convert to `Decimal32`. DataFusion compares these literals against
-/// the column, and a type-mismatched bound is at best ignored and at worst misapplied.
+/// # Why by name, and why so many refusals
 ///
-/// `Sum` is checked against DataFusion's widened result type. This excludes unsupported inputs such
-/// as booleans and decimal values whose Vortex storage width differs from the width DataFusion keeps
+/// The scan resolves a pushed-down column by **name** — `convert::exprs` lowers a `Column` to
+/// `get_item(col.name(), root())` — so the statistic follows that name. The source Arrow type is
+/// retained with it because DataFusion derives the projection's output type from the column index;
+/// a stale name/index pair can therefore select one source field while declaring another's type.
+///
+/// Everything this cannot prove yields `new_unknown()`, because the asymmetry is severe. An absent
+/// statistic costs an optimisation; a wrong one is used to prune partitions and to fold an aggregate
+/// into a literal, and produces a wrong answer. The refusals are:
+///
+/// - a non-`Column` output, whose bounds do not follow from its input's;
+/// - a name with no statistics, or one that was ambiguous in the source dtype;
+/// - a **repeated output alias**, because alias collisions let the pushed-down projection deliver
+///   the same column twice while these entries still describe two different ones;
+/// - a source field whose Arrow type disagrees with the output type;
+/// - a scalar statistic whose type disagrees with that type (or, for `Sum`, with DataFusion's
+///   widened result type), since separate conversion paths may produce, for example, a `Utf8`
+///   bound for a `Utf8View` field.
+fn project_statistics(
+    by_name: &HashMap<String, NamedColumnStatistics>,
+    projection: &ProjectionExprs,
+    output_schema: &Schema,
+) -> Vec<ColumnStatistics> {
+    let output_len = output_schema.fields().len();
+    let mut out = vec![ColumnStatistics::new_unknown(); output_len];
+
+    // Repeated aliases are refused wholesale rather than per-column: a collision changes which
+    // column the scan delivers for an output, and that is not localised to the colliding pair.
+    let mut aliases = HashSet::new();
+    if !projection.iter().all(|p| aliases.insert(p.alias.as_str())) {
+        return out;
+    }
+
+    for (idx, proj) in projection.iter().enumerate().take(output_len) {
+        let Some(column) = (proj.expr.as_ref() as &dyn Any).downcast_ref::<Column>() else {
+            continue;
+        };
+        let Some(named_stats) = by_name.get(column.name()) else {
+            continue;
+        };
+        let output_type = output_schema.field(idx).data_type();
+        if named_stats.data_type != *output_type {
+            continue;
+        }
+        out[idx] = retain_type_compatible(&named_stats.statistics, output_type);
+    }
+    out
+}
+
+/// Drops scalar statistics whose types disagree with DataFusion's interpretation of the column.
+///
+/// The Arrow schema and scalar conversion are produced by different code paths. For example, a
+/// Vortex string column surfaces as `Utf8View` while its scalar bounds convert to `Utf8`.
+/// `Sum` is checked against DataFusion's widened result type, excluding unsupported inputs such as
+/// booleans and decimal values whose Vortex storage width differs from the width DataFusion keeps
 /// while widening precision.
 fn retain_type_compatible(stats: &ColumnStatistics, data_type: &DataType) -> ColumnStatistics {
     let compatible =
@@ -817,20 +936,83 @@ fn retain_type_compatible(stats: &ColumnStatistics, data_type: &DataType) -> Col
     let mut out = stats.clone();
     out.min_value = compatible(&stats.min_value, data_type);
     out.max_value = compatible(&stats.max_value, data_type);
-    out.sum_value = datafusion_sum_type(data_type).map_or(DFPrecision::Absent, |sum_type| {
-        compatible(&stats.sum_value, &sum_type)
-    });
+    out.sum_value = match datafusion_sum_type(data_type) {
+        Ok(Some(sum_type)) => compatible(&stats.sum_value, &sum_type),
+        Ok(None) => DFPrecision::Absent,
+        Err(error) => {
+            tracing::warn!(
+                input_type = ?data_type,
+                %error,
+                "failed to resolve DataFusion SUM type; withholding the Vortex sum statistic"
+            );
+            DFPrecision::Absent
+        }
+    };
     out
 }
 
 /// DataFusion's result dtype for `SUM` after its implicit numeric coercions.
-fn datafusion_sum_type(data_type: &DataType) -> Option<DataType> {
-    let sum = sum_udaf();
-    let input = Arc::new(Field::new("sum_arg", data_type.clone(), true));
-    let coerced = fields_with_udf(&[input], sum.as_ref()).ok()?;
-    sum.return_field(&coerced)
-        .ok()
-        .map(|field| field.data_type().clone())
+///
+/// Expected non-numeric inputs return `Ok(None)`. Once an input is in SUM's supported domain,
+/// coercion and return-field failures indicate a DataFusion/API mismatch and are returned with
+/// context rather than being silently treated as an unsupported type.
+fn datafusion_sum_type(data_type: &DataType) -> DFResult<Option<DataType>> {
+    datafusion_sum_type_with(data_type, |data_type| {
+        let sum = sum_udaf();
+        let input = Arc::new(Field::new("sum_arg", data_type.clone(), true));
+        let coerced = fields_with_udf(&[input], sum.as_ref()).map_err(|error| {
+            DataFusionError::Context(
+                format!("failed to coerce DataFusion SUM input {data_type}"),
+                Box::new(error),
+            )
+        })?;
+        sum.return_field(&coerced)
+            .map(|field| field.data_type().clone())
+            .map_err(|error| {
+                DataFusionError::Context(
+                    format!("failed to derive DataFusion SUM return field for {data_type}"),
+                    Box::new(error),
+                )
+            })
+    })
+}
+
+fn datafusion_sum_type_with(
+    data_type: &DataType,
+    resolve: impl FnOnce(&DataType) -> DFResult<DataType>,
+) -> DFResult<Option<DataType>> {
+    if !datafusion_sum_supports(data_type) {
+        return Ok(None);
+    }
+
+    resolve(data_type).map(Some).map_err(|error| {
+        DataFusionError::Context(
+            format!("failed to resolve supported DataFusion SUM input {data_type}"),
+            Box::new(error),
+        )
+    })
+}
+
+fn datafusion_sum_supports(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Int8
+            | DataType::Int16
+            | DataType::Int32
+            | DataType::Int64
+            | DataType::UInt8
+            | DataType::UInt16
+            | DataType::UInt32
+            | DataType::UInt64
+            | DataType::Float16
+            | DataType::Float32
+            | DataType::Float64
+            | DataType::Decimal32(..)
+            | DataType::Decimal64(..)
+            | DataType::Decimal128(..)
+            | DataType::Decimal256(..)
+            | DataType::Duration(_)
+    ) || matches!(data_type, DataType::Dictionary(_, value) if datafusion_sum_supports(value))
 }
 
 #[cfg(test)]
@@ -841,8 +1023,13 @@ mod tests {
 
     use datafusion::prelude::SessionContext;
     use datafusion_common::arrow::array::Float64Array;
+    use datafusion_common::arrow::array::Int64Array;
     use datafusion_common::arrow::datatypes::i256;
+    use datafusion_common::config::ConfigOptions;
+    use datafusion_expr::Operator;
+    use datafusion_physical_expr::expressions::BinaryExpr;
     use datafusion_physical_expr::expressions::Literal;
+    use datafusion_physical_expr::projection::ProjectionExpr;
     use datafusion_physical_plan::placeholder_row::PlaceholderRowExec;
     use datafusion_physical_plan::projection::ProjectionExec;
     use vortex::VortexSessionDefault;
@@ -1092,6 +1279,108 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn vortex_table_projection_preserves_only_column_extrema() -> anyhow::Result<()> {
+        let session = VortexSession::default();
+        let array = StructArray::from_fields(&[
+            ("a", PrimitiveArray::from_iter([7i64, 1, 4]).into_array()),
+            ("b", PrimitiveArray::from_iter([20i64, 30, 10]).into_array()),
+        ])?
+        .into_array();
+        let mut bytes = Vec::new();
+        session
+            .write_options()
+            .write(&mut bytes, array.to_array_stream())
+            .await?;
+
+        let file = session.open_options().open_buffer(bytes)?;
+        let arrow_schema = Arc::new(session.arrow().to_arrow_schema(file.dtype())?);
+        let ctx = SessionContext::new();
+        ctx.register_table(
+            "projected",
+            Arc::new(VortexTable::new(file.data_source()?, session, arrow_schema)),
+        )?;
+
+        let extrema = ctx
+            .sql(
+                "SELECT MIN(b_alias), MAX(a_alias) \
+                 FROM (SELECT b AS b_alias, a AS a_alias FROM projected)",
+            )
+            .await?;
+        let extrema_plan = extrema.create_physical_plan().await?;
+        let projection = extrema_plan
+            .downcast_ref::<ProjectionExec>()
+            .ok_or_else(|| anyhow::anyhow!("projected extrema were not folded to literals"))?;
+        if !projection.input().is::<PlaceholderRowExec>() {
+            anyhow::bail!("projected extrema did not use footer statistics");
+        }
+        let literals = projection
+            .expr()
+            .iter()
+            .map(|expr| {
+                expr.expr
+                    .downcast_ref::<Literal>()
+                    .ok_or_else(|| anyhow::anyhow!("folded extrema were not literals"))
+                    .map(|literal| literal.value().clone())
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        assert_eq!(
+            literals,
+            vec![ScalarValue::Int64(Some(10)), ScalarValue::Int64(Some(7))]
+        );
+
+        let computed = ctx
+            .sql(
+                "SELECT MIN(computed) \
+                 FROM (SELECT a + b AS computed FROM projected)",
+            )
+            .await?;
+        let computed_plan = computed.create_physical_plan().await?;
+        assert!(
+            !computed_plan
+                .downcast_ref::<ProjectionExec>()
+                .is_some_and(|projection| projection.input().is::<PlaceholderRowExec>()),
+            "a computed projection must not inherit either input column's extrema"
+        );
+        let batches = computed.collect().await?;
+        let values = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("MIN(computed) did not produce Int64"))?;
+        assert_eq!(values.value(0), 14);
+        Ok(())
+    }
+
+    async fn unique_adapter() -> VortexResult<VortexDataSource> {
+        let dtype = DType::Struct(
+            StructFields::from_iter([
+                ("a", DType::Primitive(PType::I64, Nullability::NonNullable)),
+                ("b", DType::Primitive(PType::I64, Nullability::NonNullable)),
+            ]),
+            Nullability::NonNullable,
+        );
+        let source: DataSourceRef = Arc::new(StatisticsDataSource {
+            dtype,
+            calls: AtomicUsize::new(0),
+        });
+        let arrow_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, false),
+            Field::new("b", DataType::Int64, false),
+        ]));
+        VortexDataSource::builder(source, VortexSession::default())
+            .with_arrow_schema(arrow_schema)
+            .build()
+            .await
+    }
+
+    fn column_projection(name: &str, index: usize) -> ProjectionExprs {
+        ProjectionExprs::new(vec![ProjectionExpr {
+            expr: Arc::new(Column::new(name, index)),
+            alias: name.to_string(),
+        }])
+    }
+
     #[test]
     fn initial_statistics_require_unambiguous_matching_names() {
         let fields = StructFields::from_iter([
@@ -1219,6 +1508,62 @@ mod tests {
         Ok(())
     }
 
+    #[tokio::test]
+    async fn a_second_projection_swap_is_declined() -> Result<(), Box<dyn std::error::Error>> {
+        let adapter = unique_adapter().await?;
+        let first = adapter
+            .try_swapping_with_projection(&column_projection("b", 1))?
+            .ok_or_else(|| std::io::Error::other("first projection was not swapped"))?;
+        let mut first = first
+            .downcast_ref::<VortexDataSource>()
+            .ok_or_else(|| std::io::Error::other("expected VortexDataSource"))?
+            .clone();
+        assert_eq!(
+            first.projection_pushdown_phase,
+            ProjectionPushdownPhase::Swapped
+        );
+
+        // The safety boundary is the explicit phase, not the representation of residual work.
+        first.leftover_projection = None;
+
+        assert!(
+            first
+                .try_swapping_with_projection(&column_projection("b", 0))?
+                .is_none()
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn a_filter_after_projection_swap_is_declined() -> Result<(), Box<dyn std::error::Error>>
+    {
+        let adapter = unique_adapter().await?;
+        let first = adapter
+            .try_swapping_with_projection(&column_projection("b", 1))?
+            .ok_or_else(|| std::io::Error::other("first projection was not swapped"))?;
+        let mut first = first
+            .downcast_ref::<VortexDataSource>()
+            .ok_or_else(|| std::io::Error::other("expected VortexDataSource"))?
+            .clone();
+        assert_eq!(
+            first.projection_pushdown_phase,
+            ProjectionPushdownPhase::Swapped
+        );
+
+        // The safety boundary is the explicit phase, not the representation of residual work.
+        first.leftover_projection = None;
+        let filter: Arc<dyn PhysicalExpr> = Arc::new(BinaryExpr::new(
+            Arc::new(Column::new("b", 0)),
+            Operator::Eq,
+            Arc::new(Literal::new(ScalarValue::Int64(Some(9)))),
+        ));
+
+        let result = first.try_pushdown_filters(vec![filter], &ConfigOptions::default())?;
+        assert!(matches!(result.filters.as_slice(), [PushedDown::No]));
+        assert!(result.updated_node.is_none());
+        Ok(())
+    }
+
     #[test]
     fn sum_statistics_follow_datafusion_result_types() {
         let mut stats = ColumnStatistics::new_unknown();
@@ -1256,5 +1601,293 @@ mod tests {
             retain_type_compatible(&stats, &DataType::Decimal128(30, 2)).sum_value,
             DFPrecision::Absent
         );
+    }
+
+    #[test]
+    fn datafusion_sum_type_distinguishes_unsupported_inputs_from_failures() -> anyhow::Result<()> {
+        let unsupported = datafusion_sum_type_with(&DataType::Boolean, |_| {
+            Err(DataFusionError::Internal(
+                "the resolver ran for an unsupported SUM input".to_string(),
+            ))
+        })?;
+        assert_eq!(unsupported, None);
+
+        let failure = datafusion_sum_type_with(&DataType::Int32, |_| {
+            Err(DataFusionError::Plan(
+                "synthetic SUM coercion failure".to_string(),
+            ))
+        });
+        let Err(failure) = failure else {
+            anyhow::bail!("a supported SUM input's coercion failure was swallowed")
+        };
+        let message = failure.to_string();
+        assert!(message.contains("supported DataFusion SUM input Int32"));
+        assert!(message.contains("synthetic SUM coercion failure"));
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod statistics_tests {
+    use arrow_schema::Field;
+    use datafusion_physical_expr::expressions::Column;
+    use datafusion_physical_expr::expressions::Literal;
+    use datafusion_physical_expr::projection::ProjectionExpr;
+    use datafusion_physical_expr::projection::ProjectionExprs;
+    use vortex::dtype::PType;
+
+    use super::*;
+
+    fn stats_with_max(v: i64) -> ColumnStatistics {
+        ColumnStatistics::new_unknown()
+            .with_max_value(DFPrecision::Exact(ScalarValue::Int64(Some(v))))
+    }
+
+    fn named_statistics(
+        data_type: DataType,
+        statistics: ColumnStatistics,
+    ) -> NamedColumnStatistics {
+        NamedColumnStatistics {
+            data_type,
+            statistics,
+        }
+    }
+
+    fn by_name(pairs: &[(&str, i64)]) -> HashMap<String, NamedColumnStatistics> {
+        pairs
+            .iter()
+            .map(|(n, v)| {
+                (
+                    (*n).to_string(),
+                    named_statistics(DataType::Int64, stats_with_max(*v)),
+                )
+            })
+            .collect()
+    }
+
+    fn schema_of(fields: &[(&str, DataType)]) -> Schema {
+        Schema::new(
+            fields
+                .iter()
+                .map(|(n, t)| Field::new(*n, t.clone(), true))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn int_schema(names: &[&str]) -> Schema {
+        schema_of(
+            &names
+                .iter()
+                .map(|n| (*n, DataType::Int64))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    fn col(name: &str, idx: usize) -> ProjectionExpr {
+        ProjectionExpr {
+            expr: Arc::new(Column::new(name, idx)),
+            alias: name.to_string(),
+        }
+    }
+
+    /// A reordering projection carries each column's statistics to its new position.
+    #[test]
+    fn a_reordering_projection_moves_statistics_with_the_columns() {
+        let stats = by_name(&[("a", 10), ("b", 20), ("c", 30)]);
+        let out_schema = int_schema(&["c", "a"]);
+        let projection = ProjectionExprs::new(vec![col("c", 2), col("a", 0)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+
+        assert_eq!(out[0].max_value, stats["c"].statistics.max_value);
+        assert_eq!(out[1].max_value, stats["a"].statistics.max_value);
+    }
+
+    /// Resolution follows the column NAME, not its index.
+    ///
+    /// The scan lowers a column to `get_item(name, root())`. When the named field and output field
+    /// have the same type, a stale index must not change which statistics follow the scanned data.
+    #[test]
+    fn resolution_follows_the_name_not_the_index() {
+        let stats = by_name(&[("a", 10), ("b", 20)]);
+        let out_schema = int_schema(&["b"]);
+        // Names "b" but carries a stale index of 0.
+        let projection = ProjectionExprs::new(vec![col("b", 0)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(
+            out[0].max_value, stats["b"].statistics.max_value,
+            "the name must decide, because the scan resolves by name"
+        );
+    }
+
+    /// A computed output must report unknown rather than inherit its input's bounds.
+    #[test]
+    fn a_computed_column_is_not_given_its_inputs_statistics() {
+        let stats = by_name(&[("a", 10)]);
+        let out_schema = int_schema(&["a", "lit"]);
+        let projection = ProjectionExprs::new(vec![
+            col("a", 0),
+            ProjectionExpr {
+                expr: Arc::new(Literal::new(ScalarValue::Int64(Some(7)))),
+                alias: "lit".to_string(),
+            },
+        ]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(out[0].max_value, stats["a"].statistics.max_value);
+        assert_eq!(out[1].max_value, DFPrecision::Absent);
+    }
+
+    /// Repeated output aliases suppress statistics entirely.
+    ///
+    /// A collision lets the pushed-down projection deliver one column twice while these entries
+    /// still describe two different ones, so nothing here can be trusted positionally.
+    #[test]
+    fn a_repeated_output_alias_suppresses_everything() {
+        let stats = by_name(&[("a", 10), ("b", 20)]);
+        let out_schema = int_schema(&["dup", "dup"]);
+        let projection = ProjectionExprs::new(vec![
+            ProjectionExpr {
+                expr: Arc::new(Column::new("a", 0)),
+                alias: "dup".to_string(),
+            },
+            ProjectionExpr {
+                expr: Arc::new(Column::new("b", 1)),
+                alias: "dup".to_string(),
+            },
+        ]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(out[0].max_value, DFPrecision::Absent);
+        assert_eq!(out[1].max_value, DFPrecision::Absent);
+    }
+
+    /// A bound whose scalar type disagrees with the output column is dropped.
+    ///
+    /// The Arrow mapping and the scalar conversion are produced by different code, so a column can
+    /// surface as `Utf8View` while its bounds convert to `Utf8`.
+    #[test]
+    fn a_type_mismatched_bound_is_dropped() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "s".to_string(),
+            named_statistics(
+                DataType::Utf8View,
+                ColumnStatistics::new_unknown()
+                    .with_max_value(DFPrecision::Exact(ScalarValue::Utf8(Some("z".into())))),
+            ),
+        );
+        let out_schema = schema_of(&[("s", DataType::Utf8View)]);
+        let projection = ProjectionExprs::new(vec![col("s", 0)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(
+            out[0].max_value,
+            DFPrecision::Absent,
+            "a Utf8 bound must not be published for a Utf8View column"
+        );
+    }
+
+    /// A name with no statistics yields unknown.
+    #[test]
+    fn an_unknown_name_is_unknown_rather_than_a_panic() {
+        let stats = by_name(&[("a", 10)]);
+        let out_schema = int_schema(&["missing"]);
+        let projection = ProjectionExprs::new(vec![col("missing", 7)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(out[0].max_value, DFPrecision::Absent);
+    }
+
+    /// A schema whose names match the Vortex fields in order is usable.
+    ///
+    /// This is the case that matters: `VortexTable::scan` *always* supplies an Arrow schema, so a
+    /// rule refusing whenever one was supplied would be sound and useless — it would disable footer
+    /// statistics on the only public path that has them. The supplied schema is virtually always
+    /// derived from the same dtype, and agreement is what makes name and position interchangeable.
+    #[test]
+    fn a_matching_supplied_schema_is_usable() {
+        assert!(schema_agrees(&["a", "b", "c"], &["a", "b", "c"]));
+    }
+
+    /// Reordered, renamed, or differently sized schemas are refused.
+    ///
+    /// The struct executor zips Vortex to Arrow fields positionally, so `[b, a]` over `[a, b]`
+    /// emits Vortex `a` under Arrow name `b` — data identity positional, statistics by name.
+    #[test]
+    fn a_reordered_or_renamed_supplied_schema_is_refused() {
+        assert!(!schema_agrees(&["b", "a"], &["a", "b"]), "reordered");
+        assert!(!schema_agrees(&["x", "b"], &["a", "b"]), "renamed");
+        assert!(!schema_agrees(&["a"], &["a", "b"]), "wrong arity");
+    }
+
+    /// Exercise the same agreement helper used by `build`.
+    fn schema_agrees(arrow_names: &[&str], vortex_names: &[&str]) -> bool {
+        let schema = int_schema(arrow_names);
+        let fields = StructFields::from_iter(vortex_names.iter().map(|name| {
+            (
+                *name,
+                DType::Primitive(PType::I64, Nullability::NonNullable),
+            )
+        }));
+        schema_names_match(&schema, &fields)
+    }
+
+    /// A widened Sum survives when the named source field and output field have the same type.
+    #[test]
+    fn a_widened_sum_is_not_discarded() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "n".to_string(),
+            named_statistics(
+                DataType::Int32,
+                ColumnStatistics::new_unknown()
+                    .with_sum_value(DFPrecision::Exact(ScalarValue::Int64(Some(99)))),
+            ),
+        );
+        // The column is Int32; its sum is Int64.
+        let out_schema = schema_of(&[("n", DataType::Int32)]);
+        let projection = ProjectionExprs::new(vec![col("n", 0)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(
+            out[0].sum_value,
+            DFPrecision::Exact(ScalarValue::Int64(Some(99))),
+            "a widened sum must be kept"
+        );
+    }
+
+    /// A stale index cannot carry a named field's widened sum into an output of another type.
+    #[test]
+    fn a_source_output_type_mismatch_drops_all_statistics() {
+        let mut stats = HashMap::new();
+        stats.insert(
+            "n".to_string(),
+            named_statistics(
+                DataType::Int32,
+                ColumnStatistics::new_unknown()
+                    .with_sum_value(DFPrecision::Exact(ScalarValue::Int64(Some(99)))),
+            ),
+        );
+        // The name selects the Int32 field `n`, but the stale index made DataFusion declare an
+        // Int64 output field. The Int64 sum scalar alone cannot prove it belongs to that output.
+        let out_schema = schema_of(&[("n", DataType::Int64)]);
+        let projection = ProjectionExprs::new(vec![col("n", 1)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(out[0], ColumnStatistics::new_unknown());
+    }
+
+    /// More projection expressions than output fields must not overrun.
+    #[test]
+    fn a_longer_projection_than_output_does_not_overrun() {
+        let stats = by_name(&[("a", 10), ("b", 20)]);
+        let out_schema = int_schema(&["a"]);
+        let projection = ProjectionExprs::new(vec![col("a", 0), col("b", 1)]);
+
+        let out = project_statistics(&stats, &projection, &out_schema);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].max_value, stats["a"].statistics.max_value);
     }
 }
