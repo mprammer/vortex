@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 
-// E-B (2026-08-10): `split8read` with a TRUE disjoint hi/lo dictionary split.
+// Disjoint dictionary halves (2026-08-10): `split8read` with a TRUE disjoint hi/lo dictionary split.
 //
 // The shipped kernel reads the low eight bytes from the stride-8 `dict_s8` and,
 // for `len > 8`, the high eight from `dict_padded + code*16 + 8` — a stride-16

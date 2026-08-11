@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 
-// E1b (2026-08-10): `onpair_shmem_4tpt_split8read` with the read-once `codes`
+// Non-caching code load (2026-08-10): `onpair_shmem_4tpt_split8read` with the read-once `codes`
 // stream loaded through `__ldcs` (streaming / evict-first hint), so codes do not
 // displace the dictionary from L1.
 //

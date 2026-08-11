@@ -8,7 +8,7 @@ fifth has its own launch contract and is not registered.
 |---|---|---|
 | `onpair_shmem_4tpt_split8read_ldcs` | Does the `__ldcs` streaming hint on the read-once codes stream still have headroom once `split8read` has already halved the hot dict footprint? The existing `onpair_shmem_4tpt_ldcs` applies the hint to the stride-16 base, where it is worth ~1% in geomean over 167 committed cells and −5.6% on the L40S. | promote if it wins, else delete |
 | `onpair_shmem_4tpt_split8read_hilo` | Does a disjoint stride-8 `dict_hi` (64 KB read working set vs 96 KB) beat the shipped kernel's duplicated low half? | promote if it wins, else delete |
-| `onpair_shmem_4tpt_split8read_bounds` | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once E-A is settled either way |
+| `onpair_shmem_4tpt_split8read_bounds` | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once the drain-bounds question is settled either way |
 | `onpair_shmem_4tpt_split8read_bounds_faultinj` | Control. Identical but claims one byte more than it writes, so it MUST trap. | delete with the above |
 | `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **NOT REGISTERED, never compiled, never run.** | promote only after a differential test and a warp-wide look-back; else delete |
 
@@ -43,7 +43,7 @@ instrument is broken and the run is void.
 
 ---
 
-## E-A is BLOCKED (2026-08-10) — two review rounds killed two designs
+## The drain-bounds probe is BLOCKED (2026-08-10) — two review rounds killed two designs
 
 `--depth max` gauntlet, runs `cli-gauntlet-0fd3f381815c` then `cli-gauntlet-b0b7042a27d4`
 (verdict: reject). Both probe kernels are **deregistered** from `onpair_bench.rs`; the

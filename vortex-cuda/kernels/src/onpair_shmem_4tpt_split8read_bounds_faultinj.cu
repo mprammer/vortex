@@ -7,10 +7,10 @@
 #include <string.h>
 #include <stdio.h>
 
-// E-A FAULT-INJECTION CONTROL (2026-08-10): identical to
+// Drain bounds probe, FAULT-INJECTION CONTROL (2026-08-10): identical to
 // `onpair_shmem_4tpt_split8read_bounds` but claims one byte more than it writes on
 // the tail store, so it MUST trap. If this kernel completes cleanly the instrument
-// is broken and the E-A result is void. `split8read` instrumented to test Joe's 2026-08-05 claim that a
+// is broken and the drain-bounds result is void. `split8read` instrumented to test Joe's 2026-08-05 claim that a
 // warp's drain writes past its exclusive output region and clobbers the next
 // warp's first byte.
 //
@@ -80,7 +80,7 @@ __device__ inline uint32_t warp_inclusive_scan_u32_nds_faultinj(uint32_t x, int 
 __device__ inline void s8rb_check(uint64_t chunk, uint64_t addr, uint32_t width,
                                   uint64_t lo, uint64_t hi, int site) {
     if (addr < lo || addr + (uint64_t)width > hi) {
-        printf("E-A VIOLATION site=%d chunk=%llu addr=%llu width=%u region=[%llu,%llu)\n",
+        printf("DRAIN-BOUNDS VIOLATION site=%d chunk=%llu addr=%llu width=%u region=[%llu,%llu)\n",
                site, (unsigned long long)chunk, (unsigned long long)addr, width,
                (unsigned long long)lo, (unsigned long long)hi);
         __trap();
@@ -171,7 +171,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_bou
     // chunk_offsets[chunk+1] is valid for EVERY active chunk including the last.
     const uint64_t region_end = chunk_offsets[chunk + 1u];
     if (lane == 0 && region_end - out_start != (uint64_t)warp_total) {
-        printf("E-A VIOLATION site=0 chunk=%llu allotted=%llu warp_total=%u\n",
+        printf("DRAIN-BOUNDS VIOLATION site=0 chunk=%llu allotted=%llu warp_total=%u\n",
                (unsigned long long)chunk,
                (unsigned long long)(region_end - out_start), warp_total);
         __trap();
