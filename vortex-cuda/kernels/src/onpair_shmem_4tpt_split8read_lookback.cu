@@ -68,10 +68,12 @@
 // BEFORE A NUMBER FROM THIS KERNEL MEANS ANYTHING:
 //   - Never compiled, never run. The byte-exact check against the CPU reference
 //     (--gpu-validate) is the differential test and has not been performed.
-//   - The look-back waits for ALL 32 descriptors in a window before consuming an
-//     already-visible closest prefix, which adds head-of-line latency a production
-//     implementation would not pay. A WIN is still informative; a LOSS does not yet
-//     establish that fused positioning is uncompetitive.
+//   - The whole BLOCK stalls on warp 0's look-back while the other warps wait at a
+//     barrier. This cannot be removed by emitting earlier: the scratch base is
+//     shifted by the output base's alignment precisely so both the shared read and
+//     the global store in the drain body can be 16-byte wide, and an unaligned uint4
+//     shared load is undefined. Quantified instead by sweeping block width; see the
+//     _lookback_w{1,2,4} variants.
 //   - Timing is warmed kernel-only. Nothing is reset per launch, so it hides no
 //     clearing pass — but it also excludes one-time scratch allocation, and it
 //     excludes what the stored-offsets path pays OUTSIDE decode (building the
@@ -96,7 +98,7 @@
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
 // Ticket ring depth. Power of two; one slot per launch, never reused.
-#define LB_TICKET_SLOTS 4096u
+#define LB_TICKET_SLOTS 16384u
 #define LB_EPOCH_MASK 0x3fffffffu
 #define LB_TAG(epoch, st) ((((epoch) & LB_EPOCH_MASK) << 2) | (st))
 #define LB_EPOCH_OF(w) ((w) >> 2)
@@ -226,30 +228,28 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
                 const bool off_end = (idx < 0);
                 uint32_t st = LB_P;  // off-end lanes hold a known empty prefix
                 uint64_t v = 0;
-                // The poll is COLLECTIVE: every lane named in `mask` reaches the
-                // __all_sync on every iteration, including lanes past the left end of
-                // the grid, which are trivially ready. Putting the __all_sync inside a
-                // branch that off-end lanes skip is undefined behaviour.
-                for (;;) {
-                    if (!off_end) {
-                        const uint32_t w = lb_load_flag_acquire(&part_flag[idx]);
-                        st = (LB_EPOCH_OF(w) == epoch_tag) ? LB_STATE_OF(w) : LB_X;
-                    }
-                    if (__all_sync(mask, off_end || st != LB_X)) {
-                        break;
-                    }
-                }
                 if (!off_end) {
-                    v = (st == LB_P) ? part_inc[idx] : part_agg[idx];
+                    const uint32_t w = lb_load_flag_acquire(&part_flag[idx]);
+                    st = (LB_EPOCH_OF(w) == epoch_tag) ? LB_STATE_OF(w) : LB_X;
+                    if (st != LB_X) {
+                        v = (st == LB_P) ? part_inc[idx] : part_agg[idx];
+                    }
                 }
 
-                // The closest predecessor holding an inclusive prefix ends the walk.
-                // Summing v over lanes 0..firstP is exactly the exclusive prefix,
-                // because that lane contributes an inclusive value and the lanes
-                // nearer to us contribute aggregates.
+                // Ballots are collective: every lane named in `mask` reaches both,
+                // including off-end lanes. Lane 0 is the nearest predecessor, so
+                // __ffs gives the nearest lane in each class.
+                const unsigned xmask = __ballot_sync(mask, st == LB_X);
                 const unsigned pmask = __ballot_sync(mask, st == LB_P);
+                const int firstX = (xmask == 0u) ? 32 : (__ffs((int)xmask) - 1);
                 const int firstP = (pmask == 0u) ? 32 : (__ffs((int)pmask) - 1);
-                uint64_t contrib = ((int)lane <= firstP) ? v : 0;
+
+                // Only descriptors NEARER than the first unpublished one are usable
+                // this iteration. Consuming a visible prefix the moment it is nearer
+                // than any hole is the point: waiting for all 32 descriptors before
+                // using an already-visible prefix is head-of-line latency.
+                const int usable = (firstP < firstX) ? firstP : (firstX - 1);
+                uint64_t contrib = ((int)lane <= usable) ? v : 0;
 #pragma unroll
                 for (int off = 16; off > 0; off >>= 1) {
                     contrib += __shfl_down_sync(mask, contrib, off);
@@ -257,10 +257,13 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
                 contrib = __shfl_sync(mask, contrib, 0);
                 exclusive += contrib;
 
-                if (pmask != 0u) {
-                    break;
+                if (firstP < firstX) {
+                    break;  // consumed an inclusive prefix: the walk is done
                 }
-                window_end -= 32;
+                // Otherwise everything usable was an aggregate. Slide past exactly
+                // what we consumed and re-read; a hole becomes lane 0 next time,
+                // which is a spin on that one descriptor rather than on all 32.
+                window_end -= (firstX == 32) ? 32 : firstX;
             }
 
             if (lane == 0) {

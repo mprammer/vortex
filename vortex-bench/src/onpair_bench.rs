@@ -1078,7 +1078,7 @@ static FUSED_EPOCH: AtomicU32 = AtomicU32::new(0);
 /// Ticket-ring depth; must equal LB_TICKET_SLOTS in the kernel. One slot per launch,
 /// never reused, zeroed once at allocation — so no launch resets anything.
 #[cfg(feature = "cuda")]
-const FUSED_TICKET_SLOTS: usize = 4096;
+const FUSED_TICKET_SLOTS: usize = 16384;
 
 /// Dynamic-shared cap for `ClusterDsmem` (Blackwell allows ~227 KB/block; stay
 /// under it with margin). A cluster slice + warp staging above this is rejected.
@@ -1088,10 +1088,26 @@ const CLUSTER_DSMEM_SHARED_CAP: usize = 224 * 1024;
 #[cfg(feature = "cuda")]
 #[derive(Debug, Clone, Copy)]
 struct KernelVariant {
+    /// PTX symbol to load. Several variants may share one symbol when they differ
+    /// only in launch geometry.
     name: &'static str,
     layout: KernelLayout,
     chunk_size: usize,
     block_warps: u32,
+    /// Name to REPORT under, when `name` alone would not distinguish this entry from
+    /// another sharing the same symbol. `None` reports `name`, which is what every
+    /// pre-existing variant does.
+    report_as: Option<&'static str>,
+}
+
+#[cfg(feature = "cuda")]
+impl KernelVariant {
+    fn report_name(&self) -> &'static str {
+        match self.report_as {
+            Some(label) => label,
+            None => self.name,
+        }
+    }
 }
 
 #[cfg(feature = "cuda")]
@@ -1101,36 +1117,42 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::Ref,
         chunk_size: 0,
         block_warps: 0,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem",
         layout: KernelLayout::Stride16,
         chunk_size: 32,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_2tpt",
         layout: KernelLayout::Stride16,
         chunk_size: 64,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_wpb8",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_wpb8_occ",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     // Track B: block-granularity + forced-occupancy sweep on the 4tpt body.
     KernelVariant {
@@ -1138,42 +1160,49 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_o6",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_b512o3",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_b128o12",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_b64",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 2,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_b64o24",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 2,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_b128o12",
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     // E1b/E-A/E-B experiment variants (2026-08-10), branch mp/onpair-expts-0810.
     // All mirror the shipped 512-thread split8read operating point. Retirement: the
@@ -1185,18 +1214,55 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_hilo",
         layout: KernelLayout::SplitRead8HiLo,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read_lookback",
         layout: KernelLayout::FusedPositions,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
+    },
+    // Block-width sweep. Warp 0 performs the look-back while the rest of the block
+    // waits at a barrier, and that stall cannot be removed by emitting earlier (the
+    // scratch base is shifted by the output base's alignment so the drain body can be
+    // 16 bytes wide, and an unaligned uint4 shared load is undefined). Narrowing the
+    // block shrinks the idle fraction instead: at one warp per block nothing waits.
+    // The trend across these three is what the stall is worth.
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_lookback",
+        layout: KernelLayout::FusedPositions,
+        chunk_size: 128,
+        block_warps: 4,
+        report_as: Some("onpair_shmem_4tpt_split8read_lookback_w4"),
+    },
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_lookback",
+        layout: KernelLayout::FusedPositions,
+        chunk_size: 128,
+        block_warps: 2,
+        report_as: Some("onpair_shmem_4tpt_split8read_lookback_w2"),
+    },
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_lookback",
+        layout: KernelLayout::FusedPositions,
+        chunk_size: 128,
+        block_warps: 1,
+        report_as: Some("onpair_shmem_4tpt_split8read_lookback_w1"),
+    },
+    KernelVariant {
+        name: "onpair_shmem_4tpt_split8read_stcsedge",
+        layout: KernelLayout::SplitRead8,
+        chunk_size: 128,
+        block_warps: 16,
+        report_as: None,
     },
     // E-A bounds probes are DEREGISTERED pending redesign (gauntlet
     // cli-gauntlet-b0b7042a27d4, verdict reject). Two problems make them unsafe to
@@ -1212,84 +1278,98 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8_wpb8",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8_wpb8_occ",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_pdict",
         layout: KernelLayout::PersistDict16,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_vdict",
         layout: KernelLayout::PersistVDict,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read",
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ldcs",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_lenbucket",
         layout: KernelLayout::LenBucket,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_lenbucket_b128",
         layout: KernelLayout::LenBucket,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_regcache",
         layout: KernelLayout::RegCache,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split4read",
         layout: KernelLayout::SplitRead4,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split4read_b128o12",
         layout: KernelLayout::SplitRead4,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_cluster_dsmem",
         layout: KernelLayout::ClusterDsmem,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     // 8tpt reuses the Stride16 launch path (identical kernel signature); only
     // chunk_size differs (256 tokens/warp-chunk vs 128), which is parameterized.
@@ -1298,42 +1378,49 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::Stride16,
         chunk_size: 256,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_8tpt_b128",
         layout: KernelLayout::Stride16,
         chunk_size: 256,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_vwidth",
         layout: KernelLayout::VWidth,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_vwidth_b128",
         layout: KernelLayout::VWidth,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_vwidth4",
         layout: KernelLayout::VWidth4,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_vwidth4_b128",
         layout: KernelLayout::VWidth4,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_shdict8",
         layout: KernelLayout::ShDict8,
         chunk_size: 128,
         block_warps: 8,
+        report_as: None,
     },
     // Ablation proxies (NCU substitute): full minus one stage. `_ablate` is the
     // byte-exact full baseline; `_no*` are timing-only (not byte-exact). The
@@ -1343,108 +1430,126 @@ const GPU_KERNELS: &[KernelVariant] = &[
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ablate_nogather",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ablate_noemit",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ablate_nodrain",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ablate_noscan",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_ablate_cfree",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s8",
         layout: KernelLayout::Stride8,
         chunk_size: 32,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s8_2tpt",
         layout: KernelLayout::Stride8,
         chunk_size: 64,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s8_4tpt",
         layout: KernelLayout::Stride8,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s8_8tpt",
         layout: KernelLayout::Stride8,
         chunk_size: 256,
         block_warps: 12,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1",
         layout: KernelLayout::Stride4,
         chunk_size: 32,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_2tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 64,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_4tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 128,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_8tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 256,
         block_warps: 12,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_16tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 512,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_32tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 1024,
         block_warps: 8,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_const1",
         layout: KernelLayout::Const1,
         chunk_size: 512,
         block_warps: 16,
+        report_as: None,
     },
     KernelVariant {
         name: "onpair_shmem_const2",
         layout: KernelLayout::Const2,
         chunk_size: 256,
         block_warps: 16,
+        report_as: None,
     },
 ];
 
@@ -1525,7 +1630,7 @@ async fn run_gpu_kernel_bench(
             .then(|| format!("thread-block clusters require sm_90+ (device cc {cc_major}.x)"));
         if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
             kernels.push(GpuKernelResult {
-                kernel: variant.name.to_string(),
+                kernel: variant.report_name().to_string(),
                 decode_ms: 0.0,
                 decode_gib_s: 0.0,
                 decode_ns_iters: Vec::new(),
@@ -1549,7 +1654,7 @@ async fn run_gpu_kernel_bench(
         };
         let verified = config.validate.then_some(validation_error.is_none());
         kernels.push(GpuKernelResult {
-            kernel: variant.name.to_string(),
+            kernel: variant.report_name().to_string(),
             decode_ms,
             decode_gib_s: gib_s(decoded_bytes, decode_ms),
             decode_ns_iters,
@@ -2103,11 +2208,13 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let mut dict_s8 = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
     // E-B: disjoint high half, bytes 8..16 of each entry at stride 8.
     let mut dict_hi = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
-    // Descriptor capacity: indexed by dynamic block id, so one entry per BLOCK of
-    // the grid this variant launches — 16 warps of 128 codes each. Sized to the
-    // registered geometry rather than the narrowest possible block, which was an 8x
-    // over-allocation. The dispatch bails if a grid ever outgrows this.
-    let fused_cap = (total_tokens as usize).div_ceil(128).div_ceil(16) + 64;
+    // Descriptor capacity: indexed by dynamic block id, so one entry per BLOCK. The
+    // WIDEST grid comes from the NARROWEST registered block, and the block-width
+    // sweep below registers a one-warp variant, so capacity is one entry per 128-code
+    // chunk. (An earlier revision sized this by the 16-warp geometry; that is right
+    // only while no narrower variant is registered, and the sweep registers three.)
+    // The dispatch still bails if a grid outgrows it.
+    let fused_cap = (total_tokens as usize).div_ceil(128) + 64;
     let mut dict_s4 = vec![0u8; lens_table.len() * 4 + vortex_onpair::MAX_TOKEN_SIZE];
     let mut dict_const1 = vec![0u8; lens_table.len()];
     let mut dict_const2 = vec![0u8; lens_table.len() * 2];
