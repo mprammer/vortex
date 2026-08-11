@@ -947,11 +947,11 @@ struct GpuOnPairChunk {
     codes_offsets: vortex::array::buffer::BufferHandle,
     dict_padded: vortex::array::buffer::BufferHandle,
     dict_s8: vortex::array::buffer::BufferHandle,
-    /// Fused-positioning scratch (`KernelLayout::FusedPositions`). `ticket` is a
-    /// single u32 the blocks atomically claim dynamic ids from; the three descriptor
-    /// arrays are indexed by that id and are therefore sized by GRID width, not by
-    /// chunk count. Zeroed once here; the kernel's epoch tag makes per-launch
-    /// clearing unnecessary, so the only per-launch reset is the 4-byte ticket.
+    /// Fused-positioning scratch (`KernelLayout::FusedPositions`). `fused_ticket`
+    /// is a ring of zero-initialized counters; the launch epoch selects one counter,
+    /// from which blocks atomically claim dynamic ids. The three descriptor arrays
+    /// are indexed by that id and are therefore sized for the maximum grid width.
+    /// Unique epoch tags and ticket slots make per-launch clearing unnecessary.
     fused_ticket: vortex::array::buffer::BufferHandle,
     fused_part_agg: vortex::array::buffer::BufferHandle,
     fused_part_inc: vortex::array::buffer::BufferHandle,
@@ -1069,9 +1069,9 @@ fn shdict8_shared_bytes(dict_entries: usize, block_warps: u32) -> usize {
 const ONPAIR_CLUSTER_N: u32 = 8;
 
 /// Strictly-increasing launch epoch for `KernelLayout::FusedPositions`. The kernel
-/// packs it into the high 30 bits of each descriptor flag so stale descriptors from a
-/// previous launch read as unpublished, which is what lets us skip clearing
-/// gridDim.x entries per launch. Wraps at 2^30 launches, far past any benchmark.
+/// packs its low 30 bits into each descriptor flag so stale descriptors from a
+/// previous launch read as unpublished. Dispatch rejects epochs at the much smaller
+/// ticket-ring limit, so a launched epoch can never wrap either resource.
 #[cfg(feature = "cuda")]
 static FUSED_EPOCH: AtomicU32 = AtomicU32::new(0);
 
@@ -2210,11 +2210,11 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let mut dict_hi = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
     // Descriptor capacity: indexed by dynamic block id, so one entry per BLOCK. The
     // WIDEST grid comes from the NARROWEST registered block, and the block-width
-    // sweep below registers a one-warp variant, so capacity is one entry per 128-code
+    // registry includes a one-warp variant, so capacity is one entry per 128-code
     // chunk. (An earlier revision sized this by the 16-warp geometry; that is right
     // only while no narrower variant is registered, and the sweep registers three.)
     // The dispatch still bails if a grid outgrows it.
-    let fused_cap = (total_tokens as usize).div_ceil(128) + 64;
+    let fused_cap = total_tokens.div_ceil(128) + 64;
     let mut dict_s4 = vec![0u8; lens_table.len() * 4 + vortex_onpair::MAX_TOKEN_SIZE];
     let mut dict_const1 = vec![0u8; lens_table.len()];
     let mut dict_const2 = vec![0u8; lens_table.len() * 2];
@@ -2884,7 +2884,7 @@ async fn validate_kernel_variant(variant: KernelVariant, chunks: &[GpuOnPairChun
                 .unwrap_or_else(|| actual.len().min(chunk.expected_bytes.len()));
             anyhow::bail!(
                 "{} chunk {} output mismatch at byte {}: gpu={:?} cpu={:?}",
-                variant.name,
+                variant.report_name(),
                 idx,
                 mismatch,
                 actual.get(mismatch),
@@ -3095,20 +3095,30 @@ fn launch_variant(
             // Two devices avoid it:
             //   - descriptor flags are tagged with `epoch`; a mismatched tag reads as
             //     unpublished, so last launch's entries are inert.
-            //   - the ticket is never rewound. Each launch is handed the base its
-            //     dynamic ids start from, and the kernel subtracts it. Exact because
-            //     every launch through this layout uses the same grid width, so the
-            //     ticket advances by exactly `blocks` each time.
-            // Both are why `epoch` must be strictly increasing and never reused.
+            //   - `epoch` selects a zero-initialized ticket-ring slot used by exactly
+            //     one launch, so every launch's dynamic block ids start at zero even
+            //     when launch geometries have different grid widths.
+            // Both rely on dispatch refusing to reuse an epoch or ticket slot.
             let ticket = chunk.fused_ticket.cuda_view::<u32>()?;
-            let epoch = FUSED_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
+            // Allocate only epochs that have a fresh ticket slot. A failed update
+            // leaves the counter pinned at the last usable epoch, so repeated rejected
+            // launches cannot wrap the AtomicU32 and eventually reuse old state.
+            let epoch = match FUSED_EPOCH.fetch_update(
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+                |previous| {
+                    let next = previous.checked_add(1)?;
+                    ((next as usize) < FUSED_TICKET_SLOTS).then_some(next)
+                },
+            ) {
+                Ok(previous) => previous + 1,
+                Err(previous) => anyhow::bail!(
+                    "fused-positioning ticket ring holds {FUSED_TICKET_SLOTS} slots; \
+                     next epoch would be {}",
+                    previous.saturating_add(1)
+                ),
+            };
             // One ticket slot per launch, so nothing is reset and no base is needed.
-            // Refuse to wrap the ring rather than silently reuse a live slot.
-            if (epoch as usize) >= FUSED_TICKET_SLOTS {
-                anyhow::bail!(
-                    "fused-positioning ticket ring holds {FUSED_TICKET_SLOTS} slots, epoch {epoch}"
-                );
-            }
             let part_agg = chunk.fused_part_agg.cuda_view::<u64>()?;
             let part_inc = chunk.fused_part_inc.cuda_view::<u64>()?;
             let part_flag = chunk.fused_part_flag.cuda_view::<u32>()?;

@@ -92,8 +92,8 @@
 // 30 bits carry the LAUNCH EPOCH. A flag whose epoch differs from the current one is
 // a leftover from a previous launch and reads as LB_X. That removes the requirement
 // to clear gridDim.x descriptors before every launch, which would otherwise be real
-// work the stored-offsets path never pays and would confound the comparison. Only
-// the 4-byte ticket needs resetting per launch.
+// work the stored-offsets path never pays and would confound the comparison. Ticket
+// counters are likewise zeroed once; the host assigns a fresh ring slot per launch.
 #define LB_X 0u  // nothing published yet (or stale epoch)
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it

@@ -29,7 +29,8 @@
 // and L1/TEX-request pressure. As a bonus, holding `uint2 lo[4]` (32 B) instead
 // of `uint4 t[4]` (64 B) lowers register pressure.
 //
-// Identical scan/drain to `onpair_shmem_4tpt`; only the token-byte source
+// Token gathering and scan match `onpair_shmem_4tpt_split8read`. The drain writes
+// the same bytes to the same addresses; only the head/tail store cache operator
 // changes.
 
 #ifndef WARPS_PER_BLOCK_MAX
@@ -52,12 +53,12 @@ __device__ inline uint32_t warp_inclusive_scan_u32_s8rce(uint32_t x, int lane) {
     return x;
 }
 
-
 // Evict-first single-byte global store. The shipped drain uses __stcs for the aligned
 // 16-byte body but plain stores for the head and tail, so ~4% of output bytes are
 // written under the default policy and land in L1 as lines nothing ever re-reads —
-// the same pressure the split dictionary table exists to relieve. PTX .u8 stores take
-// a 16-bit source register, hence the "h" constraint.
+// the same pressure the split dictionary table exists to relieve. PTX has no 8-bit
+// register class; the "h" constraint supplies a .u16 register, and st.u8 stores its
+// low eight bits.
 __device__ __forceinline__ void st_cs_u8(uint8_t *p, uint8_t v) {
     asm volatile("st.global.cs.u8 [%0], %1;" ::"l"(p), "h"((unsigned short)v) : "memory");
 }
