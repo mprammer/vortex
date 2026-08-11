@@ -6,7 +6,7 @@
 #include <stdint.h>
 #include <string.h>
 
-// DRAFT (2026-08-10), NOT REVIEWED, NOT COMPILED, NOT CORRECTNESS-TESTED.
+// EXPERIMENT (2026-08-11). Reviewed twice, registered, NOT YET COMPILED OR RUN.
 //
 // "Bucket chain" / single-pass decode: obtain each batch's output position DURING
 // the decode instead of reading it from the stored offset sidecar or regenerating
@@ -53,10 +53,9 @@
 //   - part_agg, part_inc and part_flag each hold at least gridDim.x entries. They
 //     are indexed by the DYNAMIC block id, which ranges over gridDim.x, NOT by a
 //     chunk count. A short buffer corrupts memory.
-//   - `ticket_base` equal to the ticket's value before this launch, i.e. the total
-//     number of blocks all previous launches through this buffer consumed. The
-//     ticket is monotonic and never rewound, so nothing needs resetting; getting the
-//     base wrong makes blocks claim ids outside the descriptor array.
+//   - `ticket` an array of at least LB_TICKET_SLOTS u32, zeroed once at allocation.
+//     Each launch consumes slot `epoch % LB_TICKET_SLOTS`, so epochs must not wrap
+//     the ring while an earlier launch's slot is still live. Nothing is reset.
 //   - `epoch` STRICTLY INCREASING across launches that share the descriptor arrays,
 //     and never reused. Descriptors do NOT need clearing: a flag whose tagged epoch
 //     differs from the current one reads as LB_X. The arrays need zeroing exactly
@@ -66,13 +65,18 @@
 //   - The grid must cover total_tokens exactly: there is no grid-stride loop, so an
 //     undersized grid silently drops input.
 //
-// BLOCKERS BEFORE ANY NUMBER FROM THIS KERNEL MEANS ANYTHING (gauntlet
-// cli-gauntlet-9e1f2c8dc41f, verdict reject — these are NOT cosmetic):
-//   - Never compiled, never run, no differential test against the shipped kernel,
-//     no caller. build.rs compiles every .cu in this directory, so its presence
-//     here is not evidence that it works.
-//   - Timing: the only per-launch reset is the 4-byte ticket, by construction of the
-//     epoch scheme, so kernel-only timing is not hiding a descriptor-clearing cost.
+// BEFORE A NUMBER FROM THIS KERNEL MEANS ANYTHING:
+//   - Never compiled, never run. The byte-exact check against the CPU reference
+//     (--gpu-validate) is the differential test and has not been performed.
+//   - The look-back waits for ALL 32 descriptors in a window before consuming an
+//     already-visible closest prefix, which adds head-of-line latency a production
+//     implementation would not pay. A WIN is still informative; a LOSS does not yet
+//     establish that fused positioning is uncompetitive.
+//   - Timing is warmed kernel-only. Nothing is reset per launch, so it hides no
+//     clearing pass — but it also excludes one-time scratch allocation, and it
+//     excludes what the stored-offsets path pays OUTSIDE decode (building the
+//     sidecar at write time, storing it, reading it back). A fair answer to
+//     "should we store positions" needs both sides' out-of-kernel costs stated.
 
 #ifndef WARPS_PER_BLOCK_MAX
 #define WARPS_PER_BLOCK_MAX 16u
@@ -91,7 +95,10 @@
 #define LB_X 0u  // nothing published yet (or stale epoch)
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
-#define LB_TAG(epoch, st) (((epoch) << 2) | (st))
+// Ticket ring depth. Power of two; one slot per launch, never reused.
+#define LB_TICKET_SLOTS 4096u
+#define LB_EPOCH_MASK 0x3fffffffu
+#define LB_TAG(epoch, st) ((((epoch) & LB_EPOCH_MASK) << 2) | (st))
 #define LB_EPOCH_OF(w) ((w) >> 2)
 #define LB_STATE_OF(w) ((w) & 3u)
 
@@ -125,7 +132,10 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     uint8_t *__restrict output_bytes, uint64_t total_tokens,
     uint32_t *__restrict ticket, uint64_t *__restrict part_agg,
     uint64_t *__restrict part_inc, uint32_t *__restrict part_flag,
-    uint32_t epoch, uint32_t ticket_base) {
+    uint32_t epoch) {
+    // Compare tags against the same 30 bits LB_TAG stores, or an epoch past 2^30
+    // would match nothing and spin forever.
+    const uint32_t epoch_tag = epoch & LB_EPOCH_MASK;
     constexpr unsigned mask = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.x >> 5;
@@ -136,10 +146,12 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     __shared__ uint64_t s_warp_tot[WARPS_PER_BLOCK_MAX];
     __shared__ uint64_t s_block_excl;
     if (threadIdx.x == 0) {
-        // The ticket is never rewound between launches; the host hands us the
-        // base this launch's ids start from, so no reset is needed and no clearing
-        // work lands inside the timed region.
-        s_blk = atomicAdd(ticket, 1u) - ticket_base;
+        // Each launch gets its OWN ticket slot, indexed by epoch, from a ring
+        // zeroed once at allocation. So no slot is ever reused, nothing needs
+        // resetting, and a base is unnecessary — which also removes the ways a
+        // host-computed base could be wrong (several chunks sharing a buffer,
+        // unequal grid widths, a failed launch leaving the counter advanced).
+        s_blk = atomicAdd(&ticket[epoch & (LB_TICKET_SLOTS - 1u)], 1u);
     }
     __syncthreads();
     const uint32_t blk = s_blk;
@@ -198,12 +210,12 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
                 // observer that sees the flag also sees the values.
                 part_agg[0] = block_total;
                 part_inc[0] = block_total;
-                lb_store_flag_release(&part_flag[0], LB_TAG(epoch, LB_P));
+                lb_store_flag_release(&part_flag[0], LB_TAG(epoch_tag, LB_P));
             }
         } else {
             if (lane == 0) {
                 part_agg[blk] = block_total;
-                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch, LB_A));
+                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch_tag, LB_A));
             }
             __syncwarp();
 
@@ -211,24 +223,23 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
             int64_t window_end = (int64_t)blk;  // exclusive
             for (;;) {
                 const int64_t idx = window_end - 1 - (int64_t)lane;
-                uint32_t st;
-                uint64_t v;
-                if (idx < 0) {
-                    // Off the left end of the grid: an empty prefix, which is a
-                    // known inclusive value of zero. Terminates the walk.
-                    st = LB_P;
-                    v = 0;
-                } else {
-                    // Poll this lane's own predecessor until it publishes. The warp
-                    // advances only when NO lane still sees LB_X, which is what
-                    // makes the flag/payload pairing safe to read below.
-                    for (;;) {
+                const bool off_end = (idx < 0);
+                uint32_t st = LB_P;  // off-end lanes hold a known empty prefix
+                uint64_t v = 0;
+                // The poll is COLLECTIVE: every lane named in `mask` reaches the
+                // __all_sync on every iteration, including lanes past the left end of
+                // the grid, which are trivially ready. Putting the __all_sync inside a
+                // branch that off-end lanes skip is undefined behaviour.
+                for (;;) {
+                    if (!off_end) {
                         const uint32_t w = lb_load_flag_acquire(&part_flag[idx]);
-                        st = (LB_EPOCH_OF(w) == epoch) ? LB_STATE_OF(w) : LB_X;
-                        if (__all_sync(mask, st != LB_X)) {
-                            break;
-                        }
+                        st = (LB_EPOCH_OF(w) == epoch_tag) ? LB_STATE_OF(w) : LB_X;
                     }
+                    if (__all_sync(mask, off_end || st != LB_X)) {
+                        break;
+                    }
+                }
+                if (!off_end) {
                     v = (st == LB_P) ? part_inc[idx] : part_agg[idx];
                 }
 
@@ -254,7 +265,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
 
             if (lane == 0) {
                 part_inc[blk] = exclusive + block_total;
-                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch, LB_P));
+                lb_store_flag_release(&part_flag[blk], LB_TAG(epoch_tag, LB_P));
             }
         }
         if (lane == 0) {

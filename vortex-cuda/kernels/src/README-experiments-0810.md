@@ -10,7 +10,7 @@ fifth has its own launch contract and is not registered.
 | `onpair_shmem_4tpt_split8read_hilo` | Does a disjoint stride-8 `dict_hi` (64 KB read working set vs 96 KB) beat the shipped kernel's duplicated low half? | promote if it wins, else delete |
 | `onpair_shmem_4tpt_split8read_bounds` | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once the drain-bounds question is settled either way |
 | `onpair_shmem_4tpt_split8read_bounds_faultinj` | Control. Identical but claims one byte more than it writes, so it MUST trap. | delete with the above |
-| `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **NOT REGISTERED, never compiled, never run.** | promote only after a differential test and a warp-wide look-back; else delete |
+| `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **Registered 2026-08-11; never compiled, never run.** | warp-wide look-back done; promote after a byte-exact differential test, else delete kernel, layout arm, registry entry and the four `fused_*` scratch fields |
 
 ## Why the bounds probe checks what it checks
 
@@ -123,3 +123,38 @@ Still outstanding, and why no number from this kernel means anything yet:
   Do not let a slow draft close this question.
 - Timing must report kernel-only *and* reset-inclusive cost, since zeroing the
   descriptors is work the stored-offsets path never pays.
+
+
+---
+
+## Fused positioning, second review (2026-08-11)
+
+Two rounds of adversarial review. Round one found the payload race; round two, after
+the warp-wide rewrite, found a worse one:
+
+- **The poll was not collective.** `__all_sync` with the full 32-lane mask sat inside
+  the branch taken only by lanes whose predecessor index is >= 0, so lanes past the
+  left end of the grid never reached it — undefined behaviour on every window that
+  straddles the start. Restructured so all lanes reach the barrier, with off-end lanes
+  trivially ready.
+- **Epoch tags truncated to 30 bits while readers compared 32.** Any epoch past 2^30
+  would have matched nothing and spun forever. Readers now compare the same 30 bits.
+- **The host-computed ticket base was fragile** — wrong if several chunks shared a
+  buffer, if grid widths differed, or if a launch failed with the counter advanced.
+  Replaced by a ticket ring indexed by epoch: one slot per launch, never reused,
+  zeroed once, so no launch resets anything and no base exists to get wrong.
+- Descriptors were sized for a two-warp grid while the variant launches sixteen, an
+  8x over-allocation. Right-sized, with the dispatch still bailing if a grid outgrows
+  them.
+- `lb_*` scratch names collided with `lb_meta`, which means *length bucket*. Renamed
+  `fused_*`.
+
+Verified by the reviewers, and unchanged: lane 0 is the closest predecessor, `__ffs`
+selects the nearest published prefix, successive windows neither double-count nor omit
+a block, every block that claims an id publishes before any early return, and the
+decode and drain half is byte-equivalent to the shipped kernel once the output base is
+right.
+
+Outstanding, deliberately: the look-back waits for all 32 descriptors in a window
+before consuming an already-visible closest prefix. That is head-of-line latency a
+production implementation would not pay, so a **loss does not settle the question**.
