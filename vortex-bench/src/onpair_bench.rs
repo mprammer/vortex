@@ -26,6 +26,8 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::Arc;
 #[cfg(feature = "cuda")]
+use std::sync::atomic::AtomicU32;
+#[cfg(feature = "cuda")]
 use std::sync::atomic::AtomicU64;
 #[cfg(feature = "cuda")]
 use std::sync::atomic::Ordering;
@@ -1071,7 +1073,7 @@ const ONPAIR_CLUSTER_N: u32 = 8;
 /// previous launch read as unpublished, which is what lets us skip clearing
 /// gridDim.x entries per launch. Wraps at 2^30 launches, far past any benchmark.
 #[cfg(feature = "cuda")]
-static FUSED_EPOCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+static FUSED_EPOCH: AtomicU32 = AtomicU32::new(0);
 
 /// Ticket-ring depth; must equal LB_TICKET_SLOTS in the kernel. One slot per launch,
 /// never reused, zeroed once at allocation — so no launch resets anything.
@@ -2992,7 +2994,7 @@ fn launch_variant(
             //     ticket advances by exactly `blocks` each time.
             // Both are why `epoch` must be strictly increasing and never reused.
             let ticket = chunk.fused_ticket.cuda_view::<u32>()?;
-            let epoch = FUSED_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            let epoch = FUSED_EPOCH.fetch_add(1, Ordering::Relaxed) + 1;
             // One ticket slot per launch, so nothing is reset and no base is needed.
             // Refuse to wrap the ring rather than silently reuse a live slot.
             if (epoch as usize) >= FUSED_TICKET_SLOTS {
