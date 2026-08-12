@@ -29,6 +29,10 @@ import json
 import os
 import shutil
 import subprocess
+
+# Columns whose bench process exited non-zero. Consulted by the final exit status so an
+# all-failed run cannot look like a clean run with an empty matrix.
+COLUMN_FAILURES: list[str] = []
 import sys
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -273,8 +277,12 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
         text=True,
     )
     if proc.returncode != 0:
-        tail = "\n".join(proc.stderr.strip().splitlines()[-5:])
+        tail = "\n".join(proc.stderr.strip().splitlines()[-8:])
         print(f"!! {col.dataset_id}/{col.column} FAILED:\n{tail}", file=sys.stderr)
+        # Record the failure. Returning a bare [] made a failed column indistinguishable
+        # from a column that produced no cells, so a run in which EVERY column failed still
+        # wrote summaries and exited 0 -- reporting success with no data.
+        COLUMN_FAILURES.append(f"{col.dataset_id}/{col.column}: exit {proc.returncode}")
         return []
     return json.loads(proc.stdout)
 
@@ -427,8 +435,8 @@ def main() -> int:
     p.add_argument("--jobs", type=int, default=0,
                    help="columns to run concurrently (default: all available CPU cores)")
     p.add_argument("--codec", choices=["onpair", "fsst12"], default="onpair",
-                   help="stored codec; fsst12 ignores --bits/--threshold (one configuration) "
-                        "and is GPU-only")
+                   help="stored codec; fsst12 ignores --bits/--threshold (one configuration), "
+                        "is GPU-only, and implies --gpu-decode --gpu-validate")
     p.add_argument("--dev", action="store_true", help="dev build instead of release")
     p.add_argument("--datasets", type=lambda s: {x.strip() for x in s.split(",")},
                    default=None,
@@ -441,6 +449,17 @@ def main() -> int:
     p.add_argument("--clean", action="store_true",
                    help="delete generated OnPair benchmark .vortex files and summaries, then exit")
     args = p.parse_args()
+
+    # FSST-12 exists on the GPU path only: there is no .vortex round-trip for it, so the
+    # kernel byte-exactness check IS its correctness result. Imply both flags rather than
+    # letting a missing one surface as an error deep in the Rust cell, and because the CUDA
+    # feature selection below keys on gpu_decode.
+    if args.codec == "fsst12":
+        if not args.gpu_decode or not args.gpu_validate:
+            print("--codec fsst12 implies --gpu-decode --gpu-validate; enabling both",
+                  file=sys.stderr)
+        args.gpu_decode = True
+        args.gpu_validate = True
 
     if args.clean:
         clean_outputs()
@@ -519,17 +538,27 @@ def main() -> int:
     print(f"\nWrote {consolidated} (everything in one place)\n"
           f"Wrote {summary_json}\nWrote {summary_md}\nWrote {pivot_md}", file=sys.stderr)
 
+    # `onpair_only` asserts the stored column is purely OnPair-encoded. It is meaningless
+    # for a non-Vortex codec, and FSST-12 sets it false BY CONSTRUCTION -- applying it to
+    # every codec classified every successful FSST-12 cell as a failure.
     failures = [
         r for r in results
         if (
             not r["verified"]
-            or not r["onpair_only"]
+            or (r.get("codec", "onpair") == "onpair" and not r["onpair_only"])
             or (r.get("gpu", {}).get("validated") and not r["gpu"].get("verified"))
         )
     ]
-    if failures:
-        print(f"\n{len(failures)} cell(s) FAILED round-trip / onpair-only / GPU validation check",
-              file=sys.stderr)
+    if COLUMN_FAILURES:
+        print("\n!! columns whose bench process failed:", file=sys.stderr)
+        for f in COLUMN_FAILURES:
+            print(f"   - {f}", file=sys.stderr)
+    if not results:
+        print("\n!! no cells were produced; treating as failure", file=sys.stderr)
+    if failures or COLUMN_FAILURES or not results:
+        if failures:
+            print(f"\n{len(failures)} cell(s) FAILED round-trip / onpair-only / GPU validation check",
+                  file=sys.stderr)
         return 1
     return 0
 

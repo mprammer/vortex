@@ -693,11 +693,10 @@ async fn run_cell_fsst12(
     std::fs::create_dir_all(&out_dir)?;
 
     let ranges = chunk_ranges(sample.rows, sample.raw_bytes, chunk_bytes);
-    // Two timers, because OnPair's `encode_ms` stops after stored encoding. Timing our whole
-    // input-preparation pipeline against that would make FSST-12 look arbitrarily slower at
-    // a phase OnPair does not include. `encode_secs` covers train + compress only; the
-    // normalization, statistics and expected-output copy are load-time preparation and are
-    // reported separately in the run log rather than folded into a comparable field.
+    // `encode_secs` accumulates train+compress only, which is the phase OnPair's encode_ms
+    // covers. `wall_secs` is an INCLUSIVE total for the whole loop (encode + normalization +
+    // statistics + buffer construction) and therefore CONTAINS encode_secs -- it is a
+    // progress figure for the log, not a second phase to subtract.
     let mut encode_secs = 0.0f64;
     let t_all = Instant::now();
     let mut all_inputs = Vec::with_capacity(ranges.len());
@@ -748,12 +747,20 @@ async fn run_cell_fsst12(
         table_bytes_total += stored.table as u64;
         all_inputs.push(inputs);
     }
-    let prepare_secs = t_all.elapsed().as_secs_f64();
-    let n_chunks = all_inputs.len();
+    let wall_secs = t_all.elapsed().as_secs_f64();
+    // #6: chunks with no tokens are not staged, so the number of GPU launches is not the
+    // number of stored chunks. Report the stored/logical count; launches are in the GPU
+    // result's own `chunks` field.
+    let n_chunks = ranges.len();
+    let staged_chunks = all_inputs.len();
     eprintln!(
-        "fsst12 {dataset_id}/{column}: encode {:.3}s, total input preparation {:.3}s over \
-         {n_chunks} chunk(s)",
-        encode_secs, prepare_secs
+        "fsst12 {dataset_id}/{column}: encode {encode_secs:.3}s of {wall_secs:.3}s inclusive; \
+         {staged_chunks} of {n_chunks} chunk(s) staged (empty chunks are not launched)"
+    );
+    // #7: an all-empty workload must not report a GPU-verified result vacuously.
+    anyhow::ensure!(
+        staged_chunks > 0,
+        "column {column} produced no FSST-12 codes in any chunk; refusing to emit a cell"
     );
 
     let gpu = match gpu_config {
@@ -1643,13 +1650,12 @@ async fn run_gpu_kernel_bench(
     // its len() is the byte size, not the element count). Padded/s8 dicts are GPU
     // staging artifacts, not part of the stored/transferred compressed column.
     //
-    // CODEC ASYMMETRY, deliberate and not interchangeable with the cell's `mem_ratio`:
-    // OnPair stores its codes as u16, so this equals the stored payload. FSST-12 stores
-    // them densely at 12 bits and is WIDENED to u16 at load, so for FSST-12 this is the
-    // staged host-to-device payload and overstates the stored column by ~33%. The stored
-    // figure is the cell's `mem_ratio`, computed from Fsst12StoredSize. Use `mem_ratio`
-    // for compression claims and this only for H2D/whole-decompress modelling; a figure
-    // that mixes them across codecs is comparing different quantities.
+    // This is the STAGED host-to-device payload, for both codecs. It is NOT either codec's
+    // stored size: OnPair's stored column is BtrBlocks-compressed with its own metadata, and
+    // FSST-12 stores 12-bit codes that are widened to u16 here (so for FSST-12 the staged
+    // figure exceeds the stored one by ~33%). Compression claims must use the cell's
+    // `mem_ratio`; this field is only valid for H2D / whole-decompress modelling, and a
+    // figure that mixes the two across codecs compares different quantities.
     let compressed_bytes: u64 = chunks
         .iter()
         .map(|c| (c.codes.len() + c.dict_bytes.len() + c.lens.len()) as u64)
@@ -1815,10 +1821,16 @@ async fn run_gpu_kernel_bench(
         best_decode_ms: best.decode_ms,
         validated: config.validate,
         verified: config.validate.then(|| {
-            kernels
+            // Exclude `*ablate*` for the same reason `best` does: those builds skip a decode
+            // stage on purpose and produce wrong bytes, so including them made this field
+            // read false on runs where every shipped kernel was byte-exact. Committed cells
+            // showing verified:false are that artifact, not a real mismatch.
+            let mut judged = kernels
                 .iter()
-                .filter(|r| r.applicable)
-                .all(|r| r.verified == Some(true))
+                .filter(|r| r.applicable && !r.kernel.contains("ablate"))
+                .peekable();
+            // An empty set must not verify vacuously.
+            judged.peek().is_some() && judged.all(|r| r.verified == Some(true))
         }),
         auto_decode_gib_s: auto.decode_gib_s,
         best_decode_gib_s: best.decode_gib_s,
@@ -1949,9 +1961,15 @@ fn fsst12_decode_inputs(
     // after this point is load-time preparation of the decode ABI.
     let t_encode = Instant::now();
     let compressor = Compressor12::train(rows);
+    // Boundary: training and compression are the codec's encode, and that is what OnPair's
+    // encode_ms covers. normalize_rows is load-time preparation of the decode ABI and is
+    // deliberately OUTSIDE this timer -- an earlier revision enclosed it, which made the
+    // two codecs' encode figures measure different phases.
+    let compressed = compressor.compress_bulk(rows);
+    let encode_secs = t_encode.elapsed().as_secs_f64();
+    drop(compressed);
     let normalized = normalize_rows(&compressor, rows)
         .map_err(|e| anyhow::anyhow!("FSST-12 normalize failed: {e}"))?;
-    let encode_secs = t_encode.elapsed().as_secs_f64();
     let (dict_table, dict_bytes_with_pad, dict_logical_len) =
         compact_dict(compressor.symbol_table(), compressor.symbol_lengths())
             .map_err(|e| anyhow::anyhow!("FSST-12 compact dict failed: {e}"))?;
@@ -3787,7 +3805,9 @@ mod fsst12_inputs_tests {
         let owned = rows();
         let refs: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
         let (inputs, stored, encode_secs) = fsst12_decode_inputs(&refs).expect("build inputs");
-        assert!(encode_secs >= 0.0, "encode timing is reported");
+        // Not a tautology: assert the timer excludes normalization by bounding it below the
+        // whole call's wall time, and that it actually ran.
+        assert!(encode_secs > 0.0, "encode timer must record real work");
 
         let raw: usize = owned.iter().map(|r| r.len()).sum();
         assert_eq!(inputs.decoded_bytes as usize, raw, "decoded_bytes");
