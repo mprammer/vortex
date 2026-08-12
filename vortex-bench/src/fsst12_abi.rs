@@ -24,7 +24,7 @@
 //! This module is deliberately free of any `cuda` gating: it is pure host-side data
 //! movement, and it is unit-tested on machines that have no GPU.
 
-use fsst12::fsst12::Compressor12;
+use fsst12::fsst12::{Compressor12, FSST12_MAX_SYMBOLS, FSST12_RESERVED_CODES};
 
 /// Byte stride of the padded decode table, matching the kernels' `dict + code * 16`.
 pub const DICT_STRIDE: usize = 16;
@@ -35,6 +35,14 @@ const CODE12_SHIFT: u32 = 12;
 
 /// Number of codes the 12-bit space can address.
 const FSST12_CODE_SPACE: usize = 1 << 12;
+
+/// The reserved identity single-byte codes.
+const FSST12_RESERVED: usize = 256;
+
+// Local ABI constants must not drift from the canonical codec and kernel definitions.
+const _: () = assert!(FSST12_CODE_SPACE == FSST12_MAX_SYMBOLS);
+const _: () = assert!(FSST12_RESERVED == FSST12_RESERVED_CODES);
+const _: () = assert!(DICT_STRIDE == vortex_onpair::MAX_TOKEN_SIZE);
 
 /// An FSST-12 column expressed in the decode ABI.
 #[derive(Debug, Clone)]
@@ -66,6 +74,61 @@ pub enum Fsst12AbiError {
     TableSize(usize),
     #[error("code {code} has length {len}, outside 1..=8")]
     SymbolLength { code: usize, len: u8 },
+    #[error("reserved code {code} is not the identity single-byte symbol (len {len}, value {value:#x})")]
+    ReservedCode { code: usize, len: u8, value: u64 },
+    #[error("code {code} at stream position {pos} is outside the trained table of {entries} entries")]
+    UntrainedCode {
+        code: u16,
+        pos: usize,
+        entries: usize,
+    },
+}
+
+/// Validate an FSST-12 symbol table against the invariants the reference decompressor
+/// asserts in its constructor.
+///
+/// Both table conversions below go through this, so neither can accept a table the codec
+/// itself would reject. Without the reserved-code check a table that merely happens to be
+/// the right size is accepted as FSST-12, and every downstream decode is then wrong in a
+/// way no byte-exactness test on *our* pipeline would catch -- both sides would share the
+/// misreading.
+fn validate_table(symbols: &[fsst12::Symbol], lengths: &[u8]) -> Result<(), Fsst12AbiError> {
+    if symbols.len() != lengths.len() {
+        return Err(Fsst12AbiError::TableMismatch {
+            symbols: symbols.len(),
+            lengths: lengths.len(),
+        });
+    }
+    if symbols.len() < FSST12_RESERVED || symbols.len() > FSST12_CODE_SPACE {
+        return Err(Fsst12AbiError::TableSize(symbols.len()));
+    }
+    for (code, (sym, &len)) in symbols.iter().zip(lengths.iter()).enumerate() {
+        if len == 0 || len > 8 {
+            return Err(Fsst12AbiError::SymbolLength { code, len });
+        }
+        if code < FSST12_RESERVED && (len != 1 || sym.to_u64() != code as u64) {
+            return Err(Fsst12AbiError::ReservedCode {
+                code,
+                len,
+                value: sym.to_u64(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Check that every code in a stream addresses a trained entry.
+///
+/// Untrained slots widen to length zero, so an out-of-range code would otherwise vanish
+/// silently and understate `decoded_bytes` rather than fail. `Compressor12::compress` never
+/// emits one, so this guards against a mis-unpacked stream, not against the codec.
+fn validate_codes(codes: &[u16], entries: usize) -> Result<(), Fsst12AbiError> {
+    for (pos, &code) in codes.iter().enumerate() {
+        if code as usize >= entries {
+            return Err(Fsst12AbiError::UntrainedCode { code, pos, entries });
+        }
+    }
+    Ok(())
 }
 
 /// Unpack the dense 12-bit code stream.
@@ -108,23 +171,12 @@ pub fn widen_table(
     symbols: &[fsst12::Symbol],
     lengths: &[u8],
 ) -> Result<(Vec<u8>, Vec<u8>), Fsst12AbiError> {
-    if symbols.len() != lengths.len() {
-        return Err(Fsst12AbiError::TableMismatch {
-            symbols: symbols.len(),
-            lengths: lengths.len(),
-        });
-    }
-    if symbols.len() < 256 || symbols.len() > FSST12_CODE_SPACE {
-        return Err(Fsst12AbiError::TableSize(symbols.len()));
-    }
+    validate_table(symbols, lengths)?;
 
     let mut dict = vec![0u8; FSST12_CODE_SPACE * DICT_STRIDE + DICT_STRIDE];
     let mut lens = vec![0u8; FSST12_CODE_SPACE];
 
     for (code, (sym, &len)) in symbols.iter().zip(lengths.iter()).enumerate() {
-        if len == 0 || len > 8 {
-            return Err(Fsst12AbiError::SymbolLength { code, len });
-        }
         let bytes = sym.to_u64().to_le_bytes();
         dict[code * DICT_STRIDE..code * DICT_STRIDE + 8].copy_from_slice(&bytes);
         lens[code] = len;
@@ -139,13 +191,15 @@ pub fn normalize(
 ) -> Result<Fsst12Abi, Fsst12AbiError> {
     let codes = unpack_codes(compressed)?;
     let (dict_padded, lens) = widen_table(compressor.symbol_table(), compressor.symbol_lengths())?;
+    let entries = compressor.symbol_table().len();
+    validate_codes(&codes, entries)?;
     let decoded_bytes = codes.iter().map(|&c| lens[c as usize] as usize).sum();
     Ok(Fsst12Abi {
         codes,
         lens,
         dict_padded,
         decoded_bytes,
-        table_entries: compressor.symbol_table().len(),
+        table_entries: entries,
     })
 }
 
@@ -158,10 +212,11 @@ pub fn normalize(
 /// them too or it is not comparable on layout -- only on rate.
 ///
 /// The cost of keeping them is real and must be disclosed: each row's code stream is
-/// independently 12-bit packed, so a row with an odd code count wastes up to 1.5 bytes.
-/// On a column of many short rows that is a measurable ratio penalty against the
-/// whole-buffer form. It is also what a random-access string codec actually stores, which
-/// is the operating point FSST is designed for.
+/// independently 12-bit packed, so a row with an odd code count rounds its final code up
+/// from 1.5 to 2 bytes -- half a byte of waste, not the 1.5 an earlier revision of this
+/// comment claimed. On a column of many short rows even half a byte per row is a
+/// measurable ratio penalty against the whole-buffer form. It is also what a random-access
+/// string codec actually stores, which is the operating point FSST is designed for.
 #[derive(Debug, Clone)]
 pub struct Fsst12RowsAbi {
     /// Concatenated per-row codes, in row order.
@@ -169,8 +224,9 @@ pub struct Fsst12RowsAbi {
     /// `row_code_offsets[i]..row_code_offsets[i+1]` indexes `abi.codes` for row `i`.
     /// Length is `rows + 1`.
     pub row_code_offsets: Vec<u64>,
-    /// Sum of the per-row compressed lengths, i.e. what this form actually stores.
-    pub compressed_bytes: usize,
+    /// Stored footprint, by component. See [`Fsst12StoredSize`] for why this is not a
+    /// single number.
+    pub stored: Fsst12StoredSize,
 }
 
 /// Compress and normalize row by row, preserving row boundaries in code space.
@@ -183,14 +239,16 @@ pub fn normalize_rows(
 
     let mut codes: Vec<u16> = Vec::new();
     let mut row_code_offsets: Vec<u64> = Vec::with_capacity(rows.len() + 1);
-    let mut compressed_bytes = 0usize;
+    let mut packed_codes = 0usize;
     row_code_offsets.push(0);
     for packed in &per_row {
-        compressed_bytes += packed.len();
+        packed_codes += packed.len();
         codes.extend_from_slice(&unpack_codes(packed)?);
         row_code_offsets.push(codes.len() as u64);
     }
 
+    let entries = compressor.symbol_table().len();
+    validate_codes(&codes, entries)?;
     let decoded_bytes = codes.iter().map(|&c| lens[c as usize] as usize).sum();
     Ok(Fsst12RowsAbi {
         abi: Fsst12Abi {
@@ -198,10 +256,14 @@ pub fn normalize_rows(
             lens,
             dict_padded,
             decoded_bytes,
-            table_entries: compressor.symbol_table().len(),
+            table_entries: entries,
+        },
+        stored: Fsst12StoredSize {
+            packed_codes,
+            row_offsets: row_code_offsets.len() * size_of::<u64>(),
+            table: entries * (size_of::<u64>() + size_of::<u8>()),
         },
         row_code_offsets,
-        compressed_bytes,
     })
 }
 
@@ -209,39 +271,76 @@ pub fn normalize_rows(
 /// contiguous dictionary-bytes buffer.
 ///
 /// The compact-layout kernels read this instead of the padded table, so FSST-12 needs an
-/// equivalent to exercise them. Returns the directory and the contiguous bytes it indexes.
+/// equivalent to exercise them. Returns the directory, the bytes it indexes, and the
+/// logical byte length (excluding the trailing read pad).
+///
+/// The returned buffer carries `DICT_STRIDE` initialized trailing bytes because the compact
+/// kernels issue FIXED-WIDTH reads at a directory offset, not length-exact ones: a
+/// `uint4` load for the last trained symbol, or for an untrained entry pointing at the
+/// logical end, would otherwise run past the allocation. The logical length is returned
+/// separately so callers report dictionary footprint without the pad.
 pub fn compact_dict(
     symbols: &[fsst12::Symbol],
     lengths: &[u8],
-) -> Result<(Vec<u64>, Vec<u8>), Fsst12AbiError> {
-    if symbols.len() != lengths.len() {
-        return Err(Fsst12AbiError::TableMismatch {
-            symbols: symbols.len(),
-            lengths: lengths.len(),
-        });
-    }
+) -> Result<(Vec<u64>, Vec<u8>, usize), Fsst12AbiError> {
+    validate_table(symbols, lengths)?;
+
     let mut table = Vec::with_capacity(FSST12_CODE_SPACE);
-    let mut bytes: Vec<u8> = Vec::with_capacity(symbols.len() * 8);
-    for (code, (sym, &len)) in symbols.iter().zip(lengths.iter()).enumerate() {
-        if len == 0 || len > 8 {
-            return Err(Fsst12AbiError::SymbolLength { code, len });
-        }
+    let mut bytes: Vec<u8> = Vec::with_capacity(symbols.len() * 8 + DICT_STRIDE);
+    for (sym, &len) in symbols.iter().zip(lengths.iter()) {
         let off = bytes.len() as u64;
         bytes.extend_from_slice(&sym.to_u64().to_le_bytes()[..len as usize]);
+        // The directory packs the offset into the high 48 bits, so a dictionary larger
+        // than 2^48 bytes would alias. Unreachable at 4096 x 8 B, asserted rather than
+        // assumed because the shift is silent on overflow.
+        debug_assert!(off < (1u64 << 48));
         table.push((off << 16) | len as u64);
     }
-    // Untrained codes: zero length at the end of the buffer, so a stray read yields
-    // nothing rather than another entry's bytes.
-    let end = bytes.len() as u64;
-    table.resize(FSST12_CODE_SPACE, end << 16);
-    Ok((table, bytes))
+    let logical_len = bytes.len();
+    // Untrained codes: zero length at the logical end, so a stray fixed-width read lands
+    // in the pad rather than in another entry's bytes.
+    table.resize(FSST12_CODE_SPACE, (logical_len as u64) << 16);
+    bytes.extend(std::iter::repeat_n(0u8, DICT_STRIDE));
+    Ok((table, bytes, logical_len))
 }
 
-/// Decode through the ABI exactly as a kernel lane does: copy a fixed sixteen bytes from
+/// What a serialized, row-addressable FSST-12 column actually stores.
+///
+/// Kept as separate components, and deliberately NOT collapsed into one `compressed_bytes`
+/// field, because the obvious single number is the one that is wrong: the per-row 12-bit
+/// payload alone omits both the row offsets that make the column addressable and the
+/// dictionary needed to decode it. A ratio built from the payload alone is optimistic, and
+/// it is not commensurable with OnPair's `in_memory_bytes`, which counts codes, offsets,
+/// and dictionary together. Any FSST-12-vs-OnPair ratio must compare [`Self::total`]
+/// against that.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Fsst12StoredSize {
+    /// Per-row 12-bit packed code payload, summed over rows.
+    pub packed_codes: usize,
+    /// Row-boundary vector, `u64` per boundary -- the analogue of OnPair's `codes_offsets`.
+    pub row_offsets: usize,
+    /// Dictionary as stored: 8 B symbol plus 1 B length per trained entry. Excludes the
+    /// GPU-side padding and the widened decode table, which are load-time artifacts.
+    pub table: usize,
+}
+
+impl Fsst12StoredSize {
+    /// Total stored footprint, the quantity comparable to OnPair's `in_memory_bytes`.
+    pub fn total(&self) -> usize {
+        self.packed_codes + self.row_offsets + self.table
+    }
+}
+
+/// Decode through the ABI as a kernel lane does: read a fixed sixteen bytes at
 /// `dict + code * 16`, then advance the cursor by the true length.
 ///
-/// Written to mirror the kernel rather than to be the fastest correct decoder. A
-/// length-exact copy would hide a wrong padded upper half; the over-copy exposes it.
+/// It mirrors the kernel's fixed-width READ, which is what makes the padded table's
+/// allocation and stride load-bearing. It does NOT prove the padded upper half is clean:
+/// the next token's write overwrites the excess and the final excess is truncated, so a
+/// dirty upper half is invisible here. An earlier revision of this comment claimed
+/// otherwise. `padded_upper_half_is_clean` asserts that property directly instead.
+///
+/// Test oracle only -- not a decoder anything should depend on.
 pub fn decode_via_abi(abi: &Fsst12Abi) -> Vec<u8> {
     let mut out = vec![0u8; abi.decoded_bytes + DICT_STRIDE];
     let mut cursor = 0usize;
@@ -269,6 +368,20 @@ mod tests {
         }
         rows.push((0u8..=255).collect());
         rows
+    }
+
+    /// Extract one row's code slice as a standalone ABI, for isolated decode.
+    fn slice_rows(r: &Fsst12RowsAbi, lo: usize, hi: usize) -> Fsst12Abi {
+        Fsst12Abi {
+            codes: r.abi.codes[lo..hi].to_vec(),
+            lens: r.abi.lens.clone(),
+            dict_padded: r.abi.dict_padded.clone(),
+            decoded_bytes: r.abi.codes[lo..hi]
+                .iter()
+                .map(|&c| r.abi.lens[c as usize] as usize)
+                .sum(),
+            table_entries: r.abi.table_entries,
+        }
     }
 
     fn train_and_compress(rows: &[Vec<u8>]) -> (Compressor12, Vec<u8>, Vec<u8>) {
@@ -324,23 +437,21 @@ mod tests {
         assert_eq!(rowsabi.row_code_offsets.len(), refs.len() + 1);
         assert_eq!(decode_via_abi(&rowsabi.abi), flat, "concatenated decode");
 
-        // Spot-check row addressability at both ends and in the middle: a row's code
-        // slice must decode to exactly that row.
-        for &i in &[0usize, 1, refs.len() / 2, refs.len() - 1] {
-            let lo = rowsabi.row_code_offsets[i] as usize;
-            let hi = rowsabi.row_code_offsets[i + 1] as usize;
-            let slice = Fsst12Abi {
-                codes: rowsabi.abi.codes[lo..hi].to_vec(),
-                lens: rowsabi.abi.lens.clone(),
-                dict_padded: rowsabi.abi.dict_padded.clone(),
-                decoded_bytes: rowsabi.abi.codes[lo..hi]
-                    .iter()
-                    .map(|&c| rowsabi.abi.lens[c as usize] as usize)
-                    .sum(),
-                table_entries: rowsabi.abi.table_entries,
-            };
-            assert_eq!(decode_via_abi(&slice), refs[i], "row {i} decodes in isolation");
+        // EVERY offset, not a sample: a desynchronized offset vector can be correct at
+        // the ends and wrong in between.
+        let small: Vec<&[u8]> = refs.iter().copied().take(400).collect();
+        let small_abi = normalize_rows(&compressor, &small).expect("normalize_rows small");
+        for (i, row) in small.iter().enumerate() {
+            let lo = small_abi.row_code_offsets[i] as usize;
+            let hi = small_abi.row_code_offsets[i + 1] as usize;
+            let sliced = slice_rows(&small_abi, lo, hi);
+            assert_eq!(decode_via_abi(&sliced), *row, "row {i} decodes in isolation");
         }
+
+        // Accounting: components must be individually nonzero and sum to total.
+        let st = rowsabi.stored;
+        assert!(st.packed_codes > 0 && st.row_offsets > 0 && st.table > 0);
+        assert_eq!(st.total(), st.packed_codes + st.row_offsets + st.table);
     }
 
     /// The compact directory must address the same bytes the padded table holds.
@@ -349,7 +460,7 @@ mod tests {
         let rows = corpus();
         let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
         let compressor = Compressor12::train(&refs);
-        let (table, bytes) =
+        let (table, bytes, logical) =
             compact_dict(compressor.symbol_table(), compressor.symbol_lengths()).expect("compact");
         let (padded, lens) =
             widen_table(compressor.symbol_table(), compressor.symbol_lengths()).expect("widen");
@@ -365,6 +476,126 @@ mod tests {
                 "code {code} bytes"
             );
         }
+
+        // Fixed-width reads must stay in bounds for the LAST trained code and for an
+        // untrained entry pointing at the logical end -- the case true-length slicing
+        // cannot detect.
+        let last = compressor.symbol_table().len() - 1;
+        let last_off = (table[last] >> 16) as usize;
+        assert!(last_off + DICT_STRIDE <= bytes.len(), "last trained fixed-width read");
+        let untrained_off = (table[FSST12_CODE_SPACE - 1] >> 16) as usize;
+        assert_eq!(untrained_off, logical, "untrained entry points at the logical end");
+        assert!(
+            untrained_off + DICT_STRIDE <= bytes.len(),
+            "untrained fixed-width read in bounds"
+        );
+        assert_eq!(table[FSST12_CODE_SPACE - 1] & 0xffff, 0, "untrained length is zero");
+        assert_eq!(table.len(), FSST12_CODE_SPACE, "directory covers the code space");
+    }
+
+    /// The padded table's unused upper half must actually be zero. decode_via_abi cannot
+    /// show this -- the next token overwrites the excess -- so assert it at the source.
+    #[test]
+    fn padded_upper_half_is_clean() {
+        let rows = corpus();
+        let refs: Vec<&[u8]> = rows.iter().map(|r| r.as_slice()).collect();
+        let compressor = Compressor12::train(&refs);
+        let (padded, lens) =
+            widen_table(compressor.symbol_table(), compressor.symbol_lengths()).expect("widen");
+        for code in 0..FSST12_CODE_SPACE {
+            let len = lens[code] as usize;
+            let cell = &padded[code * DICT_STRIDE..(code + 1) * DICT_STRIDE];
+            assert!(
+                cell[len..].iter().all(|&b| b == 0),
+                "code {code} has dirty bytes past its length {len}"
+            );
+        }
+        assert!(padded.len() >= FSST12_CODE_SPACE * DICT_STRIDE + DICT_STRIDE, "trailing pad");
+    }
+
+    /// Hand-built packing vectors, independent of the codec, so a shared misreading between
+    /// our unpacker and the reference cannot hide.
+    #[test]
+    fn unpack_hand_built_vectors() {
+        // One 3-byte triple: low code 0x123, high code 0x456 -> bytes 23 61 45.
+        assert_eq!(unpack_codes(&[0x23, 0x61, 0x45]).unwrap(), vec![0x123, 0x456]);
+        // 2-byte odd tail: only the low 12 bits are a code; the high nibble is ignored.
+        assert_eq!(unpack_codes(&[0x23, 0xf1]).unwrap(), vec![0x123]);
+        // 5 bytes = one triple plus a 2-byte odd tail.
+        assert_eq!(
+            unpack_codes(&[0x23, 0x61, 0x45, 0x89, 0x07]).unwrap(),
+            vec![0x123, 0x456, 0x789]
+        );
+        // Lengths 1 and 4 are 1 mod 3 and invalid.
+        assert!(unpack_codes(&[0x00]).is_err());
+        assert!(unpack_codes(&[0u8; 4]).is_err());
+    }
+
+    /// Degenerate row shapes: no rows at all, and empty rows interleaved with real ones.
+    #[test]
+    fn row_form_handles_degenerate_rows() {
+        let base = corpus();
+        let refs: Vec<&[u8]> = base.iter().map(|r| r.as_slice()).collect();
+        let compressor = Compressor12::train(&refs);
+
+        let zero = normalize_rows(&compressor, &[]).expect("zero rows");
+        assert_eq!(zero.row_code_offsets, vec![0]);
+        assert!(zero.abi.codes.is_empty());
+        assert_eq!(zero.abi.decoded_bytes, 0);
+
+        let mixed: Vec<&[u8]> = vec![b"", b"", b"abc", b"", b"defgh", b""];
+        let got = normalize_rows(&compressor, &mixed).expect("mixed rows");
+        assert_eq!(got.row_code_offsets.len(), mixed.len() + 1);
+        for (i, row) in mixed.iter().enumerate() {
+            let lo = got.row_code_offsets[i] as usize;
+            let hi = got.row_code_offsets[i + 1] as usize;
+            let sliced = slice_rows(&got, lo, hi);
+            assert_eq!(decode_via_abi(&sliced), *row, "row {i}");
+        }
+    }
+
+    /// Untrained codes must fail loudly rather than decode to nothing.
+    #[test]
+    fn rejects_untrained_code() {
+        let base = corpus();
+        let refs: Vec<&[u8]> = base.iter().map(|r| r.as_slice()).collect();
+        let compressor = Compressor12::train(&refs);
+        let entries = compressor.symbol_table().len();
+        assert!(entries < FSST12_CODE_SPACE, "corpus should not fill the table");
+        // Embed an untrained code in the middle of an otherwise valid stream.
+        let codes = vec![b'a' as u16, entries as u16, b'b' as u16];
+        assert!(matches!(
+            validate_codes(&codes, entries),
+            Err(Fsst12AbiError::UntrainedCode { pos: 1, .. })
+        ));
+    }
+
+    /// A table that is the right size but whose reserved codes are not the identity
+    /// singletons is not FSST-12, and must be rejected by both conversions.
+    #[test]
+    fn rejects_non_identity_reserved_codes() {
+        let base = corpus();
+        let refs: Vec<&[u8]> = base.iter().map(|r| r.as_slice()).collect();
+        let compressor = Compressor12::train(&refs);
+        let mut symbols = compressor.symbol_table().to_vec();
+        let mut lengths = compressor.symbol_lengths().to_vec();
+        symbols[7] = fsst12::Symbol::from_slice(b"XXXXXXXX");
+        lengths[7] = 8;
+        assert!(matches!(
+            widen_table(&symbols, &lengths),
+            Err(Fsst12AbiError::ReservedCode { code: 7, .. })
+        ));
+        assert!(matches!(
+            compact_dict(&symbols, &lengths),
+            Err(Fsst12AbiError::ReservedCode { code: 7, .. })
+        ));
+        // Oversized tables must be rejected, not silently truncated.
+        let over = vec![fsst12::Symbol::ZERO; FSST12_CODE_SPACE + 1];
+        let over_len = vec![1u8; FSST12_CODE_SPACE + 1];
+        assert!(matches!(
+            compact_dict(&over, &over_len),
+            Err(Fsst12AbiError::TableSize(_))
+        ));
     }
 
     #[test]
