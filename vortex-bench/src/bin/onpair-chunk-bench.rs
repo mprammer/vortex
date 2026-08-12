@@ -112,6 +112,10 @@ enum Command {
         /// Copy GPU output bytes back and compare every applicable kernel against CPU decode.
         #[arg(long)]
         gpu_validate: bool,
+        /// Stored codec: `onpair` (default) or `fsst12`. FSST-12 is a 12-bit codec, so
+        /// --bits and --threshold do not apply to it and are ignored.
+        #[arg(long, default_value = "onpair")]
+        codec: String,
     },
     /// Run CUDA OnPair decode directly from existing `.vortex` files.
     GpuDecodeVortex {
@@ -161,6 +165,7 @@ async fn main() -> Result<()> {
             gpu_decode,
             gpu_iters,
             gpu_validate,
+            codec,
         } => {
             let results = run_column(
                 &dataset_id,
@@ -176,6 +181,7 @@ async fn main() -> Result<()> {
                     iterations: gpu_iters,
                     validate: gpu_validate,
                 }),
+                &codec,
             )
             .await?;
             println!("{}", serde_json::to_string_pretty(&results)?);

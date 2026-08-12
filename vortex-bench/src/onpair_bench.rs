@@ -128,7 +128,12 @@ pub struct CellResult {
     pub dataset_id: String,
     /// Column name within the dataset.
     pub column: String,
-    /// OnPair dictionary code width.
+    /// Codec that produced the stored representation: "onpair" or "fsst12". FSST-12 is a
+    /// 12-bit codec, so `bits` alone does NOT identify it -- a reader keying on bits would
+    /// confuse an FSST-12 cell with OnPair-12.
+    #[serde(default = "default_codec")]
+    pub codec: String,
+    /// Dictionary code width.
     pub bits: u32,
     /// OnPair training threshold.
     pub threshold: f64,
@@ -355,7 +360,7 @@ pub async fn run_vortex_gpu_decode(
         .map(|a| a.clone().into_array().nbytes())
         .sum();
     let dict_bytes = onpairs.iter().map(|a| a.dict_bytes().len() as u64).sum();
-    let gpu = run_gpu_kernel_bench(&onpairs, gpu_config).await?;
+    let gpu = run_gpu_kernel_bench(DecodeSource::OnPair(&onpairs), gpu_config).await?;
 
     Ok(GpuVortexDecodeResult {
         files: files
@@ -368,6 +373,11 @@ pub async fn run_vortex_gpu_decode(
         dict_bytes,
         gpu,
     })
+}
+
+/// Records written before FSST-12 existed carry no codec field and are all OnPair.
+fn default_codec() -> String {
+    "onpair".to_string()
 }
 
 /// Encoding id of the OnPair array, used to assert on-disk encoding.
@@ -603,6 +613,7 @@ pub async fn run_column(
     file_target_bytes: u64,
     out_root: &Path,
     gpu_config: Option<GpuBenchmarkConfig>,
+    codec: &str,
 ) -> Result<Vec<CellResult>> {
     let sample = build_sample(parquet_path, column, sample_bytes)?;
     tracing::info!(
@@ -612,6 +623,28 @@ pub async fn run_column(
     );
 
     let mut results = Vec::new();
+    // FSST-12 has one configuration: a 12-bit code space and no training threshold, so the
+    // bits and thresholds axes do not apply and are not swept. Sweeping them would emit
+    // duplicate cells that differ only in labels the codec ignores.
+    if codec == "fsst12" {
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (&sample, out_root, gpu_config);
+            anyhow::bail!("--codec fsst12 requires a build with --features cuda");
+        }
+        #[cfg(feature = "cuda")]
+        {
+            for &cb in chunk_bytes {
+                results.push(
+                    run_cell_fsst12(dataset_id, column, &sample, cb, out_root, gpu_config).await?,
+                );
+            }
+            return Ok(results);
+        }
+    }
+    if codec != "onpair" {
+        anyhow::bail!("unknown --codec '{codec}' (expected 'onpair' or 'fsst12')");
+    }
     for &b in bits {
         for &cb in chunk_bytes {
             for &thr in thresholds {
@@ -632,6 +665,105 @@ pub async fn run_column(
         }
     }
     Ok(results)
+}
+
+/// Run one cell with FSST-12 as the stored codec instead of OnPair.
+///
+/// Deliberately a separate function rather than a branch inside `run_cell`: the OnPair path
+/// produces every committed number in the paper, and threading a codec switch through its
+/// compression, BtrBlocks child-compression, file-write and round-trip stages would put
+/// that path at risk to add a codec that shares none of them. FSST-12 is not a Vortex
+/// encoding, so there is no `.vortex` file to write or read back -- the on-disk fields are
+/// zero here by construction, and `mem_ratio` is the only ratio this path reports.
+#[cfg(feature = "cuda")]
+async fn run_cell_fsst12(
+    dataset_id: &str,
+    column: &str,
+    sample: &Sample,
+    chunk_bytes: u64,
+    out_root: &Path,
+    gpu_config: Option<GpuBenchmarkConfig>,
+) -> Result<CellResult> {
+    use vortex::array::arrays::VarBinViewArray;
+
+    let out_dir = out_root
+        .join(dataset_id)
+        .join(column)
+        .join(format!("fsst12_chunk{}", human_bytes(chunk_bytes)));
+    std::fs::create_dir_all(&out_dir)?;
+
+    let ranges = chunk_ranges(sample.rows, sample.raw_bytes, chunk_bytes);
+    let t0 = Instant::now();
+    let mut all_inputs = Vec::with_capacity(ranges.len());
+    let mut stored_total = 0u64;
+    let mut table_bytes_total = 0u64;
+    for r in ranges.iter().cloned() {
+        let slice = sample.array.slice(r)?;
+        let mut ctx = SESSION.create_execution_ctx();
+        let decoded = slice.execute::<VarBinViewArray>(&mut ctx)?;
+        // Materialize the chunk's rows once; FSST-12 training and compression both need
+        // them as slices, and the borrow has to outlive both.
+        let mut flat: Vec<u8> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        decoded.with_iterator(|values| {
+            for value in values {
+                let v = value.unwrap_or(&[]);
+                let start = flat.len();
+                flat.extend_from_slice(v);
+                spans.push((start, flat.len()));
+            }
+        });
+        let rows: Vec<&[u8]> = spans.iter().map(|&(a, b)| &flat[a..b]).collect();
+        let (inputs, stored) = fsst12_decode_inputs(&rows)?;
+        stored_total += stored.total() as u64;
+        table_bytes_total += stored.table as u64;
+        all_inputs.push(inputs);
+    }
+    let encode_secs = t0.elapsed().as_secs_f64();
+    let n_chunks = all_inputs.len();
+
+    let gpu = match gpu_config {
+        Some(config) => Some(run_gpu_kernel_bench(DecodeSource::Prebuilt(all_inputs), config).await?),
+        None => {
+            anyhow::bail!("FSST-12 cells are GPU-only; pass --gpu-decode")
+        }
+    };
+    // The GPU path validates byte-exactness against `expected_bytes`; there is no separate
+    // file round-trip to verify, so that validation IS this cell's correctness result.
+    let verified = gpu.as_ref().map(|g| g.validated).unwrap_or(false);
+
+    let gib = sample.raw_bytes as f64 / GIB;
+    let result = CellResult {
+        dataset_id: dataset_id.to_string(),
+        column: column.to_string(),
+        codec: "fsst12".to_string(),
+        bits: 12,
+        threshold: 0.0,
+        chunk_bytes,
+        rows: sample.rows as u64,
+        unique_count: sample.unique_count,
+        sample_bytes: sample.raw_bytes,
+        n_chunks,
+        in_memory_bytes: stored_total,
+        dict_bytes: table_bytes_total,
+        on_disk_bytes: 0,
+        n_files: 0,
+        encode_ms: encode_secs * 1e3,
+        decode_ms: 0.0,
+        encode_gib_s: if encode_secs > 0.0 { gib / encode_secs } else { 0.0 },
+        decode_gib_s: 0.0,
+        gpu,
+        mem_ratio: ratio(sample.raw_bytes, stored_total),
+        disk_ratio: 0.0,
+        verified,
+        onpair_only: false,
+        out_dir: out_dir.to_string_lossy().into_owned(),
+    };
+    std::fs::write(
+        out_dir.join("meta.json"),
+        serde_json::to_vec_pretty(&result)?,
+    )?;
+    Ok(result)
 }
 
 #[expect(clippy::too_many_arguments)]
@@ -827,7 +959,7 @@ async fn run_cell(
     let (verified, onpair_only) = verify_roundtrip(&files, column, &sample.array).await?;
     let decode_secs = t1.elapsed().as_secs_f64();
     let gpu = match gpu_config {
-        Some(config) => Some(run_gpu_kernel_bench(&onpairs, config).await?),
+        Some(config) => Some(run_gpu_kernel_bench(DecodeSource::OnPair(&onpairs), config).await?),
         None => None,
     };
 
@@ -835,6 +967,7 @@ async fn run_cell(
     let result = CellResult {
         dataset_id: dataset_id.to_string(),
         column: column.to_string(),
+        codec: "onpair".to_string(),
         bits,
         threshold,
         chunk_bytes,
@@ -874,8 +1007,13 @@ async fn run_cell(
 }
 
 #[cfg(not(feature = "cuda"))]
+pub enum DecodeSource<'a> {
+    OnPair(&'a [OnPairArray]),
+}
+
+#[cfg(not(feature = "cuda"))]
 async fn run_gpu_kernel_bench(
-    _onpairs: &[OnPairArray],
+    _source: DecodeSource<'_>,
     _config: GpuBenchmarkConfig,
 ) -> Result<GpuCellResult> {
     anyhow::bail!(
@@ -1375,8 +1513,18 @@ const GPU_KERNELS: &[KernelVariant] = &[
 ];
 
 #[cfg(feature = "cuda")]
+/// Where a cell's decode inputs come from. The kernels are codec-agnostic, so this is the
+/// only place the codec is named on the GPU path.
+#[cfg(feature = "cuda")]
+pub enum DecodeSource<'a> {
+    OnPair(&'a [OnPairArray]),
+    /// Pre-built inputs, one per chunk, already normalized to the decode ABI.
+    Prebuilt(Vec<DecodeInputs>),
+}
+
+#[cfg(feature = "cuda")]
 async fn run_gpu_kernel_bench(
-    onpairs: &[OnPairArray],
+    source: DecodeSource<'_>,
     config: GpuBenchmarkConfig,
 ) -> Result<GpuCellResult> {
     let iterations = config.iterations.max(1);
@@ -1394,9 +1542,21 @@ async fn run_gpu_kernel_bench(
         std::fs::File::create(&p)
             .with_context(|| format!("ONPAIR_DUMP_BATCH: truncate {p} failed"))?;
     }
-    let mut chunks = Vec::with_capacity(onpairs.len());
-    for op in onpairs {
-        chunks.push(stage_gpu_chunk(op, &mut setup_ctx).await?);
+    let mut chunks = Vec::new();
+    match source {
+        DecodeSource::OnPair(onpairs) => {
+            chunks.reserve(onpairs.len());
+            for op in onpairs {
+                let inputs = onpair_decode_inputs(op, &mut setup_ctx).await?;
+                chunks.push(stage_gpu_chunk(inputs, &mut setup_ctx).await?);
+            }
+        }
+        DecodeSource::Prebuilt(all) => {
+            chunks.reserve(all.len());
+            for inputs in all {
+                chunks.push(stage_gpu_chunk(inputs, &mut setup_ctx).await?);
+            }
+        }
     }
     setup_ctx.synchronize_stream()?;
 
@@ -1664,8 +1824,172 @@ fn maybe_reorder_dict(
     (new_codes, new_padded, new_lens, new_table)
 }
 
+/// The decode inputs the GPU kernels consume, independent of which codec produced them.
+///
+/// The kernels read fixed-width `u16` codes, a per-code length table, and dictionary bytes
+/// at a fixed stride; nothing below this struct observes provenance. Making that a type
+/// rather than a convention is what lets FSST-12 and OnPair share one staging path, and it
+/// is the executable form of the paper's shared-decode-ABI claim.
+///
+/// Not gated on `cuda`: it holds only plain buffers, and leaving it ungated means the
+/// FSST-12 builder below is type-checked on machines without a CUDA toolchain -- which is
+/// where it is written.
+#[allow(dead_code)]
+struct DecodeInputs {
+    codes_u16: Vec<u16>,
+    /// Code-addressed table at `DICT_STRIDE`, with a trailing pad for wide loads.
+    dict_padded: Vec<u8>,
+    lens_table: Vec<u8>,
+    /// `(offset << 16) | length` directory over `dict_bytes_logical`.
+    dict_table: Vec<u64>,
+    /// Contiguous dictionary bytes WITHOUT the trailing pad, as the compact path indexes.
+    dict_bytes_logical: Vec<u8>,
+    /// The same bytes plus a 16-byte pad, as copied to the device.
+    dict_bytes_with_pad: Vec<u8>,
+    /// Per-row code offsets, length `rows + 1`.
+    row_code_offsets: Vec<u64>,
+    /// Per-row cumulative decoded byte offsets, length `rows + 1`.
+    output_offsets: Vec<u64>,
+    validity: Vec<u8>,
+    expected_bytes: Vec<u8>,
+    rows: usize,
+    decoded_bytes: u64,
+    total_tokens: usize,
+    distinct_codes: u32,
+    access_top4096_frac: f32,
+    dict_max_len: u8,
+    dict_mean_len: f32,
+    frac_le8: f32,
+    all_len_1: bool,
+    all_len_2: bool,
+}
+
+/// Build decode inputs from a string array by compressing it with FSST-12 and normalizing
+/// to the shared decode ABI.
+///
+/// This is the measurement that turns the paper's shared-ABI claim from an argument about
+/// formats into a result: the kernels staged from this are byte-identical in construction
+/// to the OnPair ones, and every statistic below is computed over the FSST-12 code stream
+/// rather than inherited.
+///
+/// Row-addressable form deliberately (`normalize_rows`): OnPair stores per-row code
+/// offsets and the row-decode paths read them, so a whole-buffer FSST-12 would be
+/// comparable on rate but not on layout. The cost is ~0.25 B/row measured.
+#[allow(dead_code)]
+fn fsst12_decode_inputs(rows: &[&[u8]]) -> Result<(DecodeInputs, crate::fsst12_abi::Fsst12StoredSize)> {
+    use crate::fsst12_abi::{compact_dict, normalize_rows, DICT_STRIDE};
+    use fsst12::fsst12::Compressor12;
+
+    let compressor = Compressor12::train(rows);
+    let normalized = normalize_rows(&compressor, rows)
+        .map_err(|e| anyhow::anyhow!("FSST-12 normalize failed: {e}"))?;
+    let (dict_table, dict_bytes_with_pad, dict_logical_len) =
+        compact_dict(compressor.symbol_table(), compressor.symbol_lengths())
+            .map_err(|e| anyhow::anyhow!("FSST-12 compact dict failed: {e}"))?;
+
+    let abi = normalized.abi;
+    let codes_u16 = abi.codes;
+    let lens_table = abi.lens;
+    let total_tokens = codes_u16.len();
+
+    // Same access-distribution diagnostic the OnPair path computes, over this code stream.
+    let (distinct_codes, access_top4096_frac) = if codes_u16.is_empty() {
+        (0u32, 0.0f32)
+    } else {
+        let mut freq = vec![0u32; 1usize << 12];
+        for &c in &codes_u16 {
+            freq[c as usize] += 1;
+        }
+        let distinct = freq.iter().filter(|&&f| f > 0).count() as u32;
+        freq.sort_unstable_by(|a, b| b.cmp(a));
+        let top: u64 = freq.iter().take(4096).map(|&f| f as u64).sum();
+        (distinct, top as f32 / codes_u16.len() as f32)
+    };
+
+    // Occurrence-weighted, matching the OnPair path: averaged over the code stream, not
+    // over the table, so the 256 rarely-emitted singletons do not drag it down.
+    let dict_mean_len = if codes_u16.is_empty() {
+        0.0
+    } else {
+        codes_u16
+            .iter()
+            .map(|&c| lens_table[c as usize] as u64)
+            .sum::<u64>() as f32
+            / codes_u16.len() as f32
+    };
+    let frac_le8 = if codes_u16.is_empty() {
+        0.0
+    } else {
+        codes_u16
+            .iter()
+            .filter(|&&c| lens_table[c as usize] <= 8)
+            .count() as f32
+            / codes_u16.len() as f32
+    };
+    // Every FSST-12 symbol fits eight bytes, so this is 1.0 by construction. Computed
+    // rather than hardcoded so a codec change shows up in the data instead of silently
+    // contradicting it.
+    debug_assert!((frac_le8 - 1.0).abs() < 1e-6 || codes_u16.is_empty());
+
+    let dict_max_len = *lens_table.iter().max().unwrap_or(&0);
+    let all_len_1 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 1);
+    let all_len_2 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 2);
+
+    let mut expected_bytes = Vec::with_capacity(rows.iter().map(|r| r.len()).sum());
+    let mut output_offsets = Vec::with_capacity(rows.len() + 1);
+    output_offsets.push(0u64);
+    let mut acc = 0u64;
+    for r in rows {
+        expected_bytes.extend_from_slice(r);
+        acc += r.len() as u64;
+        output_offsets.push(acc);
+    }
+    let decoded_bytes = acc;
+    // The ABI decode must reproduce the input exactly; this is the same invariant the
+    // module tests assert, re-checked here on real cell data before any GPU launch.
+    anyhow::ensure!(
+        abi.decoded_bytes as u64 == decoded_bytes,
+        "FSST-12 predicted decoded length {} != input length {decoded_bytes}",
+        abi.decoded_bytes
+    );
+
+    let dict_bytes_logical = dict_bytes_with_pad[..dict_logical_len].to_vec();
+    let _ = DICT_STRIDE;
+
+    Ok((
+        DecodeInputs {
+            codes_u16,
+            dict_padded: abi.dict_padded,
+            lens_table,
+            dict_table,
+            dict_bytes_logical,
+            dict_bytes_with_pad,
+            row_code_offsets: normalized.row_code_offsets,
+            output_offsets,
+            validity: vec![0xFFu8; rows.len().div_ceil(8)],
+            expected_bytes,
+            rows: rows.len(),
+            decoded_bytes,
+            total_tokens,
+            distinct_codes,
+            access_top4096_frac,
+            dict_max_len,
+            dict_mean_len,
+            frac_le8,
+            all_len_1,
+            all_len_2,
+        },
+        normalized.stored,
+    ))
+}
+
+/// Extract the decode inputs from an OnPair array. Unchanged behaviour; this is the code
+/// that used to open `stage_gpu_chunk`.
 #[cfg(feature = "cuda")]
-async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result<GpuOnPairChunk> {
+async fn onpair_decode_inputs(
+    op: &OnPairArray,
+    ctx: &mut CudaExecutionCtx,
+) -> Result<DecodeInputs> {
     let codes_arr = op
         .codes()
         .clone()
@@ -1793,6 +2117,58 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     });
     let validity = vec![0xFFu8; op.len().div_ceil(8)];
 
+    Ok(DecodeInputs {
+        codes_u16,
+        dict_padded,
+        lens_table,
+        dict_table,
+        dict_bytes_logical: dict_bytes_host.to_vec(),
+        dict_bytes_with_pad,
+        row_code_offsets: codes_offsets_to_u64(&codes_offsets_arr),
+        output_offsets,
+        validity,
+        expected_bytes,
+        rows: op.len(),
+        decoded_bytes,
+        total_tokens,
+        distinct_codes,
+        access_top4096_frac,
+        dict_max_len,
+        dict_mean_len,
+        frac_le8,
+        all_len_1,
+        all_len_2,
+    })
+}
+
+#[cfg(feature = "cuda")]
+async fn stage_gpu_chunk(
+    inputs: DecodeInputs,
+    ctx: &mut CudaExecutionCtx,
+) -> Result<GpuOnPairChunk> {
+    let DecodeInputs {
+        codes_u16,
+        dict_padded,
+        lens_table,
+        dict_table,
+        dict_bytes_logical,
+        dict_bytes_with_pad,
+        row_code_offsets,
+        output_offsets,
+        validity,
+        expected_bytes,
+        rows,
+        decoded_bytes,
+        total_tokens,
+        distinct_codes,
+        access_top4096_frac,
+        dict_max_len,
+        dict_mean_len,
+        frac_le8,
+        all_len_1,
+        all_len_2,
+    } = inputs;
+
     // EXPERIMENTAL, env-gated, decode-side only: relabel dict codes to study
     // cache-layout effects. A code permutation is a consistent relabeling, so
     // decoded bytes are unchanged — this does NOT touch the compressor or the
@@ -1849,13 +2225,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     if let Ok(dump_path) = std::env::var("ONPAIR_DUMP_OP1") {
         use std::io::Write;
         let dict_size = lens_table.len();
-        let row_offsets: Vec<u64> = match_each_integer_ptype!(codes_offsets_arr.ptype(), |P| {
-            codes_offsets_arr
-                .as_slice::<P>()
-                .iter()
-                .map(|&v| v as u64)
-                .collect()
-        });
+        let row_offsets: Vec<u64> = row_code_offsets.clone();
         // codes_offsets has n_rows+1 entries (row r = codes[row_offsets[r]..row_offsets[r+1]]).
         let n_rows = row_offsets.len().saturating_sub(1);
         match std::fs::File::create(&dump_path) {
@@ -1955,7 +2325,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     // the native bytes/offsets — no on-disk change. Empty if an offset > 27 bits.
     let (dict_q4_host, dict_q4_dir): (Vec<u8>, Vec<u32>) = {
         let mut bytes: Vec<u8> =
-            Vec::with_capacity(dict_bytes_host.len() + dict_table.len() * 4 + 16);
+            Vec::with_capacity(dict_bytes_logical.len() + dict_table.len() * 4 + 16);
         let mut dir: Vec<u32> = Vec::with_capacity(dict_table.len());
         let mut fits = true;
         for &e in &dict_table {
@@ -1966,7 +2336,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
                 fits = false;
                 break;
             }
-            bytes.extend_from_slice(&dict_bytes_host[off..off + len]);
+            bytes.extend_from_slice(&dict_bytes_logical[off..off + len]);
             let qsize = (len + 3) & !3;
             bytes.extend(std::iter::repeat_n(0u8, qsize - len));
             dir.push(((qoff as u32) << 5) | (len as u32 & 0x1f));
@@ -2088,7 +2458,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     let chunk_offsets_1024 = chunk_offsets(&codes_u16, &lens_table, 1024, decoded_bytes);
 
     Ok(GpuOnPairChunk {
-        rows: op.len(),
+        rows,
         decoded_bytes,
         total_tokens,
         dict_max_len,
@@ -2097,7 +2467,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
         all_len_2,
         codes: ctx.copy_to_device::<u16, _>(codes_u16)?.await?,
         codes_offsets: ctx
-            .copy_to_device::<u64, _>(codes_offsets_to_u64(&codes_offsets_arr))?
+            .copy_to_device::<u64, _>(row_code_offsets)?
             .await?,
         dict_padded: ctx.copy_to_device::<u8, _>(dict_padded)?.await?,
         dict_s8: ctx.copy_to_device::<u8, _>(dict_s8)?.await?,
@@ -3318,5 +3688,78 @@ mod tests {
         // Tiny budget would ask for more chunks than rows.
         let r = chunk_ranges(3, 1000, 1);
         assert_eq!(r.len(), 3);
+    }
+}
+
+#[cfg(test)]
+mod fsst12_inputs_tests {
+    use super::*;
+
+    fn rows() -> Vec<Vec<u8>> {
+        let mut v: Vec<Vec<u8>> = Vec::new();
+        for i in 0..1500u32 {
+            v.push(format!("http://example.com/a/{i}?x=1&y=2").into_bytes());
+            v.push(format!("some free text row number {i} with words").into_bytes());
+            v.push(Vec::new()); // empty rows must not desynchronize anything
+        }
+        v
+    }
+
+    /// The statistics this builder derives feed tab:datasets and the kernel selector, and
+    /// a wrong one is invisible to byte-exactness: the decode would still be correct while
+    /// the reported column was wrong. So they are asserted directly.
+    #[test]
+    fn derived_statistics_are_self_consistent() {
+        let owned = rows();
+        let refs: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
+        let (inputs, stored) = fsst12_decode_inputs(&refs).expect("build inputs");
+
+        let raw: usize = owned.iter().map(|r| r.len()).sum();
+        assert_eq!(inputs.decoded_bytes as usize, raw, "decoded_bytes");
+        assert_eq!(inputs.expected_bytes.len(), raw, "expected_bytes length");
+        assert_eq!(inputs.rows, refs.len(), "rows");
+
+        // Offsets: one more than rows, monotone, ending at the total.
+        assert_eq!(inputs.output_offsets.len(), refs.len() + 1);
+        assert_eq!(*inputs.output_offsets.last().unwrap(), inputs.decoded_bytes);
+        assert!(inputs.output_offsets.windows(2).all(|w| w[1] >= w[0]));
+        assert_eq!(inputs.row_code_offsets.len(), refs.len() + 1);
+        assert_eq!(
+            *inputs.row_code_offsets.last().unwrap() as usize,
+            inputs.total_tokens
+        );
+        assert!(inputs.row_code_offsets.windows(2).all(|w| w[1] >= w[0]));
+
+        // Every FSST-12 symbol fits the narrow half, so this is 1.0 -- the property that
+        // makes the split dictionary's fallback path unreachable for this codec.
+        assert!((inputs.frac_le8 - 1.0).abs() < 1e-6, "frac_le8 {}", inputs.frac_le8);
+        assert!(inputs.dict_max_len >= 1 && inputs.dict_max_len <= 8);
+        assert!(inputs.distinct_codes > 0);
+        assert!(!inputs.all_len_1 && !inputs.all_len_2);
+
+        // Occurrence-weighted mean must sit between 1 and the max, and agree with the
+        // decoded total divided by the token count.
+        let implied = inputs.decoded_bytes as f32 / inputs.total_tokens as f32;
+        assert!(
+            (inputs.dict_mean_len - implied).abs() < 1e-3,
+            "dict_mean_len {} vs implied {implied}",
+            inputs.dict_mean_len
+        );
+
+        // Validity covers every row.
+        assert_eq!(inputs.validity.len(), refs.len().div_ceil(8));
+
+        // Dictionary buffers: padded table covers the code space with a pad, and the
+        // compact directory's logical bytes are a prefix of the padded buffer.
+        assert!(inputs.dict_padded.len() >= (1 << 12) * 16 + 16);
+        assert!(inputs.dict_bytes_with_pad.len() >= inputs.dict_bytes_logical.len() + 16);
+        assert_eq!(
+            &inputs.dict_bytes_with_pad[..inputs.dict_bytes_logical.len()],
+            &inputs.dict_bytes_logical[..]
+        );
+
+        // Accounting is the comparable-to-OnPair total, not the bare payload.
+        assert!(stored.total() > stored.packed_codes);
+        assert!(stored.row_offsets > 0 && stored.table > 0);
     }
 }
