@@ -262,6 +262,7 @@ pub fn normalize_rows(
             packed_codes,
             row_offsets: row_code_offsets.len() * size_of::<u64>(),
             table: entries * (size_of::<u64>() + size_of::<u8>()),
+            codes_btrblocks: 0,
         },
         row_code_offsets,
     })
@@ -317,17 +318,45 @@ pub fn compact_dict(
 pub struct Fsst12StoredSize {
     /// Per-row 12-bit packed code payload, summed over rows.
     pub packed_codes: usize,
-    /// Row-boundary vector, `u64` per boundary -- the analogue of OnPair's `codes_offsets`.
+    /// Row-boundary vector as STORED, i.e. BtrBlocks-compressed, which is how OnPair's
+    /// `codes_offsets` are counted in its `in_memory_bytes`. `normalize_rows` fills this with
+    /// the raw `u64` size as a placeholder that the caller MUST overwrite with the compressed
+    /// size -- charging raw offsets against OnPair's compressed ones produced ratios below 1.0
+    /// on short-row columns, which no compressor can do.
     pub row_offsets: usize,
     /// Dictionary as stored: 8 B symbol plus 1 B length per trained entry. Excludes the
     /// GPU-side padding and the widened decode table, which are load-time artifacts.
     pub table: usize,
+    /// The code stream measured the way OnPair's is: as an integer array handed to
+    /// BtrBlocks, rather than as FSST-12's own fixed-width 12-bit packing. Filled by the
+    /// caller, which owns the compressor; zero means not measured.
+    ///
+    /// Both exist because they answer different questions and the difference is large.
+    /// FSST-12's native packing is FIXED at 12 bits per code, while BtrBlocks bitpacks an
+    /// integer code array down to about log2(cardinality) bits -- so on a column with two
+    /// distinct values OnPair pays ~2 bits per code and native FSST-12 pays 12. Comparing
+    /// native FSST-12 against OnPair-inside-Vortex therefore conflates the codec with its
+    /// container. [`Fsst12StoredSize::total`] is the native measure; [`Self::total_container_matched`]
+    /// is the one that isolates the codec.
+    pub codes_btrblocks: usize,
 }
 
 impl Fsst12StoredSize {
-    /// Total stored footprint, the quantity comparable to OnPair's `in_memory_bytes`.
+    /// Native total: FSST-12 stored as its reference implementation stores it, with codes in
+    /// dense 12-bit packing. This is the honest figure to compare against published FSST
+    /// numbers, and the pessimistic one to compare against OnPair-in-Vortex.
     pub fn total(&self) -> usize {
         self.packed_codes + self.row_offsets + self.table
+    }
+
+    /// Container-matched total: the code stream measured by the same instrument as OnPair's,
+    /// so the comparison isolates the codec rather than the storage format. Falls back to the
+    /// native total when `codes_btrblocks` was not measured.
+    pub fn total_container_matched(&self) -> usize {
+        if self.codes_btrblocks == 0 {
+            return self.total();
+        }
+        self.codes_btrblocks + self.row_offsets + self.table
     }
 }
 

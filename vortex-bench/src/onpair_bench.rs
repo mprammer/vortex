@@ -168,8 +168,17 @@ pub struct CellResult {
     /// CUDA kernel-only timings for GPU OnPair decompression, if requested.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub gpu: Option<GpuCellResult>,
-    /// `sample_bytes / in_memory_bytes`.
+    /// `sample_bytes / in_memory_bytes`. For FSST-12 this is the NATIVE measure: codes in
+    /// the codec's own dense 12-bit packing.
     pub mem_ratio: f64,
+    /// FSST-12 only: the same ratio with the code stream measured by the instrument OnPair's
+    /// codes go through (BtrBlocks over a `u16` code array) instead of FSST-12's fixed 12-bit
+    /// packing. Present because native FSST-12 pays 12 bits per code regardless of
+    /// cardinality while BtrBlocks bitpacks to about log2(cardinality) -- so on low-cardinality
+    /// columns the native figure charges FSST-12 for its container, not its codec. Absent for
+    /// OnPair, where the two coincide by construction.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_ratio_container_matched: Option<f64>,
     /// `sample_bytes / on_disk_bytes`.
     pub disk_ratio: f64,
     /// Whether the decoded strings matched the input exactly.
@@ -701,6 +710,7 @@ async fn run_cell_fsst12(
     let t_all = Instant::now();
     let mut all_inputs = Vec::with_capacity(ranges.len());
     let mut stored_total = 0u64;
+    let mut stored_matched_total = 0u64;
     let mut table_bytes_total = 0u64;
     for r in ranges.iter().cloned() {
         let slice = sample.array.slice(r)?;
@@ -733,17 +743,28 @@ async fn run_cell_fsst12(
              will not silently encode them as empty strings"
         );
         let rows: Vec<&[u8]> = spans.iter().map(|&(a, b)| &flat[a..b]).collect();
-        let (inputs, stored, chunk_encode_secs) = fsst12_decode_inputs(&rows)?;
+        let (inputs, mut stored, chunk_encode_secs) = fsst12_decode_inputs(&rows)?;
         encode_secs += chunk_encode_secs;
+        // Replace the raw-u64 placeholder with the STORED (BtrBlocks-compressed) offset size,
+        // matching OnPair's measurement boundary. Without this the ratio is not comparable
+        // and, on short-row columns, not even physical.
+        stored.row_offsets =
+            fsst12_stored_offset_bytes(&inputs.row_code_offsets, &mut ctx)? as usize;
+        // Also measure the code stream through OnPair's instrument, so the cell can report a
+        // container-matched ratio alongside the native one.
+        stored.codes_btrblocks =
+            fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
         // and its footprint still counts toward the stored size below.
         if inputs.total_tokens == 0 {
             stored_total += stored.total() as u64;
+            stored_matched_total += stored.total_container_matched() as u64;
             table_bytes_total += stored.table as u64;
             continue;
         }
         stored_total += stored.total() as u64;
+        stored_matched_total += stored.total_container_matched() as u64;
         table_bytes_total += stored.table as u64;
         all_inputs.push(inputs);
     }
@@ -807,6 +828,7 @@ async fn run_cell_fsst12(
         decode_gib_s: 0.0,
         gpu,
         mem_ratio: ratio(sample.raw_bytes, stored_total),
+        mem_ratio_container_matched: Some(ratio(sample.raw_bytes, stored_matched_total)),
         disk_ratio: 0.0,
         verified,
         onpair_only: false,
@@ -1046,6 +1068,10 @@ async fn run_cell(
         },
         gpu,
         mem_ratio: ratio(sample.raw_bytes, in_memory_bytes),
+        // OnPair's codes already go through BtrBlocks, so native and container-matched are
+        // the same measurement for it; reporting a second identical number would imply a
+        // distinction that does not exist here.
+        mem_ratio_container_matched: None,
         disk_ratio: ratio(sample.raw_bytes, on_disk_bytes),
         verified,
         onpair_only,
@@ -1937,6 +1963,71 @@ struct DecodeInputs {
     frac_le8: f32,
     all_len_1: bool,
     all_len_2: bool,
+}
+
+/// Stored size of the FSST-12 code stream measured the way OnPair's is: as a `u16` integer
+/// array handed to BtrBlocks, not as FSST-12's own fixed-width 12-bit packing.
+///
+/// The two differ a lot, and not uniformly. BtrBlocks bitpacks to roughly
+/// log2(cardinality) bits, so on TPC-H `l_linestatus` (two distinct values) OnPair pays
+/// about two bits per code while native FSST-12 pays twelve; on a high-cardinality column
+/// the two converge. Reporting only the native figure would therefore charge FSST-12 for
+/// its container rather than its codec, which is a different claim from the one the paper
+/// makes.
+fn fsst12_btrblocks_code_bytes(codes: &[u16], ctx: &mut ExecutionCtx) -> Result<u64> {
+    if codes.is_empty() {
+        return Ok(0);
+    }
+    let compressor = BtrBlocksCompressor::default();
+    let prim = PrimitiveArray::from_iter(codes.iter().copied());
+    Ok(compressor.compress(&prim.into_array(), ctx)?.nbytes())
+}
+
+/// Stored size of FSST-12's per-row code-offset vector, measured the way OnPair's offsets
+/// are measured.
+///
+/// This exists because getting it wrong produced ratios below 1.0. `Fsst12StoredSize`
+/// originally charged the offsets as raw `u64`, while OnPair's `in_memory_bytes` counts
+/// offsets that BtrBlocks has already compressed -- and monotonic offsets compress hard. On
+/// ClickBench `URL` that was 98 MB of phantom sidecar (17% of the reported footprint); on
+/// `MobilePhoneModel`, 800 MB (98.6%). Same quantity, different units, so the comparison was
+/// not a comparison.
+///
+/// Uses `compress_offsets`, i.e. the identical delta-or-plain path OnPair's children take,
+/// so the two codecs' offset costs are measured by the same instrument.
+///
+/// Not cuda-gated: it is CPU compression, and keeping it reachable without a CUDA toolchain
+/// is what lets the fix be tested where it was written.
+fn fsst12_stored_offset_bytes(row_code_offsets: &[u64], ctx: &mut ExecutionCtx) -> Result<u64> {
+    if row_code_offsets.is_empty() {
+        return Ok(0);
+    }
+    let compressor = BtrBlocksCompressor::default();
+    // Measure both stored widths and keep the smaller, rather than assuming one. u32 is the
+    // realistic width when the offsets fit (the offset-cost experiment above reports
+    // `offset_raw_u32` for that reason), but it is not automatically the cheaper STORED form:
+    // the delta path bit-packs, and on real offset patterns the u64 delta can compress below
+    // the u32 one. Taking the minimum mirrors `compress_offsets`'s own keep-whichever-is-
+    // smaller rule and removes the width from the argument entirely.
+    let wide = compress_offsets(
+        &PrimitiveArray::from_iter(row_code_offsets.iter().copied()).into_array(),
+        &compressor,
+        ctx,
+    )?
+    .nbytes();
+    let max = row_code_offsets.last().copied().unwrap_or(0);
+    let best = if max <= u32::MAX as u64 {
+        let narrow = compress_offsets(
+            &PrimitiveArray::from_iter(row_code_offsets.iter().map(|&v| v as u32)).into_array(),
+            &compressor,
+            ctx,
+        )?
+        .nbytes();
+        wide.min(narrow)
+    } else {
+        wide
+    };
+    Ok(best)
 }
 
 /// Build decode inputs from a string array by compressing it with FSST-12 and normalizing
@@ -3795,6 +3886,44 @@ mod fsst12_inputs_tests {
             v.push(Vec::new()); // empty rows must not desynchronize anything
         }
         v
+    }
+
+    /// The defect that produced ratios below 1.0: raw u64 offsets. This asserts the stored
+    /// measurement is a small fraction of raw, at the row counts where it actually broke
+    /// (ClickBench MobilePhoneModel had 100M rows and 800 MB of raw offsets, 98.6% of its
+    /// reported footprint).
+    #[test]
+    fn stored_offsets_are_far_smaller_than_raw() {
+        let mut ctx = SESSION.create_execution_ctx();
+        // Monotonic offsets with a realistic irregular stride, as a real column produces.
+        let n = 2_000_000usize;
+        let mut offs = Vec::with_capacity(n + 1);
+        let mut acc = 0u64;
+        offs.push(0);
+        for i in 0..n {
+            acc += 1 + (i as u64 * 7919) % 23;
+            offs.push(acc);
+        }
+        let raw = (offs.len() * 8) as u64;
+        let stored = fsst12_stored_offset_bytes(&offs, &mut ctx).expect("compress offsets");
+
+        assert!(stored > 0, "stored size must be measured, not assumed zero");
+        // Delta-of-monotonic is highly compressible; anything near raw means the fix is not
+        // engaged and the ratio would be wrong again.
+        assert!(
+            (stored as f64) < (raw as f64) * 0.5,
+            "stored offsets {stored} should be well under half of raw {raw}"
+        );
+        assert_eq!(
+            fsst12_stored_offset_bytes(&[], &mut ctx).expect("empty"),
+            0,
+            "no rows means no offset cost"
+        );
+        eprintln!(
+            "offset accounting: raw {raw} B -> stored {stored} B ({:.1}x smaller, {:.2} B/row)",
+            raw as f64 / stored as f64,
+            stored as f64 / n as f64
+        );
     }
 
     /// The statistics this builder derives feed tab:datasets and the kernel selector, and
