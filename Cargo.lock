@@ -4119,9 +4119,7 @@ dependencies = [
 
 [[package]]
 name = "fsst-rs"
-version = "0.5.10"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3bf53d7c403a2b76873d4d66ba7d79c54bde2784cdaba6083f223d6e33270708"
+version = "0.0.0"
 dependencies = [
  "rustc-hash",
 ]
@@ -10308,6 +10306,7 @@ dependencies = [
  "bzip2",
  "clap",
  "cudarc",
+ "fsst-rs",
  "futures",
  "get_dir",
  "glob",

@@ -980,6 +980,10 @@ struct GpuOnPairChunk {
     chunk_offsets_1024: vortex::array::buffer::BufferHandle,
     output: vortex::array::buffer::BufferHandle,
     expected_bytes: Vec<u8>,
+    /// Which codec produced `codes`/`lens`/`dict_padded`: "onpair" or "fsst12".
+    codec: &'static str,
+    /// Packed size of the FSST-12 stream, zero on the OnPair path.
+    fsst12_compressed_bytes: usize,
     /// Variable-stride length-bucket dict (built only when
     /// `ONPAIR_DICT_REORDER=lenbucket`; else a 16-byte dummy).
     dict_lenbucket: vortex::array::buffer::BufferHandle,
@@ -1870,9 +1874,13 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
         .into_array()
         .execute::<VarBinViewArray>(ctx.execution_ctx())?;
     let mut expected_bytes = Vec::with_capacity(usize::try_from(decoded.nbytes()).unwrap_or(0));
+    // Row lengths are kept so an alternative codec can be trained on the same row
+    // boundaries; the decode target itself is the plain concatenation.
+    let mut row_value_lens: Vec<usize> = Vec::new();
     decoded.with_iterator(|values| {
         for value in values.flatten() {
             expected_bytes.extend_from_slice(value);
+            row_value_lens.push(value.len());
         }
     });
 
@@ -1976,13 +1984,56 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
     });
     let validity = vec![0xFFu8; op.len().div_ceil(8)];
 
+    // EXPERIMENT (2026-08-11), env-gated: replace the OnPair-derived decode inputs with
+    // FSST-12 ones. `FASTPAIR_CODEC=fsst12`.
+    //
+    // This is the whole point of the FSST-12 claim made executable: the kernels below are
+    // untouched, and only the three things they consume are re-derived from a different
+    // codec. FSST-12 has no escape (codes 0..256 are the single-byte literals), so a
+    // code's output length is a function of the code alone, which is what both the
+    // fixed-stride gather and the stored offset sidecar require.
+    //
+    // `expected_bytes` is deliberately NOT recomputed: it is the concatenation of the
+    // original row values, which is codec-independent. So the byte-exact check that
+    // follows compares the GPU's FSST-12 decode against the same reference the OnPair
+    // path is held to, and a pass means the kernel really did decode FSST-12 correctly.
+    //
+    // Expect `split8read`'s wide path to be dead here: FSST-12 symbols are at most 8
+    // bytes, so every token is served by the narrow table. Report that as a different
+    // operating point, not as the same result.
+    let mut codec_label = "onpair";
+    let mut fsst12_compressed_bytes = 0usize;
+    let (codes_u16, dict_padded, lens_table) =
+        if std::env::var("FASTPAIR_CODEC").as_deref() == Ok("fsst12") {
+            // Train on the same row values the column holds. `train` wants borrowed
+            // lines; the decode target is their in-order concatenation, which is exactly
+            // what the kernels reproduce.
+            let mut lines: Vec<&[u8]> = Vec::new();
+            let mut start = 0usize;
+            for len in &row_value_lens {
+                lines.push(&expected_bytes[start..start + *len]);
+                start += *len;
+            }
+            let built = crate::fsst12_input::build(&expected_bytes, &lines)?;
+            codec_label = "fsst12";
+            fsst12_compressed_bytes = built.compressed_bytes;
+            (built.codes, built.dict_padded, built.lens)
+        } else {
+            (codes_u16, dict_padded, lens_table)
+        };
+
     // EXPERIMENTAL, env-gated, decode-side only: relabel dict codes to study
     // cache-layout effects. A code permutation is a consistent relabeling, so
     // decoded bytes are unchanged — this does NOT touch the compressor or the
     // on-disk layout. `ONPAIR_DICT_REORDER=freq` orders entries by descending
     // in-stream frequency (hot codes first → hot dict region clusters in L1).
-    let (codes_u16, dict_padded, lens_table, dict_table) =
-        maybe_reorder_dict(codes_u16, dict_padded, lens_table, dict_table);
+    // Dict reordering permutes code labels using OnPair's own table; under FSST-12 that
+    // table does not describe this code stream, so leave the labels alone.
+    let (codes_u16, dict_padded, lens_table, dict_table) = if codec_label == "fsst12" {
+        (codes_u16, dict_padded, lens_table, dict_table)
+    } else {
+        maybe_reorder_dict(codes_u16, dict_padded, lens_table, dict_table)
+    };
 
     // EXPERIMENTAL, env-gated: dump the exact decode inputs for the standalone
     // end-to-end scan bench (e2e_scan.cu). The decode output is a plain in-order
@@ -2322,6 +2373,8 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
             .copy_to_device::<u8, _>(vec![0u8; decoded_bytes as usize + 16])?
             .await?,
         expected_bytes,
+        codec: codec_label,
+        fsst12_compressed_bytes,
         dict_lenbucket: ctx.copy_to_device::<u8, _>(dict_lenbucket_host)?.await?,
         lb_meta,
         frac_le8,
@@ -2556,6 +2609,22 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
 
 #[cfg(feature = "cuda")]
 fn inapplicable_reason(variant: KernelVariant, chunks: &[GpuOnPairChunk]) -> Option<String> {
+    // Under FSST-12 the code stream is described by the FSST-12 symbol table, not by
+    // OnPair's compact offsets table or its packed dictionary bytes. Layouts that read
+    // those buffers would decode garbage, so refuse them explicitly rather than let them
+    // fail byte-exactness and look like kernel defects.
+    if chunks.iter().any(|c| c.codec == "fsst12")
+        && matches!(
+            variant.layout,
+            KernelLayout::Ref
+                | KernelLayout::VWidth
+                | KernelLayout::VWidth4
+                | KernelLayout::LenBucket
+                | KernelLayout::PersistVDict
+        )
+    {
+        return Some("layout reads OnPair-specific dictionary buffers; codec is FSST-12".to_string());
+    }
     match variant.layout {
         KernelLayout::Ref
         | KernelLayout::Stride16

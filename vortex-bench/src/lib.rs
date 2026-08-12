@@ -41,6 +41,8 @@ pub mod datasets;
 pub mod display;
 pub mod downloadable_dataset;
 pub mod fineweb;
+/// FSST-12 decode inputs in the FastPair kernels' ABI (experiment, 2026-08-11).
+pub mod fsst12_input;
 pub mod measurements;
 pub mod memory;
 pub mod onpair_bench;

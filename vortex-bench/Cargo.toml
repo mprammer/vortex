@@ -17,6 +17,7 @@ version = { workspace = true }
 workspace = true
 
 [dependencies]
+fsst-rs = { workspace = true }
 vortex = { workspace = true, features = [
     "object_store",
     "files",

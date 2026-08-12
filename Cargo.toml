@@ -154,7 +154,12 @@ enum-iterator = "2.0.0"
 env_logger = "0.11"
 fastlanes = "0.5"
 flatbuffers = "25.2.10"
-fsst-rs = "0.5.5"
+# EXPERIMENT (2026-08-11): pinned to the local mp/fsst12 branch, which adds the
+# 12-bit-code FSST variant (spiraldb/fsst PR #216). FSST-12 reserves codes 0..256 for
+# the single-byte literals, so it needs no escape, which is what lets the FastPair
+# kernels decode it after a load-time repack. Revert to the crates.io version once the
+# PR lands and a release carries fsst12.
+fsst-rs = { path = "/Users/martin/repos/fsst" }
 futures = { version = "0.3.31", default-features = false }
 fuzzy-matcher = "0.3"
 get_dir = "0.5.0"
