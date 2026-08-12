@@ -254,6 +254,7 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
             "--bits", bits,
             "--chunk-bytes", chunk_bytes,
             "--threshold", thresholds,
+            "--codec", args.codec,
             "--sample-bytes", str(args.sample_bytes),
             "--file-target-bytes", str(int(args.file_target_mb * MB)),
             "--out-dir", str(OUT_ROOT),
@@ -425,6 +426,9 @@ def main() -> int:
                    help="copy GPU output back and compare every applicable kernel against CPU bytes")
     p.add_argument("--jobs", type=int, default=0,
                    help="columns to run concurrently (default: all available CPU cores)")
+    p.add_argument("--codec", choices=["onpair", "fsst12"], default="onpair",
+                   help="stored codec; fsst12 ignores --bits/--threshold (one configuration) "
+                        "and is GPU-only")
     p.add_argument("--dev", action="store_true", help="dev build instead of release")
     p.add_argument("--datasets", type=lambda s: {x.strip() for x in s.split(",")},
                    default=None,

@@ -693,7 +693,13 @@ async fn run_cell_fsst12(
     std::fs::create_dir_all(&out_dir)?;
 
     let ranges = chunk_ranges(sample.rows, sample.raw_bytes, chunk_bytes);
-    let t0 = Instant::now();
+    // Two timers, because OnPair's `encode_ms` stops after stored encoding. Timing our whole
+    // input-preparation pipeline against that would make FSST-12 look arbitrarily slower at
+    // a phase OnPair does not include. `encode_secs` covers train + compress only; the
+    // normalization, statistics and expected-output copy are load-time preparation and are
+    // reported separately in the run log rather than folded into a comparable field.
+    let mut encode_secs = 0.0f64;
+    let t_all = Instant::now();
     let mut all_inputs = Vec::with_capacity(ranges.len());
     let mut stored_total = 0u64;
     let mut table_bytes_total = 0u64;
@@ -705,22 +711,50 @@ async fn run_cell_fsst12(
         // them as slices, and the borrow has to outlive both.
         let mut flat: Vec<u8> = Vec::new();
         let mut spans: Vec<(usize, usize)> = Vec::new();
+        // Nulls are REJECTED rather than coerced. Mapping null to an empty string would be
+        // invisible to byte-only validation (both decode to zero bytes) while changing what
+        // the column is, and FSST-12 carries no validity of its own here. The evaluated
+        // corpora are non-null; a nullable column must be handled explicitly, not silently.
+        let mut saw_null = false;
         decoded.with_iterator(|values| {
             for value in values {
-                let v = value.unwrap_or(&[]);
-                let start = flat.len();
-                flat.extend_from_slice(v);
-                spans.push((start, flat.len()));
+                match value {
+                    Some(v) => {
+                        let start = flat.len();
+                        flat.extend_from_slice(v);
+                        spans.push((start, flat.len()));
+                    }
+                    None => saw_null = true,
+                }
             }
         });
+        anyhow::ensure!(
+            !saw_null,
+            "column {column} contains nulls; the FSST-12 path does not carry validity and \
+             will not silently encode them as empty strings"
+        );
         let rows: Vec<&[u8]> = spans.iter().map(|&(a, b)| &flat[a..b]).collect();
-        let (inputs, stored) = fsst12_decode_inputs(&rows)?;
+        let (inputs, stored, chunk_encode_secs) = fsst12_decode_inputs(&rows)?;
+        encode_secs += chunk_encode_secs;
+        // An all-empty chunk yields no codes, and the optimized kernels would compute a
+        // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
+        // and its footprint still counts toward the stored size below.
+        if inputs.total_tokens == 0 {
+            stored_total += stored.total() as u64;
+            table_bytes_total += stored.table as u64;
+            continue;
+        }
         stored_total += stored.total() as u64;
         table_bytes_total += stored.table as u64;
         all_inputs.push(inputs);
     }
-    let encode_secs = t0.elapsed().as_secs_f64();
+    let prepare_secs = t_all.elapsed().as_secs_f64();
     let n_chunks = all_inputs.len();
+    eprintln!(
+        "fsst12 {dataset_id}/{column}: encode {:.3}s, total input preparation {:.3}s over \
+         {n_chunks} chunk(s)",
+        encode_secs, prepare_secs
+    );
 
     let gpu = match gpu_config {
         Some(config) => Some(run_gpu_kernel_bench(DecodeSource::Prebuilt(all_inputs), config).await?),
@@ -728,9 +762,21 @@ async fn run_cell_fsst12(
             anyhow::bail!("FSST-12 cells are GPU-only; pass --gpu-decode")
         }
     };
-    // The GPU path validates byte-exactness against `expected_bytes`; there is no separate
-    // file round-trip to verify, so that validation IS this cell's correctness result.
-    let verified = gpu.as_ref().map(|g| g.validated).unwrap_or(false);
+    // The GPU byte-exactness check IS this cell's correctness result: FSST-12 is not a
+    // Vortex encoding, so there is no file round-trip to verify separately.
+    //
+    // Read `verified` (every applicable kernel matched the reference), NOT `validated`
+    // (validation was merely requested). Reading the latter would report verified = true on
+    // a kernel mismatch, which is the one failure mode that must never be silent.
+    let verified = gpu
+        .as_ref()
+        .and_then(|g| g.verified)
+        .unwrap_or(false);
+    anyhow::ensure!(
+        verified,
+        "FSST-12 cell {dataset_id}/{column} failed GPU byte-exactness validation; refusing to \
+         emit a result. Run with --gpu-validate and investigate before trusting any rate."
+    );
 
     let gib = sample.raw_bytes as f64 / GIB;
     let result = CellResult {
@@ -1007,7 +1053,7 @@ async fn run_cell(
 }
 
 #[cfg(not(feature = "cuda"))]
-pub enum DecodeSource<'a> {
+enum DecodeSource<'a> {
     OnPair(&'a [OnPairArray]),
 }
 
@@ -1516,7 +1562,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
 /// Where a cell's decode inputs come from. The kernels are codec-agnostic, so this is the
 /// only place the codec is named on the GPU path.
 #[cfg(feature = "cuda")]
-pub enum DecodeSource<'a> {
+enum DecodeSource<'a> {
     OnPair(&'a [OnPairArray]),
     /// Pre-built inputs, one per chunk, already normalized to the decode ABI.
     Prebuilt(Vec<DecodeInputs>),
@@ -1543,6 +1589,14 @@ async fn run_gpu_kernel_bench(
             .with_context(|| format!("ONPAIR_DUMP_BATCH: truncate {p} failed"))?;
     }
     let mut chunks = Vec::new();
+    // The nvCOMP baselines re-compress the column's RAW bytes, so they are a function of the
+    // column alone and not of our stored codec. They are therefore measured only on the
+    // OnPair source: running them again under FSST-12 would emit the same numbers a second
+    // time and invite double-counting when a figure pools cells by column.
+    let nvcomp_source: Option<&[OnPairArray]> = match &source {
+        DecodeSource::OnPair(onpairs) => Some(onpairs),
+        DecodeSource::Prebuilt(_) => None,
+    };
     match source {
         DecodeSource::OnPair(onpairs) => {
             chunks.reserve(onpairs.len());
@@ -1588,6 +1642,14 @@ async fn run_gpu_kernel_bench(
     // over chunks. `BufferHandle::len()` already returns BYTES (codes is u16, so
     // its len() is the byte size, not the element count). Padded/s8 dicts are GPU
     // staging artifacts, not part of the stored/transferred compressed column.
+    //
+    // CODEC ASYMMETRY, deliberate and not interchangeable with the cell's `mem_ratio`:
+    // OnPair stores its codes as u16, so this equals the stored payload. FSST-12 stores
+    // them densely at 12 bits and is WIDENED to u16 at load, so for FSST-12 this is the
+    // staged host-to-device payload and overstates the stored column by ~33%. The stored
+    // figure is the cell's `mem_ratio`, computed from Fsst12StoredSize. Use `mem_ratio`
+    // for compression claims and this only for H2D/whole-decompress modelling; a figure
+    // that mixes them across codecs is comparing different quantities.
     let compressed_bytes: u64 = chunks
         .iter()
         .map(|c| (c.codes.len() + c.dict_bytes.len() + c.lens.len()) as u64)
@@ -1673,9 +1735,10 @@ async fn run_gpu_kernel_bench(
         0.0
     };
     let whole_decompress_gib_s = gib_s(decoded_bytes, h2d_ms + auto.decode_ms);
-    let (nvcomp_zstd_hw, nvcomp_zstd) = if fast {
+    let (nvcomp_zstd_hw, nvcomp_zstd) = if fast || nvcomp_source.is_none() {
         (None, Vec::new())
     } else {
+        let onpairs = nvcomp_source.expect("checked above");
         let hw = run_nvcomp_zstd_bench(
             onpairs,
             iterations,
@@ -1876,13 +1939,19 @@ struct DecodeInputs {
 /// offsets and the row-decode paths read them, so a whole-buffer FSST-12 would be
 /// comparable on rate but not on layout. The cost is ~0.25 B/row measured.
 #[allow(dead_code)]
-fn fsst12_decode_inputs(rows: &[&[u8]]) -> Result<(DecodeInputs, crate::fsst12_abi::Fsst12StoredSize)> {
+fn fsst12_decode_inputs(
+    rows: &[&[u8]],
+) -> Result<(DecodeInputs, crate::fsst12_abi::Fsst12StoredSize, f64)> {
     use crate::fsst12_abi::{compact_dict, normalize_rows, DICT_STRIDE};
     use fsst12::fsst12::Compressor12;
 
+    // Timed boundary: train + compress, which is what OnPair's encode_ms covers. Everything
+    // after this point is load-time preparation of the decode ABI.
+    let t_encode = Instant::now();
     let compressor = Compressor12::train(rows);
     let normalized = normalize_rows(&compressor, rows)
         .map_err(|e| anyhow::anyhow!("FSST-12 normalize failed: {e}"))?;
+    let encode_secs = t_encode.elapsed().as_secs_f64();
     let (dict_table, dict_bytes_with_pad, dict_logical_len) =
         compact_dict(compressor.symbol_table(), compressor.symbol_lengths())
             .map_err(|e| anyhow::anyhow!("FSST-12 compact dict failed: {e}"))?;
@@ -1980,6 +2049,7 @@ fn fsst12_decode_inputs(rows: &[&[u8]]) -> Result<(DecodeInputs, crate::fsst12_a
             all_len_2,
         },
         normalized.stored,
+        encode_secs,
     ))
 }
 
@@ -2088,6 +2158,18 @@ async fn onpair_decode_inputs(
             .map(|&c| lens_table[c as usize] as u64)
             .sum::<u64>() as f32
             / codes_u16.len() as f32
+    };
+    // Token-weighted fraction of tokens with length <= 8 (drives split8read
+    // auto-selection). One pass over the codes; cheap relative to decode. Same
+    // (emitted-token) population as dict_mean_len above.
+    let frac_le8 = if codes_u16.is_empty() {
+        0.0
+    } else {
+        let le8 = codes_u16
+            .iter()
+            .filter(|&&c| lens_table[c as usize] <= 8)
+            .count();
+        le8 as f32 / codes_u16.len() as f32
     };
     let all_len_1 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 1);
     let all_len_2 = !lens_table.is_empty() && lens_table.iter().all(|&l| l == 2);
@@ -2349,17 +2431,9 @@ async fn stage_gpu_chunk(
         }
     };
 
-    // Token-weighted fraction of tokens with length <= 8 (drives split8read
-    // auto-selection). One pass over the codes; cheap relative to decode.
-    let frac_le8 = if codes_u16.is_empty() {
-        0.0
-    } else {
-        let le8 = codes_u16
-            .iter()
-            .filter(|&&c| lens_table[c as usize] <= 8)
-            .count();
-        le8 as f32 / codes_u16.len() as f32
-    };
+    // frac_le8 (token-weighted fraction of tokens <= 8 B, which drives split8read
+    // auto-selection) now arrives on DecodeInputs: it is a property of the code stream, so
+    // each codec computes it once over its own stream rather than the tail recomputing it.
 
     // Token-weighted length histogram (env `ONPAIR_LEN_HIST`) — informs whether
     // a different split-read point (4/8/12) than split8read's 8 B has headroom.
@@ -3712,7 +3786,8 @@ mod fsst12_inputs_tests {
     fn derived_statistics_are_self_consistent() {
         let owned = rows();
         let refs: Vec<&[u8]> = owned.iter().map(|r| r.as_slice()).collect();
-        let (inputs, stored) = fsst12_decode_inputs(&refs).expect("build inputs");
+        let (inputs, stored, encode_secs) = fsst12_decode_inputs(&refs).expect("build inputs");
+        assert!(encode_secs >= 0.0, "encode timing is reported");
 
         let raw: usize = owned.iter().map(|r| r.len()).sum();
         assert_eq!(inputs.decoded_bytes as usize, raw, "decoded_bytes");
