@@ -8,9 +8,10 @@ fifth has its own launch contract and is not registered.
 |---|---|---|
 | `onpair_shmem_4tpt_split8read_ldcs` | Does the `__ldcs` streaming hint on the read-once codes stream still have headroom once `split8read` has already halved the hot dict footprint? The existing `onpair_shmem_4tpt_ldcs` applies the hint to the stride-16 base, where it is worth ~1% in geomean over 167 committed cells and −5.6% on the L40S. | promote if it wins, else delete |
 | `onpair_shmem_4tpt_split8read_hilo` | Does a disjoint stride-8 `dict_hi` (64 KB read working set vs 96 KB) beat the shipped kernel's duplicated low half? | promote if it wins, else delete |
-| `onpair_shmem_4tpt_split8read_bounds` | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once the drain-bounds question is settled either way |
-| `onpair_shmem_4tpt_split8read_bounds_faultinj` | Control. Identical but claims one byte more than it writes, so it MUST trap. | delete with the above |
-| `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **Registered 2026-08-11; never compiled, never run.** | warp-wide look-back done; promote after a byte-exact differential test, else delete kernel, layout arm, registry entry and the four `fused_*` scratch fields |
+| `onpair_shmem_4tpt_split8read_stcsedge` | Does an evict-first policy on the head and tail drain stores, which the shipped kernel writes under the default policy, buy anything? ~4% of output bytes, but they land in L1 as lines nothing re-reads. | promote if it wins, else delete |
+| `onpair_shmem_4tpt_split8read_bounds` (DEREGISTERED) | Does any drain store leave the region the host allotted, `[chunk_offsets[c], chunk_offsets[c+1])`? Tests the 2026-08-05 overrun claim. | delete once the drain-bounds question is settled either way |
+| `onpair_shmem_4tpt_split8read_bounds_faultinj` (DEREGISTERED) | Control. Identical but claims one byte more than it writes, so it MUST trap. | delete with the above |
+| `onpair_shmem_4tpt_split8read_lookback` | "Bucket chain": can a batch's output position be produced DURING decode by decoupled look-back, instead of read from the sidecar or regenerated in a separate pass? This is the third option on the cursor decision and the one that threatens the paper's stored-vs-regenerated finding. **Registered at four widths (16/4/2/1 warps); compiles and passes byte-exact smoke.** | warp-wide look-back done; promote after a byte-exact differential test, else delete kernel, layout arm, registry entry and the four `fused_*` scratch fields |
 
 ## Why the bounds probe checks what it checks
 
@@ -174,14 +175,17 @@ production implementation would not pay, so a **loss does not settle the questio
   narrow widths are not independently tuned: **this sweep is an end-to-end geometry
   comparison, not an isolated measurement of the block-wide stall.** Stated in the kernel
   header too.
-- **Experimental eligibility.** `_lookback`, `_stcsedge` and `_hilo` can no longer become
-  `best_kernel` unless byte-exactness was actually checked, regardless of whether
-  validation was requested for the run.
+- **Experimental eligibility.** `_lookback`, `_stcsedge`, `_hilo`, and the experimental
+  `_split8read_ldcs` variant can no longer become `best_kernel` unless byte-exactness was
+  actually checked, regardless of whether validation was requested for the run.
 - **Result identity.** Several geometries share one PTX symbol, so `kernel` is a reporting
   label; the function actually loaded is carried alongside as `kernel_symbol`.
 - **End-to-end rate.** A failed host-to-device measurement no longer becomes zero transfer
-  time and a flattering composite; the composite is NaN instead.
-- **Ticket ring.** One canonical size with a power-of-two static assertion in the kernel.
+  time and a flattering composite; both H2D and whole-decompress rates are unavailable
+  instead.
+- **Ticket ring.** The kernel asserts its own value is a power of two. The Rust and CUDA
+  constants remain two independent declarations with NO cross-language check; they agree
+  at 16,384 today and must be changed together.
 
 ### Item 1 of the plan was replaced, deliberately
 

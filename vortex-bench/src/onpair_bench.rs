@@ -213,12 +213,14 @@ pub struct GpuCellResult {
     /// host->device to decode (codes + packed dict + lens, summed over chunks).
     pub compressed_bytes: u64,
     /// Measured device host->device copy bandwidth (GiB/s, pageable host memory).
-    pub h2d_gib_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub h2d_gib_s: Option<f64>,
     /// End-to-end output rate of the auto kernel including the H2D copy of the
     /// compressed payload: `decoded_bytes / (compressed_bytes/h2d + auto_decode)`.
     /// Compare to `h2d_gib_s` (the raw-transfer output rate): when this is higher,
     /// GPU decompress delivers output faster than transferring the raw bytes.
-    pub whole_decompress_gib_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_decompress_gib_s: Option<f64>,
     /// Fastest measured kernel among all applicable variants.
     pub best_kernel: String,
     /// Auto-selected kernel average time across all chunks.
@@ -793,7 +795,7 @@ async fn run_cell(
             )
             .with_context(|| format!("ONPAIR_OFFSET_COST: write {oc_path} failed"))?;
         }
-        w.flush().ok();
+        w.flush().with_context(|| format!("ONPAIR_OFFSET_COST: flush {oc_path} failed"))?;
     }
 
     // 2. Group consecutive chunks into ~file_target_bytes files, written so the
@@ -1086,8 +1088,6 @@ const ONPAIR_CLUSTER_N: u32 = 8;
 /// packs its low 30 bits into each descriptor flag so stale descriptors from a
 /// previous launch read as unpublished. Dispatch rejects epochs at the much smaller
 /// ticket-ring limit, so a launched epoch can never wrap either resource.
-#[cfg(feature = "cuda")]
-static FUSED_EPOCH: AtomicU32 = AtomicU32::new(0);
 
 /// Ticket-ring depth; must equal LB_TICKET_SLOTS in the kernel. One slot per launch,
 /// never reused, zeroed once at allocation — so no launch resets anything.
@@ -1630,7 +1630,19 @@ async fn run_gpu_kernel_bench(
         .iter()
         .map(|c| (c.codes.len() + c.dict_bytes.len() + c.lens.len()) as u64)
         .sum();
-    let h2d_gib_s = measure_h2d_gib_s(&mut setup_ctx).await.unwrap_or(0.0);
+    let h2d_gib_s = match measure_h2d_gib_s(&mut setup_ctx).await {
+        Ok(rate) if rate > 0.0 => Some(rate),
+        Ok(_) => {
+            eprintln!(
+                "H2D bandwidth measurement returned a non-positive rate; metrics unavailable"
+            );
+            None
+        }
+        Err(error) => {
+            eprintln!("H2D bandwidth measurement failed; metrics unavailable: {error:#}");
+            None
+        }
+    };
 
     let mut kernels = Vec::with_capacity(GPU_KERNELS.len());
 
@@ -1715,18 +1727,10 @@ async fn run_gpu_kernel_bench(
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.
-    // A failed H2D measurement leaves h2d_gib_s at zero. Treating that as zero transfer
-    // TIME would overstate the composite, so mark the end-to-end rate unavailable rather
-    // than quietly flattering it.
-    let h2d_ms = if h2d_gib_s > 0.0 {
-        Some((compressed_bytes as f64 / GIB) / h2d_gib_s * 1_000.0)
-    } else {
-        None
-    };
-    let whole_decompress_gib_s = match h2d_ms {
-        Some(ms) => gib_s(decoded_bytes, ms + auto.decode_ms),
-        None => f64::NAN,
-    };
+    // A failed H2D measurement makes both transfer and end-to-end rates unavailable;
+    // treating it as zero transfer time would quietly overstate the composite.
+    let h2d_ms = h2d_gib_s.map(|rate| (compressed_bytes as f64 / GIB) / rate * 1_000.0);
+    let whole_decompress_gib_s = h2d_ms.map(|ms| gib_s(decoded_bytes, ms + auto.decode_ms));
     let (nvcomp_zstd_hw, nvcomp_zstd) = if fast {
         (None, Vec::new())
     } else {
@@ -2639,7 +2643,10 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
 /// but must never be selected as `best_kernel` unless byte-exactness was actually checked.
 #[cfg(feature = "cuda")]
 fn is_experimental_kernel(name: &str) -> bool {
-    name.contains("_lookback") || name.contains("_stcsedge") || name.contains("_hilo")
+    name.contains("_lookback")
+        || name.contains("_stcsedge")
+        || name.contains("_hilo")
+        || name.contains("_split8read_ldcs")
 }
 
 #[cfg(feature = "cuda")]

@@ -103,8 +103,9 @@
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
 // Ticket ring depth. Power of two; one slot per launch, never reused. MUST equal
-// FUSED_TICKET_SLOTS in vortex-bench/src/onpair_bench.rs; the host asserts agreement at
-// startup because a silent mismatch would alias live slots.
+// FUSED_TICKET_SLOTS in vortex-bench/src/onpair_bench.rs. That coupling is MANUAL: the
+// two constants are declared independently in different languages and nothing checks
+// their agreement, so a silent mismatch would alias live slots. Change both together.
 #define LB_TICKET_SLOTS 16384u
 static_assert((LB_TICKET_SLOTS & (LB_TICKET_SLOTS - 1u)) == 0u,
               "ticket ring must be a power of two: the kernel indexes it with a mask");
