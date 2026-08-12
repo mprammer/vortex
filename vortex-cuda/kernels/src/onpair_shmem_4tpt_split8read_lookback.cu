@@ -49,7 +49,12 @@
 //
 // LAUNCH CONTRACT — the caller MUST honour all of it; the kernel cannot check it:
 //   - 1-D block, threads a multiple of 32, 32..512 (the warp mask, the `warps`
-//     computation and the fixed 16-warp shared arrays all assume this).
+//     computation and the per-warp totals array assume this).
+//   - dynamic shared memory of exactly `warps * WARP_BUF_BYTES` bytes.
+//   - NOTE for the width sweep: __launch_bounds__(512, 2) is compile-time and therefore
+//     identical at every width. Register allocation is tuned for 512 threads, so narrow
+//     widths are not independently tuned. The sweep is an end-to-end geometry
+//     comparison, NOT an isolated measurement of the block-wide stall.
 //   - part_agg, part_inc and part_flag each hold at least gridDim.x entries. They
 //     are indexed by the DYNAMIC block id, which ranges over gridDim.x, NOT by a
 //     chunk count. A short buffer corrupts memory.
@@ -97,8 +102,12 @@
 #define LB_X 0u  // nothing published yet (or stale epoch)
 #define LB_A 1u  // aggregate available: this block's own total, prefix unknown
 #define LB_P 2u  // inclusive prefix available: everything up to and including it
-// Ticket ring depth. Power of two; one slot per launch, never reused.
+// Ticket ring depth. Power of two; one slot per launch, never reused. MUST equal
+// FUSED_TICKET_SLOTS in vortex-bench/src/onpair_bench.rs; the host asserts agreement at
+// startup because a silent mismatch would alias live slots.
 #define LB_TICKET_SLOTS 16384u
+static_assert((LB_TICKET_SLOTS & (LB_TICKET_SLOTS - 1u)) == 0u,
+              "ticket ring must be a power of two: the kernel indexes it with a mask");
 #define LB_EPOCH_MASK 0x3fffffffu
 #define LB_TAG(epoch, st) ((((epoch) & LB_EPOCH_MASK) << 2) | (st))
 #define LB_EPOCH_OF(w) ((w) >> 2)
@@ -145,6 +154,8 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
 
     // ---- 1. claim a dynamic block id -------------------------------------------
     __shared__ uint32_t s_blk;
+    // Bounded by the launch contract: warps <= WARPS_PER_BLOCK_MAX. Small and fixed, so
+    // it does not distort the width sweep the way the staging buffer did.
     __shared__ uint64_t s_warp_tot[WARPS_PER_BLOCK_MAX];
     __shared__ uint64_t s_block_excl;
     if (threadIdx.x == 0) {
@@ -287,7 +298,11 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void onpair_shmem_4tpt_split8read_loo
     }
 
     // ---- 6. from here identical to the shipped kernel ---------------------------
-    __shared__ __align__(16) uint8_t s_buf_all[WARPS_PER_BLOCK_MAX * WARP_BUF_BYTES];
+    // Dynamic, so a narrow block reserves only what it uses. With a fixed
+    // WARPS_PER_BLOCK_MAX array every width reserved ~33 KiB and the width sweep moved
+    // occupancy for reasons unrelated to the stall it is supposed to measure. The host
+    // passes warps * WARP_BUF_BYTES.
+    extern __shared__ __align__(16) uint8_t s_buf_all[];
     uint8_t *s_buf_base = &s_buf_all[warp_id * WARP_BUF_BYTES];
     const uint32_t head_pre = (16u - (uint32_t)(out_start & 15u)) & 15u;
     uint8_t *s_buf = s_buf_base + ((16u - head_pre) & 15u);

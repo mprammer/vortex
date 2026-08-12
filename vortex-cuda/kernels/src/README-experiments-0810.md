@@ -158,3 +158,41 @@ right.
 Outstanding, deliberately: the look-back waits for all 32 descriptors in a window
 before consuming an already-visible closest prefix. That is head-of-line latency a
 production implementation would not pay, so a **loss does not settle the question**.
+
+
+---
+
+## Round-three fixes (2026-08-11), after `gauntlet --depth max` returned reject
+
+- **Epoch scope.** The launch epoch was process-global while ticket and descriptor arrays
+  are owned per chunk, so a multi-cell sweep exhausted the 16,384-slot ring for reasons
+  unrelated to any one chunk. The counter now lives on the chunk that owns the scratch.
+- **Width sweep.** The staging buffer was a fixed 16-warp array, so a one-warp block
+  reserved about 33 KiB it never touched and occupancy moved for reasons unrelated to the
+  stall being measured. It is now dynamic shared memory sized to the actual width.
+  `__launch_bounds__(512, 2)` is still compile-time and identical at every width, so
+  narrow widths are not independently tuned: **this sweep is an end-to-end geometry
+  comparison, not an isolated measurement of the block-wide stall.** Stated in the kernel
+  header too.
+- **Experimental eligibility.** `_lookback`, `_stcsedge` and `_hilo` can no longer become
+  `best_kernel` unless byte-exactness was actually checked, regardless of whether
+  validation was requested for the run.
+- **Result identity.** Several geometries share one PTX symbol, so `kernel` is a reporting
+  label; the function actually loaded is carried alongside as `kernel_symbol`.
+- **End-to-end rate.** A failed host-to-device measurement no longer becomes zero transfer
+  time and a flattering composite; the composite is NaN instead.
+- **Ticket ring.** One canonical size with a power-of-two static assertion in the kernel.
+
+### Item 1 of the plan was replaced, deliberately
+
+The plan said to emit at a fixed scratch offset and repair alignment at drain. That is not
+implementable: the scratch base is shifted by the output base's alignment precisely so both
+the shared read and the global store in the drain body can be 16 bytes wide, and an
+unaligned `uint4` shared load is undefined rather than merely slow. The block-width sweep
+quantifies the stall instead of removing it. This is a changed contract, recorded here
+rather than left implicit.
+
+### Still outstanding
+
+No CUDA differential test exists. Byte-exactness against the CPU reference under
+`--gpu-validate` is the only executable check, and it runs only on a GPU box.

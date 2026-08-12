@@ -308,8 +308,14 @@ pub struct GpuVortexDecodeResult {
 /// One CUDA kernel timing result.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct GpuKernelResult {
-    /// CUDA function name.
+    /// Reporting label for this variant. Usually the CUDA function name, but several
+    /// launch geometries may share one PTX symbol, in which case this distinguishes them
+    /// and `kernel_symbol` carries the function actually loaded.
     pub kernel: String,
+    /// CUDA function loaded for this row. Equal to `kernel` unless geometries share a
+    /// symbol.
+    #[serde(default)]
+    pub kernel_symbol: String,
     /// Min full-pass time over the timed iterations, in ms (derived from
     /// `decode_ns_iters`; the convenience scalar used for best-kernel selection).
     pub decode_ms: f64,
@@ -958,6 +964,10 @@ struct GpuOnPairChunk {
     fused_part_flag: vortex::array::buffer::BufferHandle,
     /// Grid width the descriptor arrays were sized for.
     fused_capacity: usize,
+    /// Launch epoch for THIS chunk's scratch. Per chunk, not process-global: the ticket
+    /// ring and descriptors are owned per chunk, so a global counter made a multi-cell
+    /// sweep exhaust the ring for reasons unrelated to this chunk's own launches.
+    fused_epoch: AtomicU32,
     /// E-B high table. Authoritative layout: `dict_s8` holds an entry's logical
     /// bytes 0..8 and `dict_hi` holds its logical bytes 8..16, both at stride 8 and
     /// both zero-padded past the entry's true length. Together they carry the same
@@ -1083,6 +1093,11 @@ static FUSED_EPOCH: AtomicU32 = AtomicU32::new(0);
 /// never reused, zeroed once at allocation — so no launch resets anything.
 #[cfg(feature = "cuda")]
 const FUSED_TICKET_SLOTS: usize = 16384;
+
+/// Per-warp staging bytes; must equal WARP_BUF_BYTES in the look-back kernel, which now
+/// takes its staging buffer as dynamic shared memory.
+#[cfg(feature = "cuda")]
+const ONPAIR_WARP_BUF_BYTES: u32 = 2080;
 
 /// Dynamic-shared cap for `ClusterDsmem` (Blackwell allows ~227 KB/block; stay
 /// under it with margin). A cluster slice + warp staging above this is rejected.
@@ -1635,6 +1650,7 @@ async fn run_gpu_kernel_bench(
         if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
             kernels.push(GpuKernelResult {
                 kernel: variant.report_name().to_string(),
+                kernel_symbol: variant.name.to_string(),
                 decode_ms: 0.0,
                 decode_gib_s: 0.0,
                 decode_ns_iters: Vec::new(),
@@ -1659,6 +1675,7 @@ async fn run_gpu_kernel_bench(
         let verified = config.validate.then_some(validation_error.is_none());
         kernels.push(GpuKernelResult {
             kernel: variant.report_name().to_string(),
+            kernel_symbol: variant.name.to_string(),
             decode_ms,
             decode_gib_s: gib_s(decoded_bytes, decode_ms),
             decode_ns_iters,
@@ -1683,6 +1700,10 @@ async fn run_gpu_kernel_bench(
         .filter(|r| {
             r.applicable
                 && !r.kernel.contains("ablate")
+                // Experimental variants must be byte-exact to influence any summary,
+                // regardless of whether validation was requested globally. Without this
+                // an unvalidated run could crown a kernel nothing has ever checked.
+                && (!is_experimental_kernel(&r.kernel) || r.verified == Some(true))
                 // E-A probes carry hot-path bounds guards; their rate is not a
                 // decode measurement, and the fault-injection control is expected
                 // to trap. Never let either become `best`.
@@ -1694,12 +1715,18 @@ async fn run_gpu_kernel_bench(
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.
+    // A failed H2D measurement leaves h2d_gib_s at zero. Treating that as zero transfer
+    // TIME would overstate the composite, so mark the end-to-end rate unavailable rather
+    // than quietly flattering it.
     let h2d_ms = if h2d_gib_s > 0.0 {
-        (compressed_bytes as f64 / GIB) / h2d_gib_s * 1_000.0
+        Some((compressed_bytes as f64 / GIB) / h2d_gib_s * 1_000.0)
     } else {
-        0.0
+        None
     };
-    let whole_decompress_gib_s = gib_s(decoded_bytes, h2d_ms + auto.decode_ms);
+    let whole_decompress_gib_s = match h2d_ms {
+        Some(ms) => gib_s(decoded_bytes, ms + auto.decode_ms),
+        None => f64::NAN,
+    };
     let (nvcomp_zstd_hw, nvcomp_zstd) = if fast {
         (None, Vec::new())
     } else {
@@ -2355,6 +2382,7 @@ async fn stage_gpu_chunk(op: &OnPairArray, ctx: &mut CudaExecutionCtx) -> Result
         fused_part_inc: ctx.copy_to_device::<u64, _>(vec![0u64; fused_cap])?.await?,
         fused_part_flag: ctx.copy_to_device::<u32, _>(vec![0u32; fused_cap])?.await?,
         fused_capacity: fused_cap,
+        fused_epoch: AtomicU32::new(0),
         dict_s4: ctx.copy_to_device::<u8, _>(dict_s4)?.await?,
         dict_const1: ctx.copy_to_device::<u8, _>(dict_const1)?.await?,
         dict_const2: ctx.copy_to_device::<u8, _>(dict_const2)?.await?,
@@ -2605,6 +2633,13 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
     }
     debug_assert_eq!(acc, expected_total);
     offsets
+}
+
+/// Kernels that exist to answer a question, not to ship. They may appear as timing rows
+/// but must never be selected as `best_kernel` unless byte-exactness was actually checked.
+#[cfg(feature = "cuda")]
+fn is_experimental_kernel(name: &str) -> bool {
+    name.contains("_lookback") || name.contains("_stcsedge") || name.contains("_hilo")
 }
 
 #[cfg(feature = "cuda")]
@@ -3150,7 +3185,10 @@ fn launch_variant(
             if chunk.total_tokens == 0 {
                 return Ok(());  // empty chunk: a zero-width grid is not a launch
             }
-            let cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
+            let mut cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
+            // Reserve only this width's staging, so a narrow block does not pay a
+            // 16-warp footprint it never touches. Must match WARP_BUF_BYTES in the .cu.
+            cfg.shared_mem_bytes = variant.block_warps * ONPAIR_WARP_BUF_BYTES;
             let blocks = cfg.grid_dim.0 as usize;
             if blocks > chunk.fused_capacity {
                 anyhow::bail!(
@@ -3172,7 +3210,7 @@ fn launch_variant(
             // Allocate only epochs that have a fresh ticket slot. A failed update
             // leaves the counter pinned at the last usable epoch, so repeated rejected
             // launches cannot wrap the AtomicU32 and eventually reuse old state.
-            let epoch = match FUSED_EPOCH.fetch_update(
+            let epoch = match chunk.fused_epoch.fetch_update(
                 Ordering::Relaxed,
                 Ordering::Relaxed,
                 |previous| {
