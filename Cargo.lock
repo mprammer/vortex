@@ -4120,6 +4120,7 @@ dependencies = [
 [[package]]
 name = "fsst-rs"
 version = "0.0.0"
+source = "git+https://github.com/spiraldb/fsst?rev=17bfe8089b168631e70f35201e54d34d1b67cf48#17bfe8089b168631e70f35201e54d34d1b67cf48"
 dependencies = [
  "rustc-hash",
 ]
