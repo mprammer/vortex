@@ -41,6 +41,7 @@ pub mod datasets;
 pub mod display;
 pub mod downloadable_dataset;
 pub mod fineweb;
+pub mod fsst12_abi;
 pub mod measurements;
 pub mod memory;
 pub mod onpair_bench;

@@ -4119,6 +4119,13 @@ dependencies = [
 
 [[package]]
 name = "fsst-rs"
+version = "0.0.0"
+dependencies = [
+ "rustc-hash",
+]
+
+[[package]]
+name = "fsst-rs"
 version = "0.5.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3bf53d7c403a2b76873d4d66ba7d79c54bde2784cdaba6083f223d6e33270708"
@@ -10308,6 +10315,7 @@ dependencies = [
  "bzip2",
  "clap",
  "cudarc",
+ "fsst-rs 0.0.0",
  "futures",
  "get_dir",
  "glob",
@@ -10328,6 +10336,7 @@ dependencies = [
  "sysinfo",
  "tabled",
  "target-lexicon",
+ "thiserror 2.0.18",
  "tokio",
  "tokio-stream",
  "tokio-util",
@@ -10795,7 +10804,7 @@ name = "vortex-fsst"
 version = "0.1.0"
 dependencies = [
  "codspeed-divan-compat",
- "fsst-rs",
+ "fsst-rs 0.5.10",
  "prost 0.14.3",
  "rand 0.10.1",
  "rstest",

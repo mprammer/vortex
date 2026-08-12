@@ -25,6 +25,16 @@ vortex = { workspace = true, features = [
 ] }
 vortex-tensor = { workspace = true } # TODO(connor): In the future, this might be inside vortex.
 vortex-onpair = { workspace = true }
+# FSST-12, for the shared-decode-ABI experiment (src/fsst12_abi.rs). Aliased because the
+# workspace already depends on the published 8-bit fsst-rs through vortex-fsst, and the
+# 12-bit dialect lives only on spiraldb/fsst's mp/fsst12 branch.
+#
+# TODO(box): this MUST become a pinned git rev before any job is staged. run.py stages
+# with `git archive`, which cannot carry a path dep out of this tree. Blocked on the
+# training-budget fix (mp/fsst12-sampletarget) being pushed -- see
+# onpair-gpu-paper/docs/notes/2026-08-12-fsst12-normalizer-and-trainer-defect.md.
+fsst12 = { package = "fsst-rs", path = "/Users/martin/repos/fsst@sampletarget" }
+thiserror = { workspace = true }
 
 anyhow = { workspace = true }
 arrow-array = { workspace = true }
