@@ -19,6 +19,9 @@ workspace = true
 
 [features]
 default = []
+# Explicit opt-in used by CUDA-box test invocations. CUDA availability is still
+# detected by the build script and `vortex_cuda_macros::test`.
+cuda = []
 _test-harness = []
 unstable_encodings = ["vortex/unstable_encodings"]
 

@@ -71,8 +71,13 @@
 //     undersized grid silently drops input.
 //
 // BEFORE A NUMBER FROM THIS KERNEL MEANS ANYTHING:
-//   - Never compiled, never run. The byte-exact check against the CPU reference
-//     (--gpu-validate) is the differential test and has not been performed.
+//   - Compiled and smoke-run byte-exact on a B300 (2026-08-10), and reviewed
+//     adversarially three times, each round finding a real defect (a payload race,
+//     a non-collective __all_sync, an epoch wrap). Passing smoke is therefore NOT
+//     evidence of correctness here. The differential test that is
+//     (vortex-cuda/tests/onpair_lookback.rs, which diffs this kernel against the
+//     shipped split8read byte for byte over adversarial batch shapes and
+//     alignments) has NOT yet been run on a GPU.
 //   - The whole BLOCK stalls on warp 0's look-back while the other warps wait at a
 //     barrier. This cannot be removed by emitting earlier: the scratch base is
 //     shifted by the output base's alignment precisely so both the shared read and
