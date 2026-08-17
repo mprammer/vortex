@@ -413,7 +413,7 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
             if capped { " capped" } else { "" }
         );
         let Some(vbv) = build_varbin_view(&batches, col_idx, row_cap) else {
-            continue;
+            anyhow::bail!("unsupported Arrow string type for {}", field.name());
         };
         let iters: u64 = if raw_bytes < 10_000_000 {
             50
@@ -422,29 +422,30 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         } else {
             5
         };
-        match bench_column(field.name(), raw_bytes, row_cap, vbv, iters) {
-            Ok(r) => results.push(r),
-            Err(e) => println!(
-                "[nvcomp-zstd-real-data]   bench failed for {}: {e}",
-                field.name()
-            ),
-        }
+        results.push(bench_column(field.name(), raw_bytes, row_cap, vbv, iters)?);
     }
+    anyhow::ensure!(!results.is_empty(), "no eligible benchmark columns in {}", path.display());
     print_results(&label, &results);
     Ok(())
 }
 
 fn bench(_c: &mut Criterion) {
+    assert_eq!(
+        env::var("ONPAIR_ALLOW_LEGACY_MEAN_BENCH").as_deref(),
+        Ok("1"),
+        "nvcomp_zstd_real_data is a legacy mean-estimator bench without byte validation; use \
+         onpair-chunk-bench --gpu-decode --gpu-validate for paper data, or set \
+         ONPAIR_ALLOW_LEGACY_MEAN_BENCH=1 for exploratory use"
+    );
     let path_env = env::var("NVCOMP_DATA_PATH").or_else(|_| env::var("ONPAIR_DATA_PATH"));
     let Ok(paths) = path_env else {
-        println!(
-            "[nvcomp-zstd-real-data] set NVCOMP_DATA_PATH or ONPAIR_DATA_PATH (colon-separated parquet paths)"
-        );
-        return;
+        panic!("set NVCOMP_DATA_PATH or ONPAIR_DATA_PATH (colon-separated parquet paths)");
     };
-    for p in paths.split(':').filter(|s| !s.is_empty()) {
+    let inputs: Vec<_> = paths.split(':').filter(|s| !s.is_empty()).collect();
+    assert!(!inputs.is_empty(), "benchmark path list is empty");
+    for p in inputs {
         if let Err(e) = run_dataset(PathBuf::from(p)) {
-            println!("[nvcomp-zstd-real-data] dataset failed: {p}: {e}");
+            panic!("dataset failed: {p}: {e:#}");
         }
     }
 }

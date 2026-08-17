@@ -63,7 +63,6 @@ struct ColResult {
     name: String,
     rows: usize,
     raw_bytes: usize,
-    #[expect(dead_code, reason = "kept for debug-format output via Debug derive")]
     compressed_bytes: usize,
     ratio: f64,
     tokens: usize,
@@ -1545,20 +1544,12 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
             }
         );
         let Some(varbin) = build_varbin(&batches, col_idx, row_cap) else {
-            eprintln!(
-                "[onpair-real-data]   unsupported arrow type for {}",
-                field.name()
-            );
-            continue;
+            anyhow::bail!("unsupported Arrow string type for {}", field.name());
         };
-        match bench_column(field.name(), raw_bytes, row_cap, varbin, 10) {
-            Ok(rs) => results.extend(rs),
-            Err(e) => eprintln!(
-                "[onpair-real-data]   bench failed for {}: {e}",
-                field.name()
-            ),
-        }
+        results.extend(bench_column(field.name(), raw_bytes, row_cap, varbin, 10)?);
     }
+
+    anyhow::ensure!(!results.is_empty(), "no eligible benchmark columns in {}", path.display());
 
     let label = path
         .file_stem()
@@ -1570,14 +1561,25 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
 }
 
 fn bench_real_data(_c: &mut Criterion) {
+    assert_eq!(
+        env::var("ONPAIR_ALLOW_LEGACY_MEAN_BENCH").as_deref(),
+        Ok("1"),
+        "onpair_real_data is a legacy mean-estimator bench without byte validation; use \
+         onpair-chunk-bench --gpu-decode --gpu-validate for paper data, or set \
+         ONPAIR_ALLOW_LEGACY_MEAN_BENCH=1 for exploratory use"
+    );
     let Some(path_env) = env::var("ONPAIR_DATA_PATH").ok() else {
-        eprintln!("[onpair-real-data] ONPAIR_DATA_PATH not set; skipping");
-        return;
+        panic!("ONPAIR_DATA_PATH not set");
     };
-    let paths: Vec<PathBuf> = path_env.split(':').map(PathBuf::from).collect();
+    let paths: Vec<PathBuf> = path_env
+        .split(':')
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    assert!(!paths.is_empty(), "ONPAIR_DATA_PATH contains no parquet paths");
     for path in paths {
         if let Err(e) = run_dataset(path.clone()) {
-            eprintln!("[onpair-real-data] {} failed: {e}", path.display());
+            panic!("{} failed: {e:#}", path.display());
         }
     }
 }

@@ -364,7 +364,7 @@ def consolidated_summary(rows: list[dict], args, pivot: str, full_table: str) ->
         r for r in rows
         if (
             not r["verified"]
-            or not r["onpair_only"]
+            or (r.get("codec", "onpair") == "onpair" and not r["onpair_only"])
             or (r.get("gpu", {}).get("validated") and not r["gpu"].get("verified"))
         )
     ]

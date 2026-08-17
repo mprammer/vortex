@@ -1,4 +1,4 @@
-// Standalone nvCOMP hardware-decompression-engine baseline (Deflate + LZ4 + Snappy).
+// Standalone nvCOMP hardware-decompression-engine baseline (two Deflate presets + LZ4 + Snappy).
 // Compresses a raw byte file with nvCOMP, then times decompression on the
 // dedicated hardware Decompression Engine (backend=HARDWARE). Reports decode
 // GiB/s over the *uncompressed* bytes (directly comparable to OnPair decode).
@@ -19,12 +19,12 @@
 //   SDK=$(find target -path '*nvcomp-sdk' -type d | head -1)
 //   nvcc -O3 -arch=native nvcomp_hw_bench.cu -o nvbench \
 //     -I"$SDK/include" -L"$SDK/lib" -lnvcomp -lcudart
-//   LD_LIBRARY_PATH="$SDK/lib" ./nvbench <file> [chunk_bytes] [deflate_algo]
+//   LD_LIBRARY_PATH="$SDK/lib" ./nvbench <file> [legacy_chunk_bytes] [deflate_algo]
 // Input <file> = raw concatenated column bytes (dump with pyarrow).
 //
 // OUTPUT: a single JSON object on stdout (human-readable per-config lines go to
 // stderr). The object preserves the historical top-level fields — raw_bytes,
-// chunk_bytes (=262144, the 256 KiB cell), the three per-codec objects, and
+// chunk_bytes (=262144, the 256 KiB cell), the four per-codec objects, and
 // best_codec/best_decode_gib_s/best_ratio — for backward compatibility with the
 // figure pipeline (common.py de_map()). best_* is now the max over the WHOLE
 // chunk sweep. ADDED: a `chunk_sweep` array covering all five chunk sizes, and a
@@ -43,8 +43,6 @@
 #define CK(x) do{ cudaError_t e=(x); if(e!=cudaSuccess){ fprintf(stderr,"CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e)); exit(1);} }while(0)
 #define NK(x) do{ nvcompStatus_t s=(x); if(s!=nvcompSuccess){ fprintf(stderr,"nvcomp %s:%d status=%d\n",__FILE__,__LINE__,(int)s); exit(1);} }while(0)
 
-static size_t CHUNK = 262144; // good-baseline chunk for the DE (overridable via argv[2])
-
 // The legacy top-level cell + the entry duplicated inside chunk_sweep.
 static const size_t LEGACY_CHUNK = 262144; // 256 KiB
 
@@ -56,6 +54,8 @@ struct CodecResult {
     double compress_gib_s = 0.0; // encode throughput over uncompressed bytes
     double decode_gib_s = 0.0;   // min-reduced decode throughput over uncompressed bytes
     bool valid = false;          // HW-supported AND byte-exact
+    bool supported = false;      // HW API accepted this codec/chunk configuration
+    bool validation_failed = false; // status/size/byte validation detected corruption
     std::vector<unsigned long long> decode_ns_iters; // GOLD: raw per-iter decode times, integer ns
 };
 
@@ -64,7 +64,7 @@ struct CodecResult {
 // per iteration, so the engine stays saturated). On HW rejection of this chunk
 // size, sets out.valid=false and returns WITHOUT aborting the process. All device
 // allocations and the stream/events are freed before return so the chunk sweep
-// (15 invocations) does not leak.
+// (20 invocations) does not leak.
 template<class CompOpts, class DecompOpts>
 void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
          CompOpts copts, DecompOpts dopts, CodecResult& out,
@@ -106,7 +106,27 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
     float cms=0; CK(cudaEventElapsedTime(&cms,ca,cb)); cms/=citers;
     double enc_gibs=(double)N/(cms/1e3)/(1024.0*1024*1024);
     std::vector<size_t> h_csz(num); CK(cudaMemcpy(h_csz.data(),d_csz,num*sizeof(size_t),cudaMemcpyDeviceToHost));
-    size_t ctot=0; for(size_t i=0;i<num;i++) ctot+=h_csz[i];
+    std::vector<nvcompStatus_t> h_status(num);
+    CK(cudaMemcpy(h_status.data(),d_st,num*sizeof(nvcompStatus_t),cudaMemcpyDeviceToHost));
+    size_t ctot=0;
+    bool compression_ok=true;
+    for(size_t i=0;i<num;i++){
+        if(h_status[i]!=nvcompSuccess || h_csz[i]==0 || h_csz[i]>maxout){
+            fprintf(stderr,"%-13s chunk=%zu compression result[%zu] status=%d size=%zu max=%zu\n",
+                    name,chunk,i,(int)h_status[i],h_csz[i],maxout);
+            compression_ok=false;
+        }
+        ctot+=h_csz[i];
+    }
+    if(!compression_ok || ctot==0){
+        out.validation_failed=true;
+        cudaEventDestroy(ca); cudaEventDestroy(cb);
+        cudaFree(d_in); cudaFree(d_inptr); cudaFree(d_insz);
+        if(d_ctemp) cudaFree(d_ctemp);
+        cudaFree(d_cbuf); cudaFree(d_cptr); cudaFree(d_csz); cudaFree(d_st);
+        cudaStreamDestroy(stream);
+        return;
+    }
 
     // ---- decompress on HARDWARE engine ----
     // The HW path can reject a (chunk,codec) config here (e.g. Zstd has no HW
@@ -145,12 +165,36 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
         cudaStreamDestroy(stream);
         out.valid=false; return;
     }
+    out.supported=true;
     for(int w=1;w<3;w++){ NK(decompAsync(d_cptr,d_csz,d_obufsz,d_actual,num,d_dtemp,dtemp,d_optr,dopts,d_st,stream)); }
     CK(cudaStreamSynchronize(stream));
 
-    // validate
+    // Validate every chunk's API status and decoded size, not just the aggregate bytes.
+    std::vector<size_t> h_actual(num);
+    CK(cudaMemcpy(h_status.data(),d_st,num*sizeof(nvcompStatus_t),cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_actual.data(),d_actual,num*sizeof(size_t),cudaMemcpyDeviceToHost));
+    bool metadata_ok=true;
+    for(size_t i=0;i<num;i++){
+        if(h_status[i]!=nvcompSuccess || h_actual[i]!=h_insz[i]){
+            fprintf(stderr,"%-13s chunk=%zu decompress result[%zu] status=%d actual=%zu expected=%zu\n",
+                    name,chunk,i,(int)h_status[i],h_actual[i],h_insz[i]);
+            metadata_ok=false;
+        }
+    }
     std::vector<unsigned char> back(N); CK(cudaMemcpy(back.data(),d_out,N,cudaMemcpyDeviceToHost));
-    bool ok = memcmp(back.data(),host.data(),N)==0;
+    bool ok = metadata_ok && memcmp(back.data(),host.data(),N)==0;
+    if(!ok){
+        fprintf(stderr,"%-13s chunk=%zu warmup validation FAILED\n",name,chunk);
+        out.validation_failed=true;
+        cudaEventDestroy(ca); cudaEventDestroy(cb);
+        cudaFree(d_in); cudaFree(d_inptr); cudaFree(d_insz);
+        if(d_ctemp) cudaFree(d_ctemp);
+        cudaFree(d_cbuf); cudaFree(d_cptr); cudaFree(d_csz); cudaFree(d_st);
+        if(d_dtemp) cudaFree(d_dtemp);
+        cudaFree(d_out); cudaFree(d_optr); cudaFree(d_obufsz); cudaFree(d_actual);
+        cudaStreamDestroy(stream);
+        return;
+    }
 
     // MIN single-pass time over the iterations (matches FastPair's reduction): each
     // decode is timed in isolation and we keep the fastest, not the mean. GOLD: in
@@ -169,17 +213,29 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
         out.decode_ns_iters.push_back((unsigned long long)((double)it*1e6+0.5));
         if(it<ms) ms=it;
     }
+    CK(cudaMemcpy(h_status.data(),d_st,num*sizeof(nvcompStatus_t),cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(h_actual.data(),d_actual,num*sizeof(size_t),cudaMemcpyDeviceToHost));
+    CK(cudaMemcpy(back.data(),d_out,N,cudaMemcpyDeviceToHost));
+    bool timed_ok = memcmp(back.data(),host.data(),N)==0;
+    for(size_t i=0;i<num;i++)
+        timed_ok = timed_ok && h_status[i]==nvcompSuccess && h_actual[i]==h_insz[i];
+    if(!timed_ok){
+        fprintf(stderr,"%-13s chunk=%zu timed-pass validation FAILED\n",name,chunk);
+        out.decode_ns_iters.clear();
+        out.validation_failed=true;
+        ok=false;
+    }
     double gibs = (double)N/(ms/1e3)/ (1024.0*1024*1024);
     double gbs  = (double)N/(ms/1e3)/ 1e9;
     fprintf(stderr,"%-13s chunk=%6zu  ratio=%.2fx  compress=%6.1f GiB/s  decode=%6.1f GiB/s (%.0f GB/s)  valid=%s\n",
            name, chunk, (double)N/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
 
-    out.ratio = (double)N/ctot;
-    out.compress_gib_s = enc_gibs;
-    out.decode_gib_s = gibs;
+    out.ratio = ok ? (double)N/ctot : 0.0;
+    out.compress_gib_s = ok ? enc_gibs : 0.0;
+    out.decode_gib_s = ok ? gibs : 0.0;
     out.valid = ok;
 
-    // ---- free everything (the sweep calls run() 15x; leaking would OOM) ----
+    // ---- free everything (the sweep calls run() 20x; leaking would OOM) ----
     cudaEventDestroy(a); cudaEventDestroy(b);
     cudaEventDestroy(ca); cudaEventDestroy(cb);
     cudaFree(d_in); cudaFree(d_inptr); cudaFree(d_insz);
@@ -256,6 +312,8 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
     printf("%s  \"ratio\": %.2f,\n", indent, r.ratio);
     printf("%s  \"compress_gib_s\": %.1f,\n", indent, r.compress_gib_s);
     printf("%s  \"decode_gib_s\": %.1f,\n", indent, r.decode_gib_s);
+    printf("%s  \"supported\": %s,\n", indent, r.supported?"true":"false");
+    printf("%s  \"validation_failed\": %s,\n", indent, r.validation_failed?"true":"false");
     printf("%s  \"valid\": %s,\n", indent, r.valid?"true":"false");
     printf("%s  \"decode_ns_iters\": [", indent);
     for(size_t i=0;i<r.decode_ns_iters.size();i++)
@@ -266,10 +324,17 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
 
 int main(int argc, char** argv){
     const char* path = argc>1?argv[1]:"/tmp/l_comment.bin";
-    if(argc>2) CHUNK = (size_t)atol(argv[2]); // retained for compat; the bench sweeps a fixed set
+    if(argc>2 && (size_t)atol(argv[2])!=LEGACY_CHUNK){
+        fprintf(stderr,"chunk override is not supported: this producer always emits the fixed five-size sweep\n");
+        return 1;
+    }
     FILE* f=fopen(path,"rb"); if(!f){ perror("open"); return 1; }
-    fseek(f,0,SEEK_END); long sz=ftell(f); fseek(f,0,SEEK_SET);
-    std::vector<unsigned char> host(sz); fread(host.data(),1,sz,f); fclose(f);
+    if(fseek(f,0,SEEK_END)!=0){ perror("seek"); fclose(f); return 1; }
+    long sz=ftell(f);
+    if(sz<=0 || fseek(f,0,SEEK_SET)!=0){ fprintf(stderr,"input must be a non-empty regular file\n"); fclose(f); return 1; }
+    std::vector<unsigned char> host((size_t)sz);
+    if(fread(host.data(),1,(size_t)sz,f)!=(size_t)sz){ fprintf(stderr,"short read from %s\n",path); fclose(f); return 1; }
+    fclose(f);
     fprintf(stderr,"input: %s  %.1f MiB\n", path, sz/1048576.0);
     CK(cudaSetDevice(0));
 
@@ -301,20 +366,24 @@ int main(int argc, char** argv){
     // best over the WHOLE sweep (valid configs only)
     const char* best_codec = "";
     double best_decode = 0.0, best_ratio = 0.0;
+    size_t best_chunk = 0;
+    bool any_validation_failed = false;
     for(int ci=0; ci<n_sweep; ci++){
         for(size_t k=0;k<sweep_results[ci].size();k++){
             const CodecResult& r = sweep_results[ci][k];
+            any_validation_failed = any_validation_failed || r.validation_failed;
             if(r.valid && r.decode_gib_s > best_decode){
                 best_decode = r.decode_gib_s;
                 best_ratio = r.ratio;
                 best_codec = sweep_names[ci][k];
+                best_chunk = sweep_chunks[ci];
             }
         }
     }
 
     // ---- emit JSON ----
     // Top level preserves the legacy contract: raw_bytes, chunk_bytes (=256 KiB),
-    // the three per-codec objects (the 256 KiB cell), and best_* (now the sweep max).
+    // the four per-codec objects (the 256 KiB cell), and best_* (now the sweep max).
     if(legacy_idx<0){ fprintf(stderr,"FATAL: 256 KiB cell missing from sweep\n"); return 1; }
     const std::vector<const char*>& lnames = sweep_names[legacy_idx];
     const std::vector<CodecResult>& lres = sweep_results[legacy_idx];
@@ -343,8 +412,17 @@ int main(int argc, char** argv){
     printf("  ],\n");
 
     printf("  \"best_codec\": \"%s\",\n", best_codec);
+    printf("  \"best_chunk_bytes\": %zu,\n", best_chunk);
     printf("  \"best_decode_gib_s\": %.1f,\n", best_decode);
     printf("  \"best_ratio\": %.2f\n", best_ratio);
     printf("}\n");
+    if(any_validation_failed){
+        fprintf(stderr,"FATAL: at least one accepted configuration failed validation\n");
+        return 4;
+    }
+    if(best_chunk==0){
+        fprintf(stderr,"FATAL: no supported, byte-exact hardware configuration\n");
+        return 5;
+    }
     return 0;
 }

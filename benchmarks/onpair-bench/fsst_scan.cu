@@ -99,8 +99,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "short header\n");
     return 2;
   }
-  if (num_symbols > 255) {
-    fprintf(stderr, "num_symbols %u > 255\n", num_symbols);
+  if (num_strings == 0 || num_input_bytes == 0 || num_symbols == 0 || num_symbols > 255) {
+    fprintf(stderr, "invalid dimensions: strings=%llu input=%llu symbols=%u\n",
+            (unsigned long long)num_strings,
+            (unsigned long long)num_input_bytes, num_symbols);
     return 2;
   }
   // Symbol table: dumped as num_symbols entries; zero-pad to 256 so both
@@ -119,10 +121,29 @@ int main(int argc, char **argv) {
     fprintf(stderr, "short body\n");
     return 2;
   }
+  if (fgetc(f) != EOF) {
+    fprintf(stderr, "trailing bytes after FST1 payload\n");
+    return 2;
+  }
   fclose(f);
   for (uint32_t i = 0; i < num_symbols; ++i) {
+    if (symlen_in[i] == 0 || symlen_in[i] > 8) {
+      fprintf(stderr, "symbol_lengths[%u]=%u outside 1..=8\n",
+              i, (unsigned)symlen_in[i]);
+      return 2;
+    }
     symbols[i] = sym_in[i];
     symbol_lengths[i] = symlen_in[i];
+  }
+  if (codes_offsets.front() != 0 || codes_offsets.back() != num_input_bytes ||
+      !std::is_sorted(codes_offsets.begin(), codes_offsets.end())) {
+    fprintf(stderr, "codes_offsets must be monotone from 0 to num_input_bytes\n");
+    return 2;
+  }
+  if (output_offsets.front() != 0 ||
+      !std::is_sorted(output_offsets.begin(), output_offsets.end())) {
+    fprintf(stderr, "output_offsets must be monotone and start at zero\n");
+    return 2;
   }
 
   // Guard: recipe input offsets are u32 (halves the side-table size). Holds for
@@ -134,30 +155,35 @@ int main(int argc, char **argv) {
     return 2;
   }
 
-  // ── single host walk of the code stream ──
-  // Produces, in code order: total_codes, the CPU reference decode (oracle),
-  // per-4-code-group input offsets (group_in_off), and per-128-code-batch
-  // output offsets (batch_out_off). This is the FSST analog of e2e_scan.cu
-  // deriving chunk_offsets from the OnPair dump — host-side setup, not timed.
+  // ── validate and CPU-decode each string ──
+  // Decode within each stored code range so an escape byte cannot consume the
+  // first byte of the following string. This is the independent CPU oracle.
   // The dump's per-string output_offsets total is the exact decoded size —
   // reserve to it (falls back to a loose cap if absent).
   const uint64_t decoded_hint =
       output_offsets.empty() ? num_input_bytes * 2 : output_offsets.back();
   std::vector<uint8_t> cpu_out;
   cpu_out.reserve(decoded_hint);
-  std::vector<uint32_t> group_in_off;
-  std::vector<uint64_t> batch_out_off;
   uint64_t total_codes = 0;
-  {
-    uint64_t in_pos = 0;
-    while (in_pos < num_input_bytes) {
-      if ((total_codes & 127u) == 0) batch_out_off.push_back(cpu_out.size());
-      if ((total_codes & 3u) == 0) group_in_off.push_back((uint32_t)in_pos);
+  for (uint64_t row = 0; row < num_strings; ++row) {
+    uint64_t in_pos = codes_offsets[row];
+    const uint64_t in_end = codes_offsets[row + 1];
+    while (in_pos < in_end) {
       const uint8_t code = codes_bytes[in_pos];
       if (code == 255u) {  // escape: next byte is a literal
+        if (in_pos + 1 >= in_end) {
+          fprintf(stderr, "truncated escape in row %llu at byte %llu\n",
+                  (unsigned long long)row, (unsigned long long)in_pos);
+          return 2;
+        }
         cpu_out.push_back(codes_bytes[in_pos + 1]);
         in_pos += 2;
       } else {
+        if (code >= num_symbols) {
+          fprintf(stderr, "code %u at byte %llu is outside %u trained symbols\n",
+                  (unsigned)code, (unsigned long long)in_pos, num_symbols);
+          return 2;
+        }
         const uint64_t sym = symbols[code];
         const uint32_t len = symbol_lengths[code];
         const uint8_t *sb = reinterpret_cast<const uint8_t *>(&sym);
@@ -166,30 +192,67 @@ int main(int argc, char **argv) {
       }
       total_codes++;
     }
-    batch_out_off.push_back(cpu_out.size());  // sentinel = total decoded bytes
+    if (cpu_out.size() != output_offsets[row + 1]) {
+      fprintf(stderr,
+              "row %llu decode end %zu != output_offsets end %llu\n",
+              (unsigned long long)row, cpu_out.size(),
+              (unsigned long long)output_offsets[row + 1]);
+      return 2;
+    }
   }
   const uint64_t decoded_bytes = cpu_out.size();
 
-  // Sanity: the flat decode must reproduce the per-string output_offsets total.
-  if (!output_offsets.empty() && output_offsets.back() != decoded_bytes) {
-    fprintf(stderr,
-            "WARNING: flat decode %llu bytes != output_offsets.back() %llu\n",
-            (unsigned long long)decoded_bytes,
-            (unsigned long long)output_offsets.back());
+  if (output_offsets.back() != decoded_bytes) {
+    fprintf(stderr, "decoded bytes do not match output_offsets sentinel\n");
+    return 2;
   }
 
+  // Build the recipe-only metadata in a separate measured host pass. The CUDA
+  // event timings below remain kernel-only; this cost is surfaced explicitly
+  // rather than silently giving the recipe free preprocessing.
+  const double metadata_t0 = now_s();
+  std::vector<uint32_t> group_in_off;
+  std::vector<uint64_t> batch_out_off;
+  uint64_t code_idx = 0, decoded_pos = 0, in_pos = 0;
+  while (in_pos < num_input_bytes) {
+    if ((code_idx & 127u) == 0) batch_out_off.push_back(decoded_pos);
+    if ((code_idx & 3u) == 0) group_in_off.push_back((uint32_t)in_pos);
+    const uint8_t code = codes_bytes[in_pos];
+    if (code == 255u) {
+      decoded_pos += 1;
+      in_pos += 2;
+    } else {
+      decoded_pos += symbol_lengths[code];
+      in_pos += 1;
+    }
+    code_idx++;
+  }
+  batch_out_off.push_back(decoded_pos);
+  if (code_idx != total_codes || decoded_pos != decoded_bytes) {
+    fprintf(stderr, "recipe metadata pass disagrees with validated CPU decode\n");
+    return 2;
+  }
   const uint64_t num_batches = (total_codes + 127) / 128;
   // Pad group_in_off so every possible (batch,lane) group index is in-bounds;
   // trailing lanes past total_codes are inactive but still read their slot.
   const size_t groups_needed = (size_t)num_batches * 32 + 1;
   while (group_in_off.size() < groups_needed)
     group_in_off.push_back((uint32_t)num_input_bytes);
+  const double recipe_metadata_build_ms = (now_s() - metadata_t0) * 1e3;
 
   // Validity: all strings valid.
   std::vector<uint8_t> validity_bits((num_strings + 7) / 8, 0xFF);
 
   const uint64_t compressed_bytes =
       num_input_bytes + (uint64_t)num_symbols * 8 + num_symbols;
+  const uint64_t naive_metadata_bytes =
+      (num_strings + 1) * sizeof(uint64_t) * 2 + validity_bits.size();
+  const uint64_t recipe_metadata_bytes =
+      group_in_off.size() * sizeof(uint32_t) + batch_out_off.size() * sizeof(uint64_t);
+  const uint64_t naive_staged_input_bytes =
+      num_input_bytes + 256 * sizeof(uint64_t) + 256 + naive_metadata_bytes;
+  const uint64_t recipe_staged_input_bytes =
+      num_input_bytes + 256 * sizeof(uint64_t) + 256 + recipe_metadata_bytes;
 
   // ── upload to device ──
   uint8_t *d_codes, *d_symlen, *d_out_naive, *d_out_recipe, *d_valid;
@@ -258,6 +321,13 @@ int main(int argc, char **argv) {
   };
   long long naive_mm = naive_ok ? -1 : first_mismatch(h_naive);
   long long recipe_mm = recipe_ok ? -1 : first_mismatch(h_recipe);
+  if (!naive_ok || !recipe_ok) {
+    fprintf(stderr,
+            "validation failed before timing: naive_ok=%s mismatch=%lld recipe_ok=%s mismatch=%lld\n",
+            naive_ok ? "true" : "false", naive_mm,
+            recipe_ok ? "true" : "false", recipe_mm);
+    return 4;
+  }
 
   // ── timing (CUDA events, min over iters; raw per-iter ns retained) ──
   cudaEvent_t ev0, ev1;
@@ -308,8 +378,16 @@ int main(int argc, char **argv) {
   printf("  \"num_symbols\": %u,\n", num_symbols);
   printf("  \"decoded_bytes\": %llu,\n", (unsigned long long)decoded_bytes);
   printf("  \"compressed_bytes\": %llu,\n", (unsigned long long)compressed_bytes);
+  printf("  \"naive_metadata_bytes\": %llu,\n", (unsigned long long)naive_metadata_bytes);
+  printf("  \"recipe_metadata_bytes\": %llu,\n", (unsigned long long)recipe_metadata_bytes);
+  printf("  \"naive_staged_input_bytes\": %llu,\n", (unsigned long long)naive_staged_input_bytes);
+  printf("  \"recipe_staged_input_bytes\": %llu,\n", (unsigned long long)recipe_staged_input_bytes);
+  printf("  \"recipe_metadata_build_ms\": %.5f,\n", recipe_metadata_build_ms);
+  printf("  \"timing_scope\": \"kernel_only_metadata_prebuilt\",\n");
   printf("  \"ratio\": %.4f,\n", (double)decoded_bytes / compressed_bytes);
   printf("  \"iters\": %d,\n", iters);
+  printf("  \"naive_block_threads\": %u,\n", naive_block);
+  printf("  \"recipe_block_threads\": %u,\n", recipe_blk.x);
   printf("  \"naive_ok\": %s,\n", naive_ok ? "true" : "false");
   printf("  \"recipe_ok\": %s,\n", recipe_ok ? "true" : "false");
   printf("  \"naive_first_mismatch\": %lld,\n", naive_mm);

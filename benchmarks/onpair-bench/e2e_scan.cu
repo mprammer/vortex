@@ -78,8 +78,7 @@ __global__ void scan_needle(const uint8_t *__restrict__ data, uint64_t n,
                             const uint8_t *__restrict__ needle, uint32_t m,
                             uint8_t n0, uint32_t n0bcast,
                             unsigned long long *__restrict__ count) {
-  const uint64_t nchunks = n >> 4;  // 16-byte chunks; the <16 B tail can't start a match
-                                    // the CPU oracle reaches either (n%16 < m), so counts agree
+  const uint64_t nchunks = n >> 4;
   uint64_t c = (uint64_t)blockIdx.x * blockDim.x + threadIdx.x;
   const uint64_t stride = (uint64_t)gridDim.x * blockDim.x;
   const uint4 *d4 = reinterpret_cast<const uint4 *>(data);
@@ -99,6 +98,21 @@ __global__ void scan_needle(const uint8_t *__restrict__ data, uint64_t n,
           if (hit) local++;
         }
       }
+    }
+  }
+  // The vector loop owns starts in [0, floor(n/16)*16). One thread covers
+  // starts in the final partial 16-byte region, which matter for short needles.
+  // This keeps the common full-vector path unchanged and makes the scan agree
+  // with the CPU oracle for every non-empty needle length.
+  if (blockIdx.x == 0 && threadIdx.x == 0) {
+    const uint64_t tail_start = nchunks << 4;
+    for (uint64_t pos = tail_start; pos + m <= n; ++pos) {
+      if (data[pos] != n0) continue;
+      bool hit = true;
+      for (uint32_t j = 1; j < m; ++j) {
+        if (data[pos + j] != needle[j]) { hit = false; break; }
+      }
+      if (hit) local++;
     }
   }
   // Only the (rare) threads that found a match touch the global counter. An
@@ -150,6 +164,10 @@ int main(int argc, char **argv) {
     fprintf(stderr, "max_token=%u but the GPU kernel ABI requires 16\n", max_token);
     return 2;
   }
+  if (total_tokens == 0 || dict_size == 0) {
+    fprintf(stderr, "empty token stream/dictionary is not a benchmarkable E2E1 input\n");
+    return 2;
+  }
   std::vector<uint16_t> codes(total_tokens);
   std::vector<uint8_t> lens(dict_size);
   std::vector<uint8_t> dict_padded((size_t)dict_size * max_token);
@@ -160,6 +178,21 @@ int main(int argc, char **argv) {
     return 2;
   }
   fclose(f);
+
+  for (uint32_t c = 0; c < dict_size; ++c) {
+    if (lens[c] == 0 || lens[c] > max_token) {
+      fprintf(stderr, "invalid dictionary length lens[%u]=%u (expected 1..%u)\n",
+              c, (unsigned)lens[c], max_token);
+      return 2;
+    }
+  }
+  for (uint64_t i = 0; i < total_tokens; ++i) {
+    if (codes[i] >= dict_size) {
+      fprintf(stderr, "code[%llu]=%u is outside dictionary of %u entries\n",
+              (unsigned long long)i, (unsigned)codes[i], dict_size);
+      return 2;
+    }
+  }
 
   // ── derive everything the kernel needs from {codes, lens, dict_padded} ──
   // per-token output offsets (cumulative decoded byte position) + decoded size
@@ -257,6 +290,10 @@ int main(int argc, char **argv) {
     needle.assign(&cpu_out[pos], &cpu_out[pos + want]);
   }
   const uint32_t m = (uint32_t)needle.size();
+  if (m == 0) {
+    fprintf(stderr, "needle must be non-empty\n");
+    return 2;
+  }
 
   // CPU match count (the oracle for the GPU scan's count)
   uint64_t cpu_matches = 0;
@@ -407,6 +444,19 @@ int main(int argc, char **argv) {
   CK(cudaHostAlloc(&h_pin_dec, decoded_bytes, cudaHostAllocDefault));
   CK(cudaHostAlloc(&h_pin_cmp, compressed_bytes, cudaHostAllocDefault));
   memcpy(h_pin_dec, cpu_out.data(), decoded_bytes);
+  uint8_t *cmp_cursor = h_pin_cmp;
+  memcpy(cmp_cursor, codes.data(), total_tokens * sizeof(uint16_t));
+  cmp_cursor += total_tokens * sizeof(uint16_t);
+  memcpy(cmp_cursor, dict_bytes_compact.data(), sum_dict_len);
+  cmp_cursor += sum_dict_len;
+  memcpy(cmp_cursor, lens.data(), dict_size);
+  cmp_cursor += dict_size;
+  memcpy(cmp_cursor, chunk_off.data(), (n_chunks + 1) * sizeof(uint64_t));
+  cmp_cursor += (n_chunks + 1) * sizeof(uint64_t);
+  if ((uint64_t)(cmp_cursor - h_pin_cmp) != compressed_bytes) {
+    fprintf(stderr, "internal compressed-payload accounting mismatch\n");
+    return 2;
+  }
   uint8_t *d_xfer;
   // sized for the LARGER leg: compressed_bytes can exceed decoded_bytes on low-cardinality
   // columns (2 code bytes per decoded byte, plus dict/offsets) — the old decoded_bytes-only

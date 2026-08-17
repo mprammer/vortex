@@ -406,6 +406,8 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         .unwrap_or(100_000);
 
     let mut results = Vec::new();
+    let dump_base = env::var("FSST_DUMP").ok();
+    let mut eligible_columns = 0usize;
     for (col_idx, field) in schema.fields().iter().enumerate() {
         let dt = field.data_type();
         let is_str = matches!(
@@ -423,6 +425,15 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         if total_rows < 100_000 || total_raw < min_bytes {
             continue;
         }
+        let null_count: usize = batches
+            .iter()
+            .map(|batch| batch.column(col_idx).null_count())
+            .sum();
+        anyhow::ensure!(
+            null_count == 0,
+            "eligible string column {} contains {null_count} nulls; this benchmark does not stage validity",
+            field.name()
+        );
         let (row_cap, raw_bytes) = find_row_cap(&batches, col_idx);
         let capped = row_cap < total_rows;
         println!(
@@ -440,16 +451,15 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         let Some(vbn) = build_varbin(&batches, col_idx, row_cap) else {
             continue;
         };
+        eligible_columns += 1;
         // Env-gated dump for the standalone fsst_scan.cu bench. Writes one file
         // per eligible column as `<FSST_DUMP>.<column>.fsstbin`, then skips the
         // criterion bench (dumping and benching are separate use-cases). Pick
         // the target column by its emitted filename, e.g. l_comment.
-        if let Ok(dump_base) = env::var("FSST_DUMP") {
+        if let Some(dump_base) = &dump_base {
             let strings = collect_strings(&batches, col_idx, row_cap);
             let out = PathBuf::from(format!("{dump_base}.{}.fsstbin", field.name()));
-            if let Err(e) = dump_fsst(&out, &strings) {
-                println!("[vortex-fsst-real-data]   FSST_DUMP failed for {}: {e}", field.name());
-            }
+            dump_fsst(&out, &strings)?;
             continue;
         }
         let iters: u64 = if raw_bytes < 10_000_000 {
@@ -459,13 +469,11 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         } else {
             5
         };
-        match bench_column(field.name(), raw_bytes, row_cap, vbn, iters) {
-            Ok(r) => results.push(r),
-            Err(e) => println!(
-                "[vortex-fsst-real-data]   bench failed for {}: {e}",
-                field.name()
-            ),
-        }
+        results.push(bench_column(field.name(), raw_bytes, row_cap, vbn, iters)?);
+    }
+    anyhow::ensure!(eligible_columns > 0, "no eligible string columns in {}", path.display());
+    if dump_base.is_some() {
+        return Ok(());
     }
     print_results(&label, &results);
     Ok(())
@@ -474,12 +482,17 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
 fn bench(_c: &mut Criterion) {
     let path_env = env::var("VORTEX_FSST_DATA_PATH").or_else(|_| env::var("ONPAIR_DATA_PATH"));
     let Ok(paths) = path_env else {
-        println!("[vortex-fsst-real-data] set ONPAIR_DATA_PATH (colon-separated parquet paths)");
-        return;
+        panic!("set ONPAIR_DATA_PATH (colon-separated parquet paths)");
     };
-    for p in paths.split(':').filter(|s| !s.is_empty()) {
-        if let Err(e) = run_dataset(PathBuf::from(p)) {
-            println!("[vortex-fsst-real-data] dataset failed: {p}: {e}");
+    let inputs: Vec<_> = paths.split(':').filter(|s| !s.is_empty()).collect();
+    assert!(!inputs.is_empty(), "ONPAIR_DATA_PATH contains no parquet paths");
+    assert!(
+        env::var("FSST_DUMP").is_err() || inputs.len() == 1,
+        "FSST_DUMP requires exactly one input dataset to avoid overwriting same-named columns"
+    );
+    for p in inputs {
+        if let Err(error) = run_dataset(PathBuf::from(p)) {
+            panic!("dataset failed: {p}: {error:#}");
         }
     }
 }
