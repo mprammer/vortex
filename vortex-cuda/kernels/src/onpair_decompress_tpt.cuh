@@ -16,7 +16,7 @@
 #error "ONPAIR_KERNEL_NAME must be defined"
 #endif
 #ifndef ONPAIR_LAUNCH_BOUNDS
-#define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 2)
+#define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 4)
 #endif
 
 #define WARPS_PER_BLOCK_MAX 8u

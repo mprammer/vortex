@@ -1,7 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: Copyright the Vortex contributors
-// Track B": split8read at finer granularity (256-thread blocks, 4 blocks/SM).
-#define WARPS_PER_BLOCK_MAX 8u
+
+// Four-TPT member of the controlled 256-thread / four-block launch family.
+#define TOKENS_PER_THREAD    4u
+#define ONPAIR_KERNEL_NAME   onpair_shmem_4tpt_split8read_occ
 #define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 4)
-#define onpair_shmem_4tpt_split8read onpair_shmem_4tpt_split8read_occ
-#include "onpair_shmem_4tpt_split8read.cu"
+#include "onpair_split8read_tpt.cuh"

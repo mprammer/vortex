@@ -267,6 +267,7 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
                     "--gpu-decode",
                     "--gpu-iters", str(args.gpu_iters),
                     *(["--gpu-validate"] if args.gpu_validate else []),
+                    *(["--gpu-kernels", args.gpu_kernels] if args.gpu_kernels else []),
                 ]
                 if args.gpu_decode
                 else []
@@ -308,7 +309,8 @@ def markdown_table(rows: list[dict]) -> str:
         gpu_auto = ""
         gpu_best = ""
         if gpu:
-            gpu_auto = f"{gpu['auto_kernel']} {gpu['auto_decode_gib_s']:.1f}"
+            if gpu.get("auto_kernel") is not None:
+                gpu_auto = f"{gpu['auto_kernel']} {gpu['auto_decode_gib_s']:.1f}"
             gpu_best = f"{gpu['best_kernel']} {gpu['best_decode_gib_s']:.1f}"
             if gpu.get("validated"):
                 status = "ok" if gpu.get("verified") else "bad"
@@ -389,6 +391,7 @@ def consolidated_summary(rows: list[dict], args, pivot: str, full_table: str) ->
         f"- raw sample cap: `{args.sample_bytes:,}` bytes  |  file target: `{args.file_target_mb:g} MB`",
         f"- GPU kernel-only decode: `{'on' if args.gpu_decode else 'off'}`"
         + (f" ({args.gpu_iters} timed iterations)" if args.gpu_decode else ""),
+        f"- GPU kernel selection: `{args.gpu_kernels or 'all registered kernels'}`",
         f"- GPU byte validation: `{'on' if args.gpu_validate else 'off'}`",
         "",
         "## Coverage",
@@ -432,6 +435,8 @@ def main() -> int:
                    help="timed CUDA iterations per kernel when --gpu-decode is set")
     p.add_argument("--gpu-validate", action="store_true",
                    help="copy GPU output back and compare every applicable kernel against CPU bytes")
+    p.add_argument("--gpu-kernels", default=None,
+                   help="exact comma-separated kernel allowlist; use tpt-matched for the ten-way control")
     p.add_argument("--jobs", type=int, default=0,
                    help="columns to run concurrently (default: all available CPU cores)")
     p.add_argument("--codec", choices=["onpair", "fsst12"], default="onpair",

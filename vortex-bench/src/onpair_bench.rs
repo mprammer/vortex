@@ -205,8 +205,10 @@ pub struct GpuCellResult {
     /// `compressed_bytes`, which also includes dictionary metadata.
     #[serde(default)]
     pub total_tokens: u64,
-    /// Auto-selected kernel based on dictionary lengths.
-    pub auto_kernel: String,
+    /// Auto-selected kernel based on dictionary lengths. Absent when an explicit
+    /// kernel allowlist does not contain the selector's choice.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_kernel: Option<String>,
     /// Selector inputs (token-weighted fraction of tokens <= 8 bytes, mean/max
     /// dict entry length, max dict entry count across chunks, and whether every
     /// chunk's dict has <= 4096 entries). Surfaced so kernel-selection gates can
@@ -237,12 +239,14 @@ pub struct GpuCellResult {
     /// logical payload: `decoded_bytes / (compressed_bytes/h2d + auto_decode)`.
     /// Compare to `h2d_gib_s` (the raw-transfer output rate): when this is higher,
     /// GPU decompress delivers output faster than transferring the raw bytes.
-    pub whole_decompress_gib_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub whole_decompress_gib_s: Option<f64>,
     /// Fastest measured kernel among all applicable variants.
     pub best_kernel: String,
-    /// Auto-selected kernel average time across all chunks.
-    pub auto_decode_ms: f64,
-    /// Fastest measured kernel average time across all chunks.
+    /// Auto-selected kernel minimum full-pass time across timed iterations.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_decode_ms: Option<f64>,
+    /// Fastest measured kernel minimum full-pass time across timed iterations.
     pub best_decode_ms: f64,
     /// Whether output byte validation was requested.
     pub validated: bool,
@@ -250,7 +254,8 @@ pub struct GpuCellResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub verified: Option<bool>,
     /// `decoded_bytes / auto_decode_ms`.
-    pub auto_decode_gib_s: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_decode_gib_s: Option<f64>,
     /// `decoded_bytes / best_decode_ms`.
     pub best_decode_gib_s: f64,
     /// Per-kernel timing rows.
@@ -340,6 +345,30 @@ pub struct GpuKernelResult {
     /// are done at figure-generation; this integer field is the provenance.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub decode_ns_iters: Vec<u64>,
+    /// Tokens owned by one warp-chunk for this launch.
+    #[serde(default)]
+    pub chunk_tokens: usize,
+    /// Threads in each launched block.
+    #[serde(default)]
+    pub block_threads: u32,
+    /// Host-to-device input bytes actually staged for this kernel layout,
+    /// including its offset table and layout-specific dictionary metadata.
+    #[serde(default)]
+    pub staged_input_bytes: u64,
+    /// Named controlled-comparison group, when this row belongs to one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comparison: Option<String>,
+    /// Dictionary ABI family inside the controlled comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub abi_family: Option<String>,
+    /// Compile-time launch-bound maximum threads, when declared for a
+    /// controlled comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_bounds_max_threads: Option<u32>,
+    /// Compile-time launch-bound minimum blocks/SM, when declared for a
+    /// controlled comparison.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub launch_bounds_min_blocks: Option<u32>,
     /// Whether this kernel was applicable to all chunks.
     pub applicable: bool,
     /// Whether this kernel's GPU bytes matched CPU bytes, if validation was requested.
@@ -354,12 +383,15 @@ pub struct GpuKernelResult {
 }
 
 /// Configuration for optional CUDA kernel-only OnPair decompression timing.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct GpuBenchmarkConfig {
     /// Timed iterations for each kernel variant.
     pub iterations: u64,
     /// Copy each kernel's raw output back and compare against CPU-decoded bytes.
     pub validate: bool,
+    /// Exact kernel names to run, in requested order. `tpt-matched` is a
+    /// shorthand for the controlled ten-variant comparison.
+    pub kernels: Option<Arc<[String]>>,
 }
 
 /// Load existing benchmark `.vortex` files, extract an OnPair column, and run
@@ -652,7 +684,15 @@ pub async fn run_column(
         {
             for &cb in chunk_bytes {
                 results.push(
-                    run_cell_fsst12(dataset_id, column, &sample, cb, out_root, gpu_config).await?,
+                    run_cell_fsst12(
+                        dataset_id,
+                        column,
+                        &sample,
+                        cb,
+                        out_root,
+                        gpu_config.clone(),
+                    )
+                    .await?,
                 );
             }
             return Ok(results);
@@ -673,7 +713,7 @@ pub async fn run_column(
                     cb,
                     file_target_bytes,
                     out_root,
-                    gpu_config,
+                    gpu_config.clone(),
                 )
                 .await?;
                 results.push(res);
@@ -1167,6 +1207,8 @@ struct GpuOnPairChunk {
     codes_offsets: vortex::array::buffer::BufferHandle,
     dict_padded: vortex::array::buffer::BufferHandle,
     dict_s8: vortex::array::buffer::BufferHandle,
+    dict_s8_hi: vortex::array::buffer::BufferHandle,
+    packed_lens: vortex::array::buffer::BufferHandle,
     dict_s4: vortex::array::buffer::BufferHandle,
     dict_const1: vortex::array::buffer::BufferHandle,
     dict_const2: vortex::array::buffer::BufferHandle,
@@ -1178,6 +1220,9 @@ struct GpuOnPairChunk {
     chunk_offsets_32: vortex::array::buffer::BufferHandle,
     chunk_offsets_64: vortex::array::buffer::BufferHandle,
     chunk_offsets_128: vortex::array::buffer::BufferHandle,
+    chunk_offsets_160: vortex::array::buffer::BufferHandle,
+    chunk_offsets_192: vortex::array::buffer::BufferHandle,
+    chunk_offsets_224: vortex::array::buffer::BufferHandle,
     chunk_offsets_256: vortex::array::buffer::BufferHandle,
     chunk_offsets_512: vortex::array::buffer::BufferHandle,
     chunk_offsets_1024: vortex::array::buffer::BufferHandle,
@@ -1212,6 +1257,9 @@ enum KernelLayout {
     /// (uint2), rare `len>8` high bytes from `dict_padded`. Shrinks the hot
     /// dict working set to raise L1 hit rate. Always applicable.
     SplitRead8,
+    /// Dense low/high 8-byte planes plus two four-bit `(length - 1)` values
+    /// per byte. This is Joe's packed dictionary ABI.
+    PackedSplit8,
     /// Standard grid; variable-stride length-bucket dict (stride 4/8/12/16).
     /// Requires the entries to be bucket-sorted, i.e. only valid under
     /// `ONPAIR_DICT_REORDER=lenbucket`.
@@ -1367,6 +1415,60 @@ const GPU_KERNELS: &[KernelVariant] = &[
         name: "onpair_shmem_4tpt_split8read_occ",
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_shmem_5tpt_split8read",
+        layout: KernelLayout::SplitRead8,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_shmem_6tpt_split8read",
+        layout: KernelLayout::SplitRead8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_shmem_7tpt_split8read",
+        layout: KernelLayout::SplitRead8,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_shmem_8tpt_split8read",
+        layout: KernelLayout::SplitRead8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_decompress",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_decompress_5tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_decompress_6tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_decompress_7tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_decompress_8tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
         block_warps: 8,
     },
     KernelVariant {
@@ -1605,6 +1707,20 @@ const GPU_KERNELS: &[KernelVariant] = &[
 ];
 
 #[cfg(feature = "cuda")]
+const TPT_MATCHED_KERNELS: &[&str] = &[
+    "onpair_shmem_4tpt_split8read_occ",
+    "onpair_shmem_5tpt_split8read",
+    "onpair_shmem_6tpt_split8read",
+    "onpair_shmem_7tpt_split8read",
+    "onpair_shmem_8tpt_split8read",
+    "onpair_decompress",
+    "onpair_decompress_5tpt",
+    "onpair_decompress_6tpt",
+    "onpair_decompress_7tpt",
+    "onpair_decompress_8tpt",
+];
+
+#[cfg(feature = "cuda")]
 /// Where a cell's decode inputs come from. The kernels are codec-agnostic, so this is the
 /// only place the codec is named on the GPU path.
 #[cfg(feature = "cuda")]
@@ -1663,7 +1779,7 @@ async fn run_gpu_kernel_bench(
     let decoded_bytes = chunks.iter().map(|c| c.decoded_bytes).sum::<u64>();
     let total_tokens = chunks.iter().map(|c| c.total_tokens as u64).sum::<u64>();
     let cc_major = device_cc_major(&setup_ctx);
-    let auto_kernel = pick_auto_kernel(&chunks, cc_major).to_string();
+    let selector_kernel = pick_auto_kernel(&chunks, cc_major).to_string();
     let frac_le8 = if total_tokens == 0 {
         0.0
     } else {
@@ -1714,15 +1830,34 @@ async fn run_gpu_kernel_bench(
         .sum();
     let h2d_gib_s = measure_h2d_gib_s(&mut setup_ctx).await.unwrap_or(0.0);
 
-    let mut kernels = Vec::with_capacity(GPU_KERNELS.len());
+    let variants = select_gpu_kernels(config.kernels.as_deref())?;
+    let explicit_selection = config.kernels.is_some();
+    let is_matched_tpt_comparison = variants.len() == TPT_MATCHED_KERNELS.len()
+        && variants
+            .iter()
+            .all(|variant| TPT_MATCHED_KERNELS.contains(&variant.name));
+    anyhow::ensure!(
+        !is_matched_tpt_comparison || config.validate,
+        "the ten-variant TPT comparison requires --gpu-validate"
+    );
+    if std::env::var("ONPAIR_L2_PERSIST").is_ok()
+        && variants
+            .iter()
+            .any(|variant| matches!(variant.layout, KernelLayout::PackedSplit8))
+    {
+        anyhow::bail!(
+            "ONPAIR_L2_PERSIST has no fair packed-ABI treatment; disable it for this comparison"
+        );
+    }
+    let mut kernels = Vec::with_capacity(variants.len());
 
     // Fast mode (`ONPAIR_FAST=1`): skip the slow reference `onpair` kernel and the
     // bundled nvCOMP comparison so kernel-tuning sweeps iterate quickly. These are
     // the dominant wall-time costs and are irrelevant when comparing OnPair kernels.
     let fast = std::env::var("ONPAIR_FAST").is_ok_and(|v| v != "0");
 
-    for variant in GPU_KERNELS {
-        if fast && matches!(variant.layout, KernelLayout::Ref) {
+    for variant in &variants {
+        if !explicit_selection && fast && matches!(variant.layout, KernelLayout::Ref) {
             continue;
         }
         // Thread-block-cluster kernels need sm_90+; on older GPUs (e.g. A100 /
@@ -1730,11 +1865,22 @@ async fn run_gpu_kernel_bench(
         let cc_reason = (cc_major < 9 && matches!(variant.layout, KernelLayout::ClusterDsmem))
             .then(|| format!("thread-block clusters require sm_90+ (device cc {cc_major}.x)"));
         if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
+            if explicit_selection {
+                anyhow::bail!("requested GPU kernel {} is inapplicable: {reason}", variant.name);
+            }
+            let metadata = kernel_result_metadata(*variant, &chunks)?;
             kernels.push(GpuKernelResult {
                 kernel: variant.name.to_string(),
                 decode_ms: 0.0,
                 decode_gib_s: 0.0,
                 decode_ns_iters: Vec::new(),
+                chunk_tokens: variant.chunk_size,
+                block_threads: variant.block_warps * 32,
+                staged_input_bytes: metadata.staged_input_bytes,
+                comparison: metadata.comparison,
+                abi_family: metadata.abi_family,
+                launch_bounds_max_threads: metadata.launch_bounds_max_threads,
+                launch_bounds_min_blocks: metadata.launch_bounds_min_blocks,
                 applicable: false,
                 verified: None,
                 reason: Some(reason),
@@ -1751,6 +1897,7 @@ async fn run_gpu_kernel_bench(
         } else {
             None
         };
+        let metadata = kernel_result_metadata(*variant, &chunks)?;
         let decode_ns_iters = time_kernel_variant(*variant, &chunks, iterations)?;
         // Convenience scalar = the fastest pass (min ns -> ms). All other reductions
         // are recoverable from `decode_ns_iters` at figure-generation.
@@ -1761,6 +1908,13 @@ async fn run_gpu_kernel_bench(
             decode_ms,
             decode_gib_s: gib_s(decoded_bytes, decode_ms),
             decode_ns_iters,
+            chunk_tokens: variant.chunk_size,
+            block_threads: variant.block_warps * 32,
+            staged_input_bytes: metadata.staged_input_bytes,
+            comparison: metadata.comparison,
+            abi_family: metadata.abi_family,
+            launch_bounds_max_threads: metadata.launch_bounds_max_threads,
+            launch_bounds_min_blocks: metadata.launch_bounds_min_blocks,
             applicable: true,
             verified,
             reason: None,
@@ -1770,8 +1924,10 @@ async fn run_gpu_kernel_bench(
 
     let auto = kernels
         .iter()
-        .find(|r| r.kernel == auto_kernel && r.applicable)
-        .with_context(|| format!("auto kernel {auto_kernel} was not timed"))?;
+        .find(|r| r.kernel == selector_kernel && r.applicable);
+    if !explicit_selection && auto.is_none() {
+        anyhow::bail!("auto kernel {selector_kernel} was not timed");
+    }
     let best = kernels
         .iter()
         // Exclude the non-byte-exact `*ablate*` instrumentation builds unconditionally
@@ -1800,7 +1956,7 @@ async fn run_gpu_kernel_bench(
     } else {
         0.0
     };
-    let whole_decompress_gib_s = gib_s(decoded_bytes, h2d_ms + auto.decode_ms);
+    let whole_decompress_gib_s = auto.map(|row| gib_s(decoded_bytes, h2d_ms + row.decode_ms));
     let (nvcomp_zstd_hw, nvcomp_zstd) = if fast || nvcomp_source.is_none() {
         (None, Vec::new())
     } else {
@@ -1866,7 +2022,7 @@ async fn run_gpu_kernel_bench(
         decoded_bytes,
         chunks: chunks.len(),
         total_tokens,
-        auto_kernel,
+        auto_kernel: auto.map(|_| selector_kernel),
         frac_le8,
         dict_mean_len,
         dict_max_len,
@@ -1878,7 +2034,7 @@ async fn run_gpu_kernel_bench(
         h2d_gib_s,
         whole_decompress_gib_s,
         best_kernel: best.kernel.clone(),
-        auto_decode_ms: auto.decode_ms,
+        auto_decode_ms: auto.map(|row| row.decode_ms),
         best_decode_ms: best.decode_ms,
         validated: config.validate,
         verified: config.validate.then(|| {
@@ -1893,7 +2049,7 @@ async fn run_gpu_kernel_bench(
             // An empty set must not verify vacuously.
             judged.peek().is_some() && judged.all(|r| r.verified == Some(true))
         }),
-        auto_decode_gib_s: auto.decode_gib_s,
+        auto_decode_gib_s: auto.map(|row| row.decode_gib_s),
         best_decode_gib_s: best.decode_gib_s,
         kernels,
         nvcomp_zstd_hw,
@@ -1904,6 +2060,155 @@ async fn run_gpu_kernel_bench(
 #[cfg(feature = "cuda")]
 fn is_timing_only_ablation(kernel: &str) -> bool {
     kernel.contains("_ablate_no") || kernel.ends_with("_ablate_cfree")
+}
+
+#[cfg(feature = "cuda")]
+fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>> {
+    let Some(requested) = requested else {
+        return Ok(GPU_KERNELS.to_vec());
+    };
+    anyhow::ensure!(!requested.is_empty(), "--gpu-kernels must not be empty");
+
+    let expanded: Vec<&str> = if requested == ["tpt-matched"] {
+        TPT_MATCHED_KERNELS.to_vec()
+    } else {
+        anyhow::ensure!(
+            !requested.iter().any(|name| name == "tpt-matched"),
+            "the tpt-matched preset cannot be combined with individual kernel names"
+        );
+        requested.iter().map(String::as_str).collect()
+    };
+
+    let mut selected = Vec::with_capacity(expanded.len());
+    for name in expanded {
+        anyhow::ensure!(
+            !selected.iter().any(|variant: &KernelVariant| variant.name == name),
+            "duplicate GPU kernel {name:?}"
+        );
+        let variant = GPU_KERNELS
+            .iter()
+            .find(|variant| variant.name == name)
+            .copied()
+            .with_context(|| format!("unknown GPU kernel {name:?}"))?;
+        selected.push(variant);
+    }
+    Ok(selected)
+}
+
+#[cfg(feature = "cuda")]
+struct KernelResultMetadata {
+    staged_input_bytes: u64,
+    comparison: Option<String>,
+    abi_family: Option<String>,
+    launch_bounds_max_threads: Option<u32>,
+    launch_bounds_min_blocks: Option<u32>,
+}
+
+#[cfg(feature = "cuda")]
+fn kernel_result_metadata(
+    variant: KernelVariant,
+    chunks: &[GpuOnPairChunk],
+) -> Result<KernelResultMetadata> {
+    let staged_input_bytes = chunks.iter().try_fold(0u64, |total, chunk| {
+        let bytes = match variant.layout {
+            KernelLayout::Ref => {
+                chunk.codes.len()
+                    + chunk.codes_offsets.len()
+                    + chunk.dict_table.len()
+                    + chunk.dict_bytes.len()
+                    + chunk.output_offsets.len()
+                    + chunk.validity.len()
+            }
+            KernelLayout::Stride16 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_padded.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::Stride8 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_s8.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::Stride4 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_s4.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::Const1 => chunk.codes.len() + chunk.dict_const1.len(),
+            KernelLayout::Const2 => chunk.codes.len() + chunk.dict_const2.len(),
+            KernelLayout::PersistDict16
+            | KernelLayout::RegCache
+            | KernelLayout::ClusterDsmem => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_padded.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::PersistVDict => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_table.len()
+                    + chunk.dict_bytes.len()
+            }
+            KernelLayout::SplitRead8 | KernelLayout::ShDict8 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_s8.len()
+                    + chunk.dict_padded.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::PackedSplit8 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_s8.len()
+                    + chunk.dict_s8_hi.len()
+                    + chunk.packed_lens.len()
+            }
+            KernelLayout::LenBucket => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_lenbucket.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::SplitRead4 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_s4.len()
+                    + chunk.dict_padded.len()
+                    + chunk.lens.len()
+            }
+            KernelLayout::VWidth => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_off32.len()
+                    + chunk.dict_bytes.len()
+            }
+            KernelLayout::VWidth4 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_q4_dir.len()
+                    + chunk.dict_q4.len()
+            }
+        };
+        Ok::<_, anyhow::Error>(total + bytes as u64)
+    })?;
+
+    let in_comparison = TPT_MATCHED_KERNELS.contains(&variant.name);
+    let abi_family = in_comparison.then(|| match variant.layout {
+        KernelLayout::SplitRead8 => "split8read".to_string(),
+        KernelLayout::PackedSplit8 => "packed".to_string(),
+        _ => unreachable!("TPT comparison contains only split layouts"),
+    });
+    Ok(KernelResultMetadata {
+        staged_input_bytes,
+        comparison: in_comparison.then(|| "tpt-matched".to_string()),
+        abi_family,
+        launch_bounds_max_threads: in_comparison.then_some(256),
+        launch_bounds_min_blocks: in_comparison.then_some(4),
+    })
 }
 
 /// Decode-side dict relabeling for cache-layout experiments. Env-gated; a code
@@ -2373,6 +2678,68 @@ async fn onpair_decode_inputs(
 }
 
 #[cfg(feature = "cuda")]
+fn build_packed_split8_dictionary(
+    codes: &[u16],
+    dict_padded: &[u8],
+    lens: &[u8],
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>)> {
+    const PLANE_STRIDE: usize = 8;
+    let dict_bytes = lens.len() * vortex_onpair::MAX_TOKEN_SIZE;
+    anyhow::ensure!(
+        dict_padded.len() >= dict_bytes,
+        "padded dictionary has {} bytes for {} entries (need at least {dict_bytes})",
+        dict_padded.len(),
+        lens.len()
+    );
+
+    let mut referenced = vec![false; lens.len()];
+    for (position, &code) in codes.iter().enumerate() {
+        let entry = referenced.get_mut(usize::from(code)).with_context(|| {
+            format!(
+                "code {code} at stream position {position} is outside dictionary of {} entries",
+                lens.len()
+            )
+        })?;
+        *entry = true;
+    }
+
+    let mut lo = vec![0u8; lens.len() * PLANE_STRIDE + vortex_onpair::MAX_TOKEN_SIZE];
+    let mut hi = vec![0u8; lens.len() * PLANE_STRIDE + vortex_onpair::MAX_TOKEN_SIZE];
+    let mut packed_lens = vec![0u8; lens.len().div_ceil(2)];
+    for (entry, &len) in lens.iter().enumerate() {
+        anyhow::ensure!(
+            len <= vortex_onpair::MAX_TOKEN_SIZE as u8,
+            "dictionary entry {entry} has invalid length {len}; expected 1..={}",
+            vortex_onpair::MAX_TOKEN_SIZE
+        );
+        anyhow::ensure!(
+            len != 0 || !referenced[entry],
+            "referenced dictionary entry {entry} has zero length"
+        );
+
+        // FSST-12 deliberately leaves untrained code-space entries at length
+        // zero. They cannot occur in `codes`; encode their unused nibble as
+        // zero (decoded length one) while rejecting zero for every reference.
+        let encoded_len = len.saturating_sub(1);
+        let shift = (entry & 1) * 4;
+        packed_lens[entry / 2] |= encoded_len << shift;
+
+        if len == 0 {
+            continue;
+        }
+        let src = entry * vortex_onpair::MAX_TOKEN_SIZE;
+        let low_len = usize::from(len).min(PLANE_STRIDE);
+        lo[entry * PLANE_STRIDE..entry * PLANE_STRIDE + low_len]
+            .copy_from_slice(&dict_padded[src..src + low_len]);
+        let high_len = usize::from(len).saturating_sub(PLANE_STRIDE);
+        hi[entry * PLANE_STRIDE..entry * PLANE_STRIDE + high_len].copy_from_slice(
+            &dict_padded[src + PLANE_STRIDE..src + PLANE_STRIDE + high_len],
+        );
+    }
+    Ok((lo, hi, packed_lens))
+}
+
+#[cfg(feature = "cuda")]
 async fn stage_gpu_chunk(
     inputs: DecodeInputs,
     ctx: &mut CudaExecutionCtx,
@@ -2607,14 +2974,13 @@ async fn stage_gpu_chunk(
     // ..]` zeroes the whole allocation, so the pad bytes are already zero; the
     // copy loop below only writes the first `lens_table.len()` entries (indexed
     // per entry), never the pad.
-    let mut dict_s8 = vec![0u8; lens_table.len() * 8 + vortex_onpair::MAX_TOKEN_SIZE];
+    let (dict_s8, dict_s8_hi, packed_lens) =
+        build_packed_split8_dictionary(&codes_u16, &dict_padded, &lens_table)?;
     let mut dict_s4 = vec![0u8; lens_table.len() * 4 + vortex_onpair::MAX_TOKEN_SIZE];
     let mut dict_const1 = vec![0u8; lens_table.len()];
     let mut dict_const2 = vec![0u8; lens_table.len() * 2];
     for (i, len) in lens_table.iter().copied().enumerate() {
         let src = i * vortex_onpair::MAX_TOKEN_SIZE;
-        let n8 = usize::from(len).min(8);
-        dict_s8[i * 8..i * 8 + n8].copy_from_slice(&dict_padded[src..src + n8]);
         let n4 = usize::from(len).min(4);
         dict_s4[i * 4..i * 4 + n4].copy_from_slice(&dict_padded[src..src + n4]);
         if len >= 1 {
@@ -2668,6 +3034,9 @@ async fn stage_gpu_chunk(
     let chunk_offsets_32 = chunk_offsets(&codes_u16, &lens_table, 32, decoded_bytes);
     let chunk_offsets_64 = chunk_offsets(&codes_u16, &lens_table, 64, decoded_bytes);
     let chunk_offsets_128 = chunk_offsets(&codes_u16, &lens_table, 128, decoded_bytes);
+    let chunk_offsets_160 = chunk_offsets(&codes_u16, &lens_table, 160, decoded_bytes);
+    let chunk_offsets_192 = chunk_offsets(&codes_u16, &lens_table, 192, decoded_bytes);
+    let chunk_offsets_224 = chunk_offsets(&codes_u16, &lens_table, 224, decoded_bytes);
     let chunk_offsets_256 = chunk_offsets(&codes_u16, &lens_table, 256, decoded_bytes);
     let chunk_offsets_512 = chunk_offsets(&codes_u16, &lens_table, 512, decoded_bytes);
     let chunk_offsets_1024 = chunk_offsets(&codes_u16, &lens_table, 1024, decoded_bytes);
@@ -2686,6 +3055,8 @@ async fn stage_gpu_chunk(
             .await?,
         dict_padded: ctx.copy_to_device::<u8, _>(dict_padded)?.await?,
         dict_s8: ctx.copy_to_device::<u8, _>(dict_s8)?.await?,
+        dict_s8_hi: ctx.copy_to_device::<u8, _>(dict_s8_hi)?.await?,
+        packed_lens: ctx.copy_to_device::<u8, _>(packed_lens)?.await?,
         dict_s4: ctx.copy_to_device::<u8, _>(dict_s4)?.await?,
         dict_const1: ctx.copy_to_device::<u8, _>(dict_const1)?.await?,
         dict_const2: ctx.copy_to_device::<u8, _>(dict_const2)?.await?,
@@ -2697,6 +3068,9 @@ async fn stage_gpu_chunk(
         chunk_offsets_32: ctx.copy_to_device::<u64, _>(chunk_offsets_32)?.await?,
         chunk_offsets_64: ctx.copy_to_device::<u64, _>(chunk_offsets_64)?.await?,
         chunk_offsets_128: ctx.copy_to_device::<u64, _>(chunk_offsets_128)?.await?,
+        chunk_offsets_160: ctx.copy_to_device::<u64, _>(chunk_offsets_160)?.await?,
+        chunk_offsets_192: ctx.copy_to_device::<u64, _>(chunk_offsets_192)?.await?,
+        chunk_offsets_224: ctx.copy_to_device::<u64, _>(chunk_offsets_224)?.await?,
         chunk_offsets_256: ctx.copy_to_device::<u64, _>(chunk_offsets_256)?.await?,
         chunk_offsets_512: ctx.copy_to_device::<u64, _>(chunk_offsets_512)?.await?,
         chunk_offsets_1024: ctx.copy_to_device::<u64, _>(chunk_offsets_1024)?.await?,
@@ -2942,6 +3316,7 @@ fn inapplicable_reason(variant: KernelVariant, chunks: &[GpuOnPairChunk]) -> Opt
         KernelLayout::Ref
         | KernelLayout::Stride16
         | KernelLayout::SplitRead8
+        | KernelLayout::PackedSplit8
         | KernelLayout::SplitRead4
         | KernelLayout::RegCache => None,
         KernelLayout::Stride8 => chunks
@@ -3196,6 +3571,10 @@ fn time_kernel_variant(
     // output cannot evict it. Targets the gather bottleneck on large (bits16)
     // dicts. Single-chunk benchmarks only (window covers chunks[0]'s dict).
     if std::env::var("ONPAIR_L2_PERSIST").is_ok() {
+        anyhow::ensure!(
+            !matches!(variant.layout, KernelLayout::PackedSplit8),
+            "ONPAIR_L2_PERSIST has no defined packed-ABI treatment"
+        );
         if let Some(c) = chunks.first() {
             let (dict, dict_len) = match variant.layout {
                 KernelLayout::SplitRead8 => (&c.dict_s8, c.dict_s8.len()),
@@ -3446,6 +3825,22 @@ fn launch_variant(
                     .arg(&total_tokens);
             })?;
         }
+        KernelLayout::PackedSplit8 => {
+            let dict_s8_lo = chunk.dict_s8.cuda_view::<u8>()?;
+            let dict_s8_hi = chunk.dict_s8_hi.cuda_view::<u8>()?;
+            let packed_lens = chunk.packed_lens.cuda_view::<u8>()?;
+            let chunk_offsets = chunk_offsets_for_variant(chunk, variant.chunk_size)?;
+            let cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
+            ctx.launch_kernel_config(function, cfg, chunk.total_tokens, |args| {
+                args.arg(&codes)
+                    .arg(&chunk_offsets)
+                    .arg(&dict_s8_lo)
+                    .arg(&dict_s8_hi)
+                    .arg(&packed_lens)
+                    .arg(&output)
+                    .arg(&total_tokens);
+            })?;
+        }
         KernelLayout::RegCache => {
             let dict_padded = chunk.dict_padded.cuda_view::<u8>()?;
             let lens = chunk.lens.cuda_view::<u8>()?;
@@ -3689,9 +4084,28 @@ fn chunk_offsets_for_variant(
         32 => Ok(chunk.chunk_offsets_32.cuda_view::<u64>()?),
         64 => Ok(chunk.chunk_offsets_64.cuda_view::<u64>()?),
         128 => Ok(chunk.chunk_offsets_128.cuda_view::<u64>()?),
+        160 => Ok(chunk.chunk_offsets_160.cuda_view::<u64>()?),
+        192 => Ok(chunk.chunk_offsets_192.cuda_view::<u64>()?),
+        224 => Ok(chunk.chunk_offsets_224.cuda_view::<u64>()?),
         256 => Ok(chunk.chunk_offsets_256.cuda_view::<u64>()?),
         512 => Ok(chunk.chunk_offsets_512.cuda_view::<u64>()?),
         1024 => Ok(chunk.chunk_offsets_1024.cuda_view::<u64>()?),
+        _ => anyhow::bail!("unsupported OnPair chunk size {chunk_size}"),
+    }
+}
+
+#[cfg(feature = "cuda")]
+fn chunk_offsets_len(chunk: &GpuOnPairChunk, chunk_size: usize) -> Result<usize> {
+    match chunk_size {
+        32 => Ok(chunk.chunk_offsets_32.len()),
+        64 => Ok(chunk.chunk_offsets_64.len()),
+        128 => Ok(chunk.chunk_offsets_128.len()),
+        160 => Ok(chunk.chunk_offsets_160.len()),
+        192 => Ok(chunk.chunk_offsets_192.len()),
+        224 => Ok(chunk.chunk_offsets_224.len()),
+        256 => Ok(chunk.chunk_offsets_256.len()),
+        512 => Ok(chunk.chunk_offsets_512.len()),
+        1024 => Ok(chunk.chunk_offsets_1024.len()),
         _ => anyhow::bail!("unsupported OnPair chunk size {chunk_size}"),
     }
 }
@@ -3903,6 +4317,84 @@ mod tests {
         // Tiny budget would ask for more chunks than rows.
         let r = chunk_ranges(3, 1000, 1);
         assert_eq!(r.len(), 3);
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn packed_split8_planes_and_odd_length_table() -> Result<()> {
+        let lens = vec![1, 8, 9, 16, 3];
+        let codes = vec![0, 1, 2, 3, 4];
+        let mut padded = vec![0u8; lens.len() * 16 + 16];
+        for entry in 0..lens.len() {
+            for byte in 0..16 {
+                padded[entry * 16 + byte] = (entry * 16 + byte) as u8;
+            }
+        }
+
+        let (lo, hi, packed_lens) =
+            build_packed_split8_dictionary(&codes, &padded, &lens)?;
+        assert_eq!(packed_lens, [0x70, 0xf8, 0x02]);
+        for (entry, &len) in lens.iter().enumerate() {
+            let low_len = usize::from(len).min(8);
+            assert_eq!(
+                &lo[entry * 8..entry * 8 + low_len],
+                &padded[entry * 16..entry * 16 + low_len]
+            );
+            let high_len = usize::from(len).saturating_sub(8);
+            assert_eq!(
+                &hi[entry * 8..entry * 8 + high_len],
+                &padded[entry * 16 + 8..entry * 16 + 8 + high_len]
+            );
+        }
+
+        let mut lens_with_untrained = lens;
+        lens_with_untrained.push(0);
+        let mut padded_with_untrained = padded;
+        padded_with_untrained.resize(lens_with_untrained.len() * 16 + 16, 0);
+        build_packed_split8_dictionary(&codes, &padded_with_untrained, &lens_with_untrained)?;
+        assert!(build_packed_split8_dictionary(&[5], &padded_with_untrained, &lens_with_untrained)
+            .is_err());
+        Ok(())
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn matched_tpt_offsets_cover_partial_max_length_chunks() {
+        for chunk_size in [128, 160, 192, 224, 256] {
+            let codes = vec![0u16; chunk_size + 3];
+            let expected_total = (codes.len() * 16) as u64;
+            assert_eq!(
+                chunk_offsets(&codes, &[16], chunk_size, expected_total),
+                vec![0, (chunk_size * 16) as u64, expected_total]
+            );
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn gpu_kernel_allowlist_is_exact_and_ordered() -> Result<()> {
+        let requested = vec![
+            "onpair_decompress_6tpt".to_string(),
+            "onpair_shmem_6tpt_split8read".to_string(),
+        ];
+        let selected = select_gpu_kernels(Some(&requested))?;
+        assert_eq!(
+            selected.iter().map(|variant| variant.name).collect::<Vec<_>>(),
+            requested
+        );
+
+        let preset = select_gpu_kernels(Some(&["tpt-matched".to_string()]))?;
+        assert_eq!(
+            preset.iter().map(|variant| variant.name).collect::<Vec<_>>(),
+            TPT_MATCHED_KERNELS
+        );
+        assert!(select_gpu_kernels(Some(&["missing".to_string()])).is_err());
+        assert!(select_gpu_kernels(Some(&[
+            "onpair_decompress".to_string(),
+            "onpair_decompress".to_string(),
+        ]))
+        .is_err());
+        Ok(())
     }
 }
 

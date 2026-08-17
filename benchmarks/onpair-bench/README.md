@@ -5,8 +5,8 @@ SPDX-FileCopyrightText: Copyright the Vortex contributors
 
 > **Frozen experimental harness.** This commit is the pinned snapshot of the benchmark harness
 > behind the paper *"FastPair: Towards Architecture-Optimal String Decompression."* The GPU decode
-> kernels here are **byte-identical** to the revision lineage that produced the paper's committed
-> results, so a fresh run reproduces the published throughput. The committed raw results, the figure
+> shipped kernel symbols here preserve the revision lineage that produced the paper's committed
+> results. The committed raw results, the figure
 > generators, and a hardware-free `make verify` live in the **FastPair reproducibility-artifacts**
 > repository; this branch is what regenerates that raw data on a GPU box.
 
@@ -44,13 +44,26 @@ python benchmarks/onpair-bench/run.py --gpu-decode --gpu-validate --gpu-iters 10
 ```
 
 `--gpu-decode` builds with `--features cuda` and times every applicable kernel; `--gpu-validate`
-copies each kernel's output back and byte-compares it against the CPU decode (failing kernels are
-excluded). The best **shipped** kernel per cell (the `*ablate*` instrumentation builds are always
+copies each byte-exact kernel's output back and compares it against the CPU decode. A mismatch aborts
+the cell without emitting timings. The best **shipped** kernel per cell (the `*ablate*` instrumentation builds are always
 excluded from "best") is what the paper reports. Results land in
 `vortex-bench/data/onpair-bench/summary.json` (full per-kernel breakdown, with raw per-iteration
 timings reduced to the min — the microbenchmark convention).
 
 > The paper uses **100** iterations (`--gpu-iters 100`); the default is 10 for quick smoke runs.
+
+For the controlled `{split8read, packed} × {4,5,6,7,8}` comparison, run only the matched
+256-thread, `__launch_bounds__(256,4)` variants:
+
+```bash
+python benchmarks/onpair-bench/run.py --gpu-decode --gpu-validate --gpu-iters 100 \
+    --gpu-kernels tpt-matched --chunk-mb 1000
+```
+
+The preset preserves a fixed order, rejects partial/inapplicable selections, and emits `chunk_tokens`,
+`block_threads`, launch bounds, ABI family, and layout-specific `staged_input_bytes` on every row.
+The original shipped `onpair_shmem_4tpt_split8read` remains separately registered at its 512-thread
+launch geometry and is not part of this controlled preset.
 
 ### 2. Hardware Decompression Engine baseline (Blackwell)
 
@@ -163,9 +176,9 @@ the corpora.
 - **libclang not found** → `export LIBCLANG_PATH=$(llvm-config --libdir)`.
 - **`sccache: Operation not permitted`** (if sccache is globally configured) → `export RUSTC_WRAPPER=`.
 - **A newer host compiler** can trip the kernels' `-Werror`; install a matching GCC/Clang or relax it.
-- **A column was skipped** — `run.py` streams the Amazon corpora from HuggingFace automatically (set
-  `HF_TOKEN` to avoid throttling); any dataset whose source can't be fetched is skipped with a stderr
-  note and the run completes on the rest. Use `--datasets`/`--columns` to scope a run.
+- **A column is unavailable** — `run.py` streams the Amazon corpora from HuggingFace automatically
+  (set `HF_TOKEN` to avoid throttling). Missing requested inputs fail the campaign by default; use
+  `--allow-missing-inputs` only when a deliberately partial exploratory run is acceptable.
 
 ## Did it work?
 

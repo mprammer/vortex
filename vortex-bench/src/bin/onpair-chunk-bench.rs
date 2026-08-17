@@ -112,6 +112,10 @@ enum Command {
         /// Copy GPU output bytes back and compare every applicable kernel against CPU decode.
         #[arg(long)]
         gpu_validate: bool,
+        /// Exact CUDA kernel allowlist, comma-separated. Preserves order and rejects
+        /// duplicates/unknown names. Use `tpt-matched` for the controlled ten-way comparison.
+        #[arg(long, value_delimiter = ',')]
+        gpu_kernels: Option<Vec<String>>,
         /// Stored codec: `onpair` (default) or `fsst12`. FSST-12 is a 12-bit codec, so
         /// --bits and --threshold do not apply to it and are ignored.
         #[arg(long, default_value = "onpair")]
@@ -131,6 +135,10 @@ enum Command {
         /// Copy GPU output bytes back and compare every applicable kernel against CPU decode.
         #[arg(long)]
         gpu_validate: bool,
+        /// Exact CUDA kernel allowlist, comma-separated; `tpt-matched` selects the
+        /// controlled ten-way comparison.
+        #[arg(long, value_delimiter = ',')]
+        gpu_kernels: Option<Vec<String>>,
     },
 }
 
@@ -165,6 +173,7 @@ async fn main() -> Result<()> {
             gpu_decode,
             gpu_iters,
             gpu_validate,
+            gpu_kernels,
             codec,
         } => {
             let results = run_column(
@@ -180,6 +189,7 @@ async fn main() -> Result<()> {
                 gpu_decode.then_some(GpuBenchmarkConfig {
                     iterations: gpu_iters,
                     validate: gpu_validate,
+                    kernels: gpu_kernels.map(Into::into),
                 }),
                 &codec,
             )
@@ -191,6 +201,7 @@ async fn main() -> Result<()> {
             column,
             gpu_iters,
             gpu_validate,
+            gpu_kernels,
         } => {
             let files = collect_vortex_files(&vortex)?;
             let result = run_vortex_gpu_decode(
@@ -199,6 +210,7 @@ async fn main() -> Result<()> {
                 GpuBenchmarkConfig {
                     iterations: gpu_iters,
                     validate: gpu_validate,
+                    kernels: gpu_kernels.map(Into::into),
                 },
             )
             .await?;
