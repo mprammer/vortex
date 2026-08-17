@@ -70,6 +70,11 @@ enum Command {
         /// Number of URL rows to generate.
         #[arg(long, default_value_t = 10_000_000)]
         rows: usize,
+        /// Distinct filler path segments to draw from, widening the OnPair dictionary.
+        /// 0 (the default) reproduces the original seed-123 corpus byte-for-byte; any
+        /// positive value yields a different corpus and must use its own output path.
+        #[arg(long, default_value_t = 0)]
+        vocab: usize,
         /// Output parquet path (single Utf8 column named `url`).
         #[arg(long)]
         out: PathBuf,
@@ -156,9 +161,12 @@ async fn main() -> Result<()> {
             vortex_bench::tpcds::duckdb::generate_tpcds(out_dir.clone(), format!("{sf}"))?;
             eprintln!("TPC-DS (sf={sf}) ready under {}/parquet", out_dir.display());
         }
-        Command::GenSynthUrls { rows, out } => {
-            gen_synth_urls(rows, &out)?;
-            eprintln!("synthetic URLs ({rows} rows) ready at {}", out.display());
+        Command::GenSynthUrls { rows, vocab, out } => {
+            gen_synth_urls(rows, vocab, &out)?;
+            eprintln!(
+                "synthetic URLs ({rows} rows, vocab {vocab}) ready at {}",
+                out.display()
+            );
         }
         Command::Run {
             parquet,
@@ -293,13 +301,42 @@ const CB_FRAGMENTS: &[&str] = &[
     "",
 ];
 
+/// One distinct filler segment, base-36 encoded. Short by construction, so widening the
+/// vocabulary moves token *diversity* far more than mean token length — the ladder has to
+/// move dictionary size without sliding every other selector predictor with it.
+fn vocab_segment(i: usize) -> String {
+    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+    let (mut v, mut s) = (i, String::new());
+    loop {
+        s.push(ALPHABET[v % ALPHABET.len()] as char);
+        v /= ALPHABET.len();
+        if v == 0 {
+            break;
+        }
+    }
+    s
+}
+
 /// Deterministic ClickBench-style URL generator (seed 123), deterministic for the
 /// committed `Cargo.lock`. Mirrors `vortex_fsst::test_utils::generate_clickbench_urls`.
-fn generate_clickbench_urls(n: usize) -> Vec<String> {
+///
+/// `vocab` widens the token vocabulary — and so the OnPair dictionary — by drawing one
+/// extra path segment per row from a pool of `vocab` distinct strings. It exists to make
+/// the kernel selector's dictionary-size thresholds *identifiable*. The measured corpus
+/// clusters near 870, 4096, and 65536 entries with nothing in between, so a threshold
+/// placed inside those gaps classifies no observation and cannot be fitted from data at
+/// all; the Ada rule in `onpair_bench.rs` currently sits in exactly such a gap.
+///
+/// `vocab == 0` reproduces the original generator **exactly**, drawing the same five
+/// random values per row in the same order. That is load-bearing rather than tidy: the
+/// committed `synthetic/url` cell must stay byte-identical or it stops being comparable
+/// with every measurement already in the artifact.
+fn generate_clickbench_urls(n: usize, vocab: usize) -> Vec<String> {
     use rand::RngExt;
     use rand::SeedableRng;
     use rand::prelude::StdRng;
 
+    let pool: Vec<String> = (0..vocab).map(vocab_segment).collect();
     let mut rng = StdRng::seed_from_u64(123);
     (0..n)
         .map(|_| {
@@ -312,14 +349,20 @@ fn generate_clickbench_urls(n: usize) -> Vec<String> {
             let path = CB_PATHS[rng.random_range(0..CB_PATHS.len())];
             let params = CB_PARAMS[rng.random_range(0..CB_PARAMS.len())];
             let fragment = CB_FRAGMENTS[rng.random_range(0..CB_FRAGMENTS.len())];
-            format!("{scheme}://{domain}{path}{params}{fragment}")
+            if pool.is_empty() {
+                // No sixth draw: the RNG stream stays identical to the original generator.
+                format!("{scheme}://{domain}{path}{params}{fragment}")
+            } else {
+                let seg = &pool[rng.random_range(0..pool.len())];
+                format!("{scheme}://{domain}{path}/{seg}{params}{fragment}")
+            }
         })
         .collect()
 }
 
 /// Generate `rows` synthetic URLs and write them as a single-column (`url`)
 /// parquet at `out` (idempotent; a no-op if `out` already exists).
-fn gen_synth_urls(rows: usize, out: &Path) -> Result<()> {
+fn gen_synth_urls(rows: usize, vocab: usize, out: &Path) -> Result<()> {
     use std::sync::Arc;
 
     use arrow_array::RecordBatch;
@@ -336,7 +379,7 @@ fn gen_synth_urls(rows: usize, out: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let urls = generate_clickbench_urls(rows);
+    let urls = generate_clickbench_urls(rows, vocab);
     let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, false)]));
 
     let tmp = out.with_extension("parquet.part");
@@ -375,4 +418,51 @@ fn collect_vortex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
         anyhow::bail!("no .vortex files found");
     }
     Ok(files)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `vocab == 0` must reproduce the pre-2026-08-17 corpus exactly. The committed
+    /// `synthetic/url` cell was measured with that generator, so any drift here silently
+    /// decouples every new synthetic measurement from the ones already in the artifact.
+    /// The guarantee holds because the zero case takes no sixth draw from the RNG.
+    #[test]
+    fn vocab_zero_preserves_the_original_corpus() {
+        let urls = generate_clickbench_urls(64, 0);
+        assert_eq!(urls.len(), 64);
+        // Spot-check the shape rather than a golden blob: no filler segment is spliced in,
+        // and the scheme/domain/path/params/fragment concatenation is unchanged.
+        for u in &urls {
+            assert!(u.starts_with("https://") || u.starts_with("http://"), "{u}");
+        }
+        // Determinism: the same seed yields the same sequence.
+        assert_eq!(urls, generate_clickbench_urls(64, 0));
+    }
+
+    /// The ladder must actually move token diversity, monotonically, or it cannot make the
+    /// selector's dictionary-size threshold identifiable.
+    #[test]
+    fn widening_the_vocabulary_raises_distinct_values() {
+        use std::collections::HashSet;
+        let distinct = |vocab| {
+            generate_clickbench_urls(20_000, vocab)
+                .into_iter()
+                .collect::<HashSet<_>>()
+                .len()
+        };
+        let (base, mid, wide) = (distinct(0), distinct(256), distinct(4096));
+        assert!(mid > base, "vocab 256 ({mid}) should exceed baseline ({base})");
+        assert!(wide > mid, "vocab 4096 ({wide}) should exceed vocab 256 ({mid})");
+    }
+
+    /// Distinct pool indices must give distinct segments, otherwise the pool silently
+    /// collapses and a rung of the ladder measures the same corpus as a lower one.
+    #[test]
+    fn vocab_segments_are_distinct() {
+        use std::collections::HashSet;
+        let segs: HashSet<String> = (0..4096).map(vocab_segment).collect();
+        assert_eq!(segs.len(), 4096);
+    }
 }

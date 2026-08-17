@@ -745,9 +745,11 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
         # no external source. Idempotent on the Rust side.
         cache = col.cache_path()
         cache.parent.mkdir(parents=True, exist_ok=True)
-        print(f"==> generating synthetic URL corpus ({col.rows} rows)", file=sys.stderr)
+        print(f"==> generating synthetic URL corpus ({col.rows} rows, "
+              f"vocab {col.synth_vocab})", file=sys.stderr)
         subprocess.run(
-            [str(binary), "gen-synth-urls", "--rows", str(col.rows), "--out", str(cache)],
+            [str(binary), "gen-synth-urls", "--rows", str(col.rows),
+             "--vocab", str(col.synth_vocab), "--out", str(cache)],
             cwd=REPO_ROOT,
             check=True,
         )

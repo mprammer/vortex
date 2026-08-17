@@ -121,6 +121,9 @@ class Column:
     local: list[Path] = field(default_factory=list)
     # synthetic
     rows: int = 10_000_000  # row count for the `synthetic` generator
+    # synthetic: distinct filler path segments, widening the OnPair dictionary. 0 keeps the
+    # original seed-123 corpus byte-for-byte; positive values are the selector ladder.
+    synth_vocab: int = 0
     # amazon
     category: str | None = None  # HF Amazon-Reviews-2023 category, e.g. "Books"
     # parquet_stream / jsonl: every column of the dataset shares one cache file, so the
@@ -304,4 +307,16 @@ COLUMNS: list[Column] = [
     # (no external source). Column name `url` matches the paper's synthetic row.
     Column(dataset_id="synthetic", column="url", kind="synthetic",
            cache="synthetic_urls.parquet"),
+    # Dictionary-cardinality ladder. The measured corpus clusters near 870, 4096 and 65536
+    # dictionary entries with nothing in between, so any selector threshold placed inside
+    # those gaps classifies no observation and cannot be fitted -- the Ada rule's 2048 sits
+    # in exactly such a gap, which is why 1024 and 2048 score identically. These rungs put
+    # observations in the gap so the threshold becomes identifiable instead of asserted.
+    # Same generator, same seed, one extra path segment drawn from a pool of `synth_vocab`
+    # distinct strings; each rung gets its own cache because the corpora differ.
+    *(
+        Column(dataset_id=f"synthdict-{v}", column="url", kind="synthetic",
+               synth_vocab=v, cache=f"synthetic_urls_vocab{v}.parquet")
+        for v in (256, 1024, 2048, 3072, 6144, 16384)
+    ),
 ]
