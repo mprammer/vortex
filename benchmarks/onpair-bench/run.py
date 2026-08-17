@@ -25,20 +25,29 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import contextlib
+import http.client
 import io
 import json
 import os
+import random
+import re
 import shutil
 import subprocess
-
-# Columns whose bench process exited non-zero. Consulted by the final exit status so an
-# all-failed run cannot look like a clean run with an empty matrix.
-COLUMN_FAILURES: list[str] = []
 import sys
+import tempfile
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 from columns import AMAZON_URL, COLUMNS, DATA_DIR, REPO_ROOT, SRC_DIR, Column
+
+# Columns whose bench process exited non-zero. Consulted by the final exit status so an
+# all-failed run cannot look like a clean run with an empty matrix.
+COLUMN_FAILURES: list[str] = []
 
 OUT_ROOT = DATA_DIR / "onpair-bench"
 BIN = "onpair-chunk-bench"
@@ -178,24 +187,139 @@ def amazon_to_parquet(col: Column) -> Path:
 # column, so ~1.5 GB of extracted text leaves headroom without pulling whole shards.
 STREAM_CAP_BYTES = int(os.environ.get("STREAM_CAP_BYTES", 1_500_000_000))
 
+HTTP_TIMEOUT_SECONDS = float(os.environ.get("ONPAIR_HTTP_TIMEOUT_SECONDS", "60"))
+HTTP_MAX_ATTEMPTS = int(os.environ.get("ONPAIR_HTTP_MAX_ATTEMPTS", "4"))
+HTTP_RETRY_BASE_SECONDS = float(os.environ.get("ONPAIR_HTTP_RETRY_BASE_SECONDS", "0.5"))
+_RETRYABLE_HTTP_STATUS = frozenset({403, 408, 429, 500, 502, 503, 504})
+_CONTENT_RANGE_RE = re.compile(r"^bytes (\d+)-(\d+)/(\d+)$")
+
+
+def _origin(url: str) -> tuple[str, str | None, int | None]:
+    parsed = urllib.parse.urlsplit(url)
+    port = parsed.port
+    if port is None:
+        port = {"http": 80, "https": 443}.get(parsed.scheme.lower())
+    return parsed.scheme.lower(), parsed.hostname, port
+
+
+class _ScopedAuthorizationRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """Preserve ordinary headers across redirects, but never credentials cross-origin."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        redirected = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if redirected is not None and _origin(req.full_url) != _origin(newurl):
+            redirected.remove_header("Authorization")
+        return redirected
+
+
+_HTTP_OPENER = urllib.request.build_opener(_ScopedAuthorizationRedirectHandler())
+
+
+class _HttpProtocolError(OSError):
+    """A successful HTTP response violated the range-reader contract."""
+
+
+class _RetryableHttpReadError(OSError):
+    """A response ended before its declared body was available."""
+
+
+def _retry_delay(attempt: int) -> float:
+    ceiling = HTTP_RETRY_BASE_SECONDS * (2 ** attempt)
+    return random.uniform(ceiling / 2, ceiling)
+
+
+def _request_with_retry(
+    request: urllib.request.Request,
+    consume,
+    *,
+    opener=None,
+    sleep=time.sleep,
+    max_attempts: int = HTTP_MAX_ATTEMPTS,
+):
+    """Open and consume one request, retrying only transient transport/status failures."""
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least one")
+    open_request = opener or _HTTP_OPENER.open
+    for attempt in range(max_attempts):
+        try:
+            with open_request(request, timeout=HTTP_TIMEOUT_SECONDS) as response:
+                return consume(response)
+        except urllib.error.HTTPError as error:
+            error.close()
+            if error.code not in _RETRYABLE_HTTP_STATUS or attempt + 1 == max_attempts:
+                raise
+        except (
+            _RetryableHttpReadError,
+            urllib.error.URLError,
+            http.client.IncompleteRead,
+            ConnectionError,
+            TimeoutError,
+        ):
+            if attempt + 1 == max_attempts:
+                raise
+        sleep(_retry_delay(attempt))
+    raise AssertionError("retry loop exhausted without returning or raising")
+
 
 class _HttpRangeFile(io.RawIOBase):
     """Seekable read-only file over HTTP range requests.
 
     Exists so a multi-GB remote parquet can be read row group by row group: pyarrow
     seeks to the footer, then to the row groups it wants, and only those byte ranges
-    cross the network. Servers that ignore `Range` would silently return the whole
-    body, so the first request asserts a 206 rather than trusting the response."""
+    cross the network. Every request starts from the canonical URL so an expiring CDN
+    redirect can refresh, while a strong ETag pins all reads to the object inspected by
+    HEAD."""
 
-    def __init__(self, url: str, headers: dict[str, str] | None = None):
-        import urllib.request
+    def __init__(
+        self,
+        url: str,
+        headers: dict[str, str] | None = None,
+        *,
+        opener=None,
+        sleep=time.sleep,
+        max_attempts: int = HTTP_MAX_ATTEMPTS,
+    ):
         self._url, self._headers, self._pos = url, dict(headers or {}), 0
-        self._req = urllib.request
+        self._headers["Accept-Encoding"] = "identity"
+        self._opener = opener
+        self._sleep = sleep
+        self._max_attempts = max_attempts
+
+        def inspect_head(response):
+            if response.status != 200:
+                raise _HttpProtocolError(f"{url} HEAD returned status {response.status}, expected 200")
+            content_length = response.headers.get("Content-Length")
+            if content_length is None:
+                raise _HttpProtocolError(f"{url} HEAD omitted Content-Length")
+            try:
+                size = int(content_length)
+            except (TypeError, ValueError) as error:
+                raise _HttpProtocolError(
+                    f"{url} HEAD returned invalid Content-Length {content_length!r}"
+                ) from error
+            if size < 0:
+                raise _HttpProtocolError(f"{url} HEAD returned negative Content-Length {size}")
+            etag = response.headers.get("ETag")
+            if (
+                not etag
+                or etag.startswith("W/")
+                or not (etag.startswith('"') and etag.endswith('"'))
+            ):
+                raise _HttpProtocolError(f"{url} requires a strong ETag, got {etag!r}")
+            return size, etag
+
         head = urllib.request.Request(url, method="HEAD", headers=self._headers)
-        with urllib.request.urlopen(head) as r:
-            self._size = int(r.headers["Content-Length"])
-            # HEAD follows redirects; read subsequent ranges from where we landed.
-            self._url = r.geturl()
+        self._size, self._etag = _request_with_retry(
+            head,
+            inspect_head,
+            opener=self._opener,
+            sleep=self._sleep,
+            max_attempts=self._max_attempts,
+        )
+
+    @property
+    def source_metadata(self) -> dict[str, str | int]:
+        return {"url": self._url, "etag": self._etag, "content_length": self._size}
 
     def readable(self) -> bool:
         return True
@@ -207,28 +331,220 @@ class _HttpRangeFile(io.RawIOBase):
         return self._pos
 
     def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
-        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
-        self._pos = max(0, min(self._size, base + offset))
+        if whence == io.SEEK_SET:
+            base = 0
+        elif whence == io.SEEK_CUR:
+            base = self._pos
+        elif whence == io.SEEK_END:
+            base = self._size
+        else:
+            raise ValueError(f"invalid whence: {whence}")
+        position = base + offset
+        if position < 0:
+            raise ValueError(f"negative seek position: {position}")
+        self._pos = position
         return self._pos
 
     def readinto(self, b) -> int:
-        n = min(len(b), self._size - self._pos)
+        view = memoryview(b)
+        if view.readonly:
+            raise TypeError("readinto() argument must be writable")
+        try:
+            view = view.cast("B")
+        except TypeError as error:
+            raise TypeError("readinto() argument must be a contiguous buffer") from error
+        n = min(view.nbytes, max(0, self._size - self._pos))
         if n <= 0:
             return 0
+        start = self._pos
+        end = start + n - 1
         h = dict(self._headers)
-        h["Range"] = f"bytes={self._pos}-{self._pos + n - 1}"
-        with self._req.urlopen(self._req.Request(self._url, headers=h)) as r:
-            if r.status != 206:
-                raise OSError(
-                    f"{self._url} ignored a Range request (status {r.status}); "
+        h["Range"] = f"bytes={start}-{end}"
+        h["If-Match"] = self._etag
+
+        def read_range(response):
+            if response.status != 206:
+                raise _HttpProtocolError(
+                    f"{self._url} ignored a Range request (status {response.status}); "
                     "refusing to download the whole object")
-            data = r.read(n)
-        b[: len(data)] = data
-        self._pos += len(data)
-        return len(data)
+            content_range = response.headers.get("Content-Range")
+            match = _CONTENT_RANGE_RE.fullmatch(content_range or "")
+            actual_range = tuple(int(value) for value in match.groups()) if match else None
+            expected_range = (start, end, self._size)
+            if actual_range != expected_range:
+                raise _HttpProtocolError(
+                    f"{self._url} returned Content-Range {content_range!r}, expected "
+                    f"'bytes {start}-{end}/{self._size}'"
+                )
+            response_etag = response.headers.get("ETag")
+            if response_etag != self._etag:
+                raise _HttpProtocolError(
+                    f"{self._url} changed ETag from {self._etag!r} to {response_etag!r}"
+                )
+            content_encoding = response.headers.get("Content-Encoding")
+            if content_encoding not in (None, "identity"):
+                raise _HttpProtocolError(
+                    f"{self._url} encoded a byte-range response as {content_encoding!r}"
+                )
+            response_length = response.headers.get("Content-Length")
+            if response_length is not None:
+                try:
+                    declared_length = int(response_length)
+                except (TypeError, ValueError) as error:
+                    raise _HttpProtocolError(
+                        f"{self._url} returned invalid Content-Length {response_length!r}"
+                    ) from error
+                if declared_length != n:
+                    raise _HttpProtocolError(
+                        f"{self._url} declared {declared_length} bytes for a {n}-byte range"
+                    )
+            data = response.read(n + 1)
+            if len(data) != n:
+                raise _RetryableHttpReadError(
+                    f"{self._url} returned {len(data)} bytes for range {start}-{end}, expected {n}"
+                )
+            return data
+
+        request = urllib.request.Request(self._url, headers=h)
+        data = _request_with_retry(
+            request,
+            read_range,
+            opener=self._opener,
+            sleep=self._sleep,
+            max_attempts=self._max_attempts,
+        )
+        view[:n] = data
+        self._pos += n
+        return n
 
 
-def parquet_stream_to_parquet(col: Column) -> Path:
+def _stream_cache_identity(col: Column) -> dict:
+    urls = list(col.urls) or ([col.url] if col.url else [])
+    return {
+        "loader_version": 2,
+        "dataset_id": col.dataset_id,
+        "kind": col.kind,
+        "columns": list(col.siblings) or [col.column],
+        "json_paths": [list(item) for item in col.json_paths],
+        "cap_bytes": col.cap_bytes or STREAM_CAP_BYTES,
+        "source_revision": col.source_revision,
+        "urls": urls,
+    }
+
+
+def _cache_manifest_path(dest: Path) -> Path:
+    return Path(f"{dest}.manifest.json")
+
+
+def _schema_description(schema) -> list[dict[str, object]]:
+    return [
+        {"name": field.name, "type": str(field.type), "nullable": field.nullable}
+        for field in schema
+    ]
+
+
+def _stream_cache_status(dest: Path, identity: dict) -> tuple[bool, str]:
+    import pyarrow.parquet as pq
+
+    manifest_path = _cache_manifest_path(dest)
+    if not dest.is_file():
+        return False, "parquet is absent"
+    if not manifest_path.is_file():
+        return False, "manifest is absent"
+    try:
+        manifest = json.loads(manifest_path.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        return False, f"manifest cannot be read: {error}"
+    if manifest.get("identity") != identity:
+        return False, "manifest identity differs"
+    try:
+        parquet = pq.ParquetFile(dest)
+        metadata = parquet.metadata
+        schema = parquet.schema_arrow
+        stat_size = dest.stat().st_size
+    except (OSError, ValueError) as error:
+        return False, f"parquet footer cannot be read: {error}"
+    if metadata.num_rows != manifest.get("row_count"):
+        return False, "parquet row count differs from manifest"
+    if stat_size != manifest.get("parquet_bytes"):
+        return False, "parquet file size differs from manifest"
+    if _schema_description(schema) != manifest.get("schema"):
+        return False, "parquet schema differs from manifest"
+    utf8_bytes = manifest.get("utf8_bytes")
+    expected_columns = identity["columns"]
+    if not isinstance(utf8_bytes, dict) or set(utf8_bytes) != set(expected_columns):
+        return False, "manifest UTF-8 byte totals do not cover the selected columns"
+    if any(not isinstance(utf8_bytes[name], int) or utf8_bytes[name] < 0 for name in expected_columns):
+        return False, "manifest has an invalid UTF-8 byte total"
+    return True, "identity and parquet metadata match"
+
+
+@contextlib.contextmanager
+def _stream_cache_lock(dest: Path):
+    import fcntl
+
+    lock_path = Path(f"{dest}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(lock_path, "a+b") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def _publish_stream_cache(table, dest: Path, identity: dict, details: dict) -> dict:
+    import pyarrow.parquet as pq
+
+    if table.num_rows == 0:
+        raise OSError(f"refusing to publish an empty streamed cache at {dest}")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        dir=dest.parent, prefix=f".{dest.name}.", suffix=".part", delete=False
+    ) as tmp_file:
+        tmp = Path(tmp_file.name)
+    manifest_path = _cache_manifest_path(dest)
+    with tempfile.NamedTemporaryFile(
+        dir=dest.parent,
+        prefix=f".{manifest_path.name}.",
+        suffix=".part",
+        delete=False,
+    ) as manifest_file:
+        manifest_tmp = Path(manifest_file.name)
+    try:
+        pq.write_table(table, tmp)
+        parquet = pq.ParquetFile(tmp)
+        if parquet.metadata.num_rows != table.num_rows:
+            raise OSError(
+                f"temporary cache row count changed: {parquet.metadata.num_rows} != {table.num_rows}"
+            )
+        manifest = {
+            "identity": identity,
+            "row_count": table.num_rows,
+            "parquet_bytes": tmp.stat().st_size,
+            "schema": _schema_description(parquet.schema_arrow),
+            **details,
+        }
+        with open(manifest_tmp, "w", encoding="utf-8") as output:
+            output.write(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
+            output.flush()
+            os.fsync(output.fileno())
+        os.replace(tmp, dest)
+        os.replace(manifest_tmp, manifest_path)
+        return manifest
+    finally:
+        tmp.unlink(missing_ok=True)
+        manifest_tmp.unlink(missing_ok=True)
+
+
+def _utf8_payload_bytes(array) -> int:
+    import pyarrow.compute as pc
+
+    total = pc.sum(pc.binary_length(array)).as_py()
+    return int(total or 0)
+
+
+def parquet_stream_to_parquet(col: Column, identity: dict | None = None) -> Path:
     """Pull row groups from a remote parquet over HTTP ranges until `cap_bytes` of the
     dataset's columns have accumulated, then write them to the shared cache. Used for
     shards far larger than the ~1 GB the benchmark samples."""
@@ -236,6 +552,7 @@ def parquet_stream_to_parquet(col: Column) -> Path:
     import pyarrow.parquet as pq
 
     dest = col.cache_path()
+    identity = identity or _stream_cache_identity(col)
     cap = col.cap_bytes or STREAM_CAP_BYTES
     cols = list(col.siblings) or [col.column]
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -247,46 +564,58 @@ def parquet_stream_to_parquet(col: Column) -> Path:
     print(f"==> streaming remote parquet columns {cols} from {len(urls)} shard(s) "
           f"(cap {cap} B)\n        {urls[0]}\n        -> {dest}", file=sys.stderr)
 
-    # The cap tracks the *widest* column, not the total: the benchmark samples each column
-    # independently, so a dataset with one long column and three short ones must keep
-    # reading until the long one is full.
-    batches, per_col, total = [], {c: 0 for c in cols}, 0
+    # The cap tracks the widest column. This preserves the campaign's existing staging
+    # contract; the pair-level sweep selects only CodeSearchNet whole_func_string and
+    # FineWeb2 text, and both clear the benchmark's 1 GB payload sample.
+    batches, per_col, total, sources = [], {c: 0 for c in cols}, 0, []
+    stop_reason = "all_sources_exhausted"
     for si, url in enumerate(urls, 1):
-        pf = pq.ParquetFile(_HttpRangeFile(url, hdr))
+        remote = _HttpRangeFile(url, hdr)
+        sources.append(remote.source_metadata)
+        pf = pq.ParquetFile(remote)
         for rg in range(pf.num_row_groups):
             t = pf.read_row_group(rg, columns=cols)
             batches.append(t)
             for c in cols:
-                per_col[c] += t.column(c).nbytes
+                per_col[c] += _utf8_payload_bytes(t.column(c))
             total = max(per_col.values())
             print(f"    shard {si}/{len(urls)} row group {rg + 1}/{pf.num_row_groups}: "
                   f"{total} B", file=sys.stderr)
             if total >= cap:
+                stop_reason = "cap_reached"
                 break
         if total >= cap:
             break
+    if not batches:
+        raise OSError(f"no row groups were read from streamed source(s) for {col.dataset_id}")
     table = pa.concat_tables(batches)
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    pq.write_table(table, tmp)
-    tmp.rename(dest)
+    _publish_stream_cache(
+        table,
+        dest,
+        identity,
+        {
+            "sources": sources,
+            "utf8_bytes": per_col,
+            "stop_reason": stop_reason,
+            "shards_read": len(sources),
+        },
+    )
     print(f"==> wrote {table.num_rows} rows ~{total} B -> {dest}", file=sys.stderr)
     return dest
 
 
-def jsonl_to_parquet(col: Column) -> Path:
+def jsonl_to_parquet(col: Column, identity: dict | None = None) -> Path:
     """Stream gzipped JSON-lines URLs in order, extract a dotted path per output column,
     and write them all to the shared cache. Stops at the byte cap or when the URLs run
     out; a URL that 404s ends the stream rather than failing the run, so a corpus that
     has lost a shard still yields a (smaller, reported) sample."""
     import gzip
     import json
-    import urllib.error
-    import urllib.request
 
     import pyarrow as pa
-    import pyarrow.parquet as pq
 
     dest = col.cache_path()
+    identity = identity or _stream_cache_identity(col)
     cap = col.cap_bytes or STREAM_CAP_BYTES
     paths = dict(col.json_paths)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -296,36 +625,66 @@ def jsonl_to_parquet(col: Column) -> Path:
 
     out: dict[str, list[str]] = {c: [] for c in paths}
     per_col = {c: 0 for c in paths}
-    total, shards = 0, 0
+    total, shards, sources = 0, 0, []
+    stop_reason = "all_sources_exhausted"
     for url in col.urls:
+        req = urllib.request.Request(url, headers=hdr)
+
+        def read_shard(response):
+            shard_out: dict[str, list[str]] = {c: [] for c in paths}
+            shard_bytes = {c: 0 for c in paths}
+            with gzip.GzipFile(fileobj=response) as stream:
+                for line_number, line in enumerate(stream, 1):
+                    try:
+                        rec = json.loads(line)
+                    except json.JSONDecodeError as error:
+                        raise ValueError(f"{url}:{line_number}: malformed JSON") from error
+                    for name, path in paths.items():
+                        value = rec
+                        for part in path.split("."):
+                            value = value.get(part) if isinstance(value, dict) else None
+                        text = value if isinstance(value, str) else ""
+                        shard_out[name].append(text)
+                        shard_bytes[name] += len(text.encode("utf-8"))
+            return shard_out, shard_bytes, {
+                "url": url,
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "content_length": response.headers.get("Content-Length"),
+            }
+
         try:
-            req = urllib.request.Request(url, headers=hdr)
-            resp = urllib.request.urlopen(req)
+            shard_out, shard_bytes, source = _request_with_retry(req, read_shard)
         except urllib.error.HTTPError as e:
-            print(f"    {url}: HTTP {e.code}, stopping here", file=sys.stderr)
-            break
+            if e.code == 404:
+                print(f"    {url}: HTTP 404, source sequence exhausted", file=sys.stderr)
+                stop_reason = "terminal_404"
+                break
+            raise
         shards += 1
-        with resp, gzip.GzipFile(fileobj=resp) as stream:
-            for line in stream:
-                try:
-                    rec = json.loads(line)
-                except Exception:
-                    continue
-                for name, path in paths.items():
-                    v = rec
-                    for part in path.split("."):
-                        v = v.get(part) if isinstance(v, dict) else None
-                    s = v if isinstance(v, str) else ""
-                    out[name].append(s)
-                    per_col[name] += len(s.encode("utf-8"))
+        sources.append(source)
+        for name in paths:
+            out[name].extend(shard_out[name])
+            per_col[name] += shard_bytes[name]
         total = max(per_col.values())
         print(f"    shard {shards}/{len(col.urls)}: {total} B", file=sys.stderr)
         if total >= cap:
+            stop_reason = "cap_reached"
             break
+    if shards == 0:
+        raise OSError(f"no JSONL shards were read for {col.dataset_id}")
     table = pa.table({c: pa.array(v, type=pa.string()) for c, v in out.items()})
-    tmp = dest.with_suffix(dest.suffix + ".part")
-    pq.write_table(table, tmp)
-    tmp.rename(dest)
+    _publish_stream_cache(
+        table,
+        dest,
+        identity,
+        {
+            "sources": sources,
+            "utf8_bytes": per_col,
+            "stop_reason": stop_reason,
+            "shards_read": shards,
+        },
+    )
     print(f"==> wrote {table.num_rows} rows from {shards} shards ~{total} B -> {dest}",
           file=sys.stderr)
     return dest
@@ -333,6 +692,18 @@ def jsonl_to_parquet(col: Column) -> Path:
 
 def ensure_parquet(binary: Path, col: Column) -> Path:
     path = col.parquet_path()
+    if col.kind in {"parquet_stream", "jsonl"} and path == col.cache_path():
+        identity = _stream_cache_identity(col)
+        with _stream_cache_lock(path):
+            valid, reason = _stream_cache_status(path, identity)
+            if valid:
+                print(f"==> streamed cache hit: {path} ({reason})", file=sys.stderr)
+                return path
+            if path.exists() or _cache_manifest_path(path).exists():
+                print(f"==> rebuilding streamed cache {path}: {reason}", file=sys.stderr)
+            if col.kind == "parquet_stream":
+                return parquet_stream_to_parquet(col, identity)
+            return jsonl_to_parquet(col, identity)
     if path.exists():
         return path
     if col.kind == "tpch":
@@ -367,10 +738,6 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
             download(col.url, raw_path)
         text_to_parquet(raw_path, col.cache_path(), col.column)
         return col.cache_path()
-    if col.kind == "parquet_stream" and col.url:
-        return parquet_stream_to_parquet(col)
-    if col.kind == "jsonl" and col.urls:
-        return jsonl_to_parquet(col)
     if col.kind == "amazon":
         return amazon_to_parquet(col)
     if col.kind == "synthetic":
@@ -447,7 +814,15 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
         # wrote summaries and exited 0 -- reporting success with no data.
         COLUMN_FAILURES.append(f"{col.dataset_id}/{col.column}: exit {proc.returncode}")
         return []
-    return json.loads(proc.stdout)
+    rows = json.loads(proc.stdout)
+    if col.kind in {"parquet_stream", "jsonl"} and col.parquet_path() == col.cache_path():
+        try:
+            source_cache = json.loads(_cache_manifest_path(col.cache_path()).read_text())
+        except (OSError, json.JSONDecodeError) as error:
+            raise OSError(f"validated source-cache manifest disappeared for {col.dataset_id}") from error
+        for row in rows:
+            row["source_cache"] = source_cache
+    return rows
 
 
 def fmt_bytes(n: int) -> str:

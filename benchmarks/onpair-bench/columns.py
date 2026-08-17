@@ -63,16 +63,19 @@ AMAZON_URL = ("https://huggingface.co/datasets/McAuley-Lab/Amazon-Reviews-2023/"
 # same rows. The all-languages split (Go, Java, JavaScript, PHP, Python, Ruby) is used
 # rather than Python alone: the per-language splits top out around 375 MB of function text,
 # too little to fill the 1 GB chunk the throughput cells decode. Both train shards are
-# listed because the first alone yields 0.86 GB of `whole_func_string`, just short.
+# listed because the first alone yields 833,059,459 UTF-8 payload bytes of
+# `whole_func_string`, just short. Pin the Hub revision so every box resolves the same files.
+CODESEARCHNET_REVISION = "bd0cf261e357a3eb5c8fba490d23ec1a1cd59555"
 _CSN_BASE = ("https://huggingface.co/datasets/code-search-net/code_search_net/"
-             "resolve/main/all/")
+             f"resolve/{CODESEARCHNET_REVISION}/all/")
 CODESEARCHNET_URLS = [_CSN_BASE + f"train-0000{i}-of-00002.parquet" for i in (0, 1)]
 #   landing page: https://huggingface.co/datasets/code-search-net/code_search_net
 # FineWeb2 Mandarin (cmn_Hani) — the multibyte-UTF-8 case. Every shard is ~4.8 GB, far more
 # than the ~1 GB the bench samples, so this uses `parquet_stream`: row groups arrive over
 # HTTP range requests until the byte cap is hit, and the shard is never fetched whole.
+FINEWEB2_REVISION = "af9c13333eb981300149d5ca60a8e9d659b276b9"
 FINEWEB2_ZH_URL = ("https://huggingface.co/datasets/HuggingFaceFW/fineweb-2/"
-                   "resolve/main/data/cmn_Hani/train/000_00000.parquet")
+                   f"resolve/{FINEWEB2_REVISION}/data/cmn_Hani/train/000_00000.parquet")
 #   landing page: https://huggingface.co/datasets/HuggingFaceFW/fineweb-2
 # GH Archive — public GitHub events as hourly gzipped JSON-lines, starting 2024-10-01
 # (the day the 2026-05 dataset survey used). One day yields only ~110 MB per extracted
@@ -131,6 +134,9 @@ class Column:
     # parquet_stream / jsonl: stop once this many extracted UTF-8 bytes have accumulated.
     # 0 means the loader's own default.
     cap_bytes: int = 0
+    # Immutable source revision when the remote registry supports one. This is repeated
+    # in the cache manifest even when it is also embedded in the resolve URL.
+    source_revision: str | None = None
 
     def tpch_dir(self) -> Path:
         return SRC_DIR / f"tpch_sf{int(self.scale_factor)}"
@@ -167,7 +173,7 @@ def _parquet_cols(dataset_id, columns, *, url, cache):
     ]
 
 
-def _stream_cols(dataset_id, columns, *, urls, cache, cap_bytes=0):
+def _stream_cols(dataset_id, columns, *, urls, cache, cap_bytes=0, source_revision=None):
     """Columns served by a byte-capped remote-parquet read (`parquet_stream`). `urls` are
     read in order until the widest column reaches the cap, so a corpus whose per-shard
     yield falls short of the sampled chunk can span shards."""
@@ -175,7 +181,8 @@ def _stream_cols(dataset_id, columns, *, urls, cache, cap_bytes=0):
     us = (urls,) if isinstance(urls, str) else tuple(urls)
     return [
         Column(dataset_id=dataset_id, column=c, kind="parquet_stream", url=us[0], urls=us,
-               cache=cache, siblings=sib, cap_bytes=cap_bytes, local=_local(dataset_id))
+               cache=cache, siblings=sib, cap_bytes=cap_bytes,
+               source_revision=source_revision, local=_local(dataset_id))
         for c in columns
     ]
 
@@ -246,9 +253,10 @@ COLUMNS: list[Column] = [
     # ClickBench "hits" — long high-cardinality URLs/titles vs short categoricals.
     # `OriginalURL` joins URL/Title/Referer as a fourth multi-GB column in the same file:
     # once hits.parquet is on the box, another column costs sweep time and nothing else.
-    # PageCharset is 0.96 GB over 4 distinct values: l_shipinstruct's tiny-dictionary
-    # regime on real data. SearchPhrase is 86.8% empty strings — the low-fill case, not
-    # a like-for-like throughput cell.
+    # PageCharset has 1,176,679,095 UTF-8 payload bytes over 10 distinct values:
+    # l_shipinstruct's tiny-dictionary regime on real data. SearchPhrase is 86.8% empty
+    # strings and has only 739,636,342 payload bytes — the low-fill case, not a
+    # like-for-like throughput cell.
     *_parquet_cols("clickbench", ["URL", "Title", "Referer", "OriginalURL", "PageCharset",
                                   "SearchPhrase", "MobilePhoneModel"],
                    url=CLICKBENCH_URL, cache="hits.parquet"),
@@ -270,16 +278,18 @@ COLUMNS: list[Column] = [
            cache="amazon_movies.parquet", local=_local("amazon-movies")),
     Column(dataset_id="amazon-electronics", column="text", kind="amazon", category="Electronics",
            cache="amazon_electronics.parquet", local=_local("amazon-electronics")),
-    # CodeSearchNet (Python split): whole functions, their docstrings, and the repository
-    # paths they came from — source code beside prose in one corpus.
+    # CodeSearchNet all-languages split: whole functions, their docstrings, and the
+    # repository paths they came from — source code beside prose in one corpus.
     *_stream_cols("codesearchnet",
                   ["whole_func_string", "func_documentation_string",
                    "func_code_url", "repository_name"],
-                  urls=CODESEARCHNET_URLS, cache="code_search_net_all_train.parquet"),
+                  urls=CODESEARCHNET_URLS, cache="code_search_net_all_train.parquet",
+                  source_revision=CODESEARCHNET_REVISION),
     # FineWeb2 Mandarin: multibyte UTF-8, where the share of tokens under 8 bytes — the
     # selector's main input — is far lower than in any of the Latin-script corpora.
     *_stream_cols("fineweb2-zh", ["text", "url"],
-                  urls=FINEWEB2_ZH_URL, cache="fineweb2_cmn_Hani_000.parquet"),
+                  urls=FINEWEB2_ZH_URL, cache="fineweb2_cmn_Hani_000.parquet",
+                  source_revision=FINEWEB2_REVISION),
     # GH Archive 2024-10-01: machine-generated event records. `type` is a ~20-value
     # categorical, `repo.name` and `actor.login` are high-cardinality identifiers.
     # Catalogued but deliberately OUT of the campaign sweep: its widest column is only
