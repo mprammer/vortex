@@ -114,6 +114,13 @@ class HttpRangeFileTests(unittest.TestCase):
         self.assertEqual(request_headers(request)["if-match"], '"object-a"')
         self.assertEqual(timeout, run.HTTP_TIMEOUT_SECONDS)
 
+    def test_zero_length_object_and_buffer_do_not_issue_ranges(self):
+        file, calls = self.make(head(0))
+        self.assertEqual(file.read(), b"")
+        self.assertEqual(file.readinto(bytearray()), 0)
+        self.assertEqual(file.tell(), 0)
+        self.assertEqual(len(calls.requests), 1)
+
     def test_later_200_is_rejected_before_body_is_read(self):
         later = Response(status=200, data=b"whole-object")
         file, _ = self.make(head(8), byte_range(0, 3, 8, b"abcd"), later)
@@ -145,6 +152,21 @@ class HttpRangeFileTests(unittest.TestCase):
                 self.assertEqual(response.read_calls, 0)
                 self.assertTrue(response.closed)
                 self.assertEqual(file.tell(), 0)
+
+    def test_encoded_range_is_rejected_before_body_is_read(self):
+        encoded = byte_range(
+            0,
+            3,
+            4,
+            b"abcd",
+            headers={"Content-Encoding": "gzip"},
+        )
+        file, _ = self.make(head(4), encoded, max_attempts=1)
+        with self.assertRaisesRegex(OSError, "encoded a byte-range response"):
+            file.readinto(bytearray(4))
+        self.assertEqual(encoded.read_calls, 0)
+        self.assertTrue(encoded.closed)
+        self.assertEqual(file.tell(), 0)
 
     def test_short_body_is_discarded_and_retried_from_same_offset(self):
         short = byte_range(0, 3, 4, b"ab")
@@ -194,6 +216,22 @@ class HttpRangeFileTests(unittest.TestCase):
             file.readinto(bytearray(4))
         self.assertEqual(file.tell(), 0)
         self.assertEqual(len(calls.requests), 3)
+
+    def test_416_is_not_retried_and_does_not_advance_position(self):
+        body = io.BytesIO(b"range unsatisfiable")
+        error = urllib.error.HTTPError(
+            "https://cdn/object",
+            416,
+            "range unsatisfiable",
+            {},
+            body,
+        )
+        file, calls = self.make(head(4), error)
+        with self.assertRaises(urllib.error.HTTPError):
+            file.readinto(bytearray(4))
+        self.assertEqual(file.tell(), 0)
+        self.assertEqual(len(calls.requests), 2)
+        self.assertTrue(body.closed)
 
     def test_head_requires_length_and_strong_etag(self):
         for response in [
