@@ -1739,7 +1739,6 @@ const TPT_MATCHED_KERNELS: &[&str] = &[
 #[cfg(feature = "cuda")]
 /// Where a cell's decode inputs come from. The kernels are codec-agnostic, so this is the
 /// only place the codec is named on the GPU path.
-#[cfg(feature = "cuda")]
 enum DecodeSource<'a> {
     OnPair(&'a [OnPairArray]),
     /// Pre-built inputs, one per chunk, already normalized to the decode ABI.
@@ -3473,6 +3472,9 @@ struct AutoKernelInputs {
 }
 
 #[cfg(feature = "cuda")]
+// The selector feature is stored as f32. Accumulating in f64 avoids compounding the
+// rounding error before this single, intentional narrowing conversion.
+#[allow(clippy::cast_possible_truncation)]
 fn token_weighted_fraction(samples: impl IntoIterator<Item = (f32, usize)>) -> f32 {
     let (weighted_sum, total_tokens) =
         samples
