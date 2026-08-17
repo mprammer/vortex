@@ -799,8 +799,7 @@ async fn run_cell_fsst12(
             fsst12_stored_offset_bytes(&inputs.row_code_offsets, &mut ctx)? as usize;
         // Also measure the code stream through OnPair's instrument, so the cell can report a
         // container-matched ratio alongside the native one.
-        stored.codes_btrblocks =
-            fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
+        stored.codes_btrblocks = fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
         // and its footprint still counts toward the stored size below.
@@ -832,7 +831,9 @@ async fn run_cell_fsst12(
     );
 
     let gpu = match gpu_config {
-        Some(config) => Some(run_gpu_kernel_bench(DecodeSource::Prebuilt(all_inputs), config).await?),
+        Some(config) => {
+            Some(run_gpu_kernel_bench(DecodeSource::Prebuilt(all_inputs), config).await?)
+        }
         None => {
             anyhow::bail!("FSST-12 cells are GPU-only; pass --gpu-decode")
         }
@@ -843,10 +844,7 @@ async fn run_cell_fsst12(
     // Read `verified` (every applicable kernel matched the reference), NOT `validated`
     // (validation was merely requested). Reading the latter would report verified = true on
     // a kernel mismatch, which is the one failure mode that must never be silent.
-    let verified = gpu
-        .as_ref()
-        .and_then(|g| g.verified)
-        .unwrap_or(false);
+    let verified = gpu.as_ref().and_then(|g| g.verified).unwrap_or(false);
     anyhow::ensure!(
         verified,
         "FSST-12 cell {dataset_id}/{column} failed GPU byte-exactness validation; refusing to \
@@ -871,7 +869,11 @@ async fn run_cell_fsst12(
         n_files: 0,
         encode_ms: encode_secs * 1e3,
         decode_ms: 0.0,
-        encode_gib_s: if encode_secs > 0.0 { gib / encode_secs } else { 0.0 },
+        encode_gib_s: if encode_secs > 0.0 {
+            gib / encode_secs
+        } else {
+            0.0
+        },
         decode_gib_s: 0.0,
         gpu,
         mem_ratio: ratio(sample.raw_bytes, stored_total),
@@ -946,6 +948,7 @@ async fn run_cell(
     // compressed/decoded) is left to post-processing, per the raw-provenance convention.
     if let Ok(oc_path) = std::env::var("ONPAIR_OFFSET_COST") {
         use std::io::Write;
+
         use vortex::array::match_each_integer_ptype;
         const REPS: usize = 7;
         const TOK_PER_BATCH: usize = 128;
@@ -960,12 +963,24 @@ async fn run_cell(
         for (chunk_idx, op) in onpairs.iter().enumerate() {
             let codes_arr = op.codes().clone().execute::<PrimitiveArray>(&mut ctx)?;
             let codes_u16: Vec<u16> = match_each_integer_ptype!(codes_arr.ptype(), |P| {
-                codes_arr.as_slice::<P>().iter().map(|&v| v as u16).collect()
+                codes_arr
+                    .as_slice::<P>()
+                    .iter()
+                    .map(|&v| v as u16)
+                    .collect()
             });
-            let dict_offsets_arr = op.dict_offsets().clone().execute::<PrimitiveArray>(&mut ctx)?;
-            let dict_offsets_u64: Vec<u64> = match_each_integer_ptype!(dict_offsets_arr.ptype(), |P| {
-                dict_offsets_arr.as_slice::<P>().iter().map(|&v| v as u64).collect()
-            });
+            let dict_offsets_arr = op
+                .dict_offsets()
+                .clone()
+                .execute::<PrimitiveArray>(&mut ctx)?;
+            let dict_offsets_u64: Vec<u64> =
+                match_each_integer_ptype!(dict_offsets_arr.ptype(), |P| {
+                    dict_offsets_arr
+                        .as_slice::<P>()
+                        .iter()
+                        .map(|&v| v as u64)
+                        .collect()
+                });
             let lens: Vec<u32> = (0..dict_offsets_u64.len().saturating_sub(1))
                 .map(|i| (dict_offsets_u64[i + 1] - dict_offsets_u64[i]) as u32)
                 .collect();
@@ -994,7 +1009,8 @@ async fn run_cell(
             // Real BtrBlocks-compressed size of the sidecar (the GPU consumes it uncompressed;
             // this is the on-disk stored cost). Uses the same delta/plain path as the OnPair children.
             let off_prim = PrimitiveArray::from_iter(chunk_off[..n_batches].iter().copied());
-            let off_compressed_arr = compress_offsets(&off_prim.into_array(), &compressor, &mut ctx)?;
+            let off_compressed_arr =
+                compress_offsets(&off_prim.into_array(), &compressor, &mut ctx)?;
             let off_compressed = off_compressed_arr.nbytes();
             // (Q2) Cost to DECOMPRESS the stored compressed sidecar back to the plain
             // integer offsets the GPU consumes. Times canonicalization of the compressed
@@ -1866,7 +1882,10 @@ async fn run_gpu_kernel_bench(
             .then(|| format!("thread-block clusters require sm_90+ (device cc {cc_major}.x)"));
         if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
             if explicit_selection {
-                anyhow::bail!("requested GPU kernel {} is inapplicable: {reason}", variant.name);
+                anyhow::bail!(
+                    "requested GPU kernel {} is inapplicable: {reason}",
+                    variant.name
+                );
             }
             let metadata = kernel_result_metadata(*variant, &chunks)?;
             kernels.push(GpuKernelResult {
@@ -2082,7 +2101,9 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
     let mut selected = Vec::with_capacity(expanded.len());
     for name in expanded {
         anyhow::ensure!(
-            !selected.iter().any(|variant: &KernelVariant| variant.name == name),
+            !selected
+                .iter()
+                .any(|variant: &KernelVariant| variant.name == name),
             "duplicate GPU kernel {name:?}"
         );
         let variant = GPU_KERNELS
@@ -2139,9 +2160,7 @@ fn kernel_result_metadata(
             }
             KernelLayout::Const1 => chunk.codes.len() + chunk.dict_const1.len(),
             KernelLayout::Const2 => chunk.codes.len() + chunk.dict_const2.len(),
-            KernelLayout::PersistDict16
-            | KernelLayout::RegCache
-            | KernelLayout::ClusterDsmem => {
+            KernelLayout::PersistDict16 | KernelLayout::RegCache | KernelLayout::ClusterDsmem => {
                 chunk.codes.len()
                     + chunk_offsets_len(chunk, variant.chunk_size)?
                     + chunk.dict_padded.len()
@@ -2390,8 +2409,11 @@ fn fsst12_stored_offset_bytes(row_code_offsets: &[u64], ctx: &mut ExecutionCtx) 
 fn fsst12_decode_inputs(
     rows: &[&[u8]],
 ) -> Result<(DecodeInputs, crate::fsst12_abi::Fsst12StoredSize, f64)> {
-    use crate::fsst12_abi::{compact_dict, normalize_rows, DICT_STRIDE};
     use fsst12::fsst12::Compressor12;
+
+    use crate::fsst12_abi::DICT_STRIDE;
+    use crate::fsst12_abi::compact_dict;
+    use crate::fsst12_abi::normalize_rows;
 
     // Timed boundary: train + compress, which is what OnPair's encode_ms covers. Everything
     // after this point is load-time preparation of the decode ABI.
@@ -2732,9 +2754,8 @@ fn build_packed_split8_dictionary(
         lo[entry * PLANE_STRIDE..entry * PLANE_STRIDE + low_len]
             .copy_from_slice(&dict_padded[src..src + low_len]);
         let high_len = usize::from(len).saturating_sub(PLANE_STRIDE);
-        hi[entry * PLANE_STRIDE..entry * PLANE_STRIDE + high_len].copy_from_slice(
-            &dict_padded[src + PLANE_STRIDE..src + PLANE_STRIDE + high_len],
-        );
+        hi[entry * PLANE_STRIDE..entry * PLANE_STRIDE + high_len]
+            .copy_from_slice(&dict_padded[src + PLANE_STRIDE..src + PLANE_STRIDE + high_len]);
     }
     Ok((lo, hi, packed_lens))
 }
@@ -3050,9 +3071,7 @@ async fn stage_gpu_chunk(
         all_len_1,
         all_len_2,
         codes: ctx.copy_to_device::<u16, _>(codes_u16)?.await?,
-        codes_offsets: ctx
-            .copy_to_device::<u64, _>(row_code_offsets)?
-            .await?,
+        codes_offsets: ctx.copy_to_device::<u64, _>(row_code_offsets)?.await?,
         dict_padded: ctx.copy_to_device::<u8, _>(dict_padded)?.await?,
         dict_s8: ctx.copy_to_device::<u8, _>(dict_s8)?.await?,
         dict_s8_hi: ctx.copy_to_device::<u8, _>(dict_s8_hi)?.await?,
@@ -4331,8 +4350,7 @@ mod tests {
             }
         }
 
-        let (lo, hi, packed_lens) =
-            build_packed_split8_dictionary(&codes, &padded, &lens)?;
+        let (lo, hi, packed_lens) = build_packed_split8_dictionary(&codes, &padded, &lens)?;
         assert_eq!(packed_lens, [0x70, 0xf8, 0x02]);
         for (entry, &len) in lens.iter().enumerate() {
             let low_len = usize::from(len).min(8);
@@ -4352,8 +4370,10 @@ mod tests {
         let mut padded_with_untrained = padded;
         padded_with_untrained.resize(lens_with_untrained.len() * 16 + 16, 0);
         build_packed_split8_dictionary(&codes, &padded_with_untrained, &lens_with_untrained)?;
-        assert!(build_packed_split8_dictionary(&[5], &padded_with_untrained, &lens_with_untrained)
-            .is_err());
+        assert!(
+            build_packed_split8_dictionary(&[5], &padded_with_untrained, &lens_with_untrained)
+                .is_err()
+        );
         Ok(())
     }
 
@@ -4379,21 +4399,29 @@ mod tests {
         ];
         let selected = select_gpu_kernels(Some(&requested))?;
         assert_eq!(
-            selected.iter().map(|variant| variant.name).collect::<Vec<_>>(),
+            selected
+                .iter()
+                .map(|variant| variant.name)
+                .collect::<Vec<_>>(),
             requested
         );
 
         let preset = select_gpu_kernels(Some(&["tpt-matched".to_string()]))?;
         assert_eq!(
-            preset.iter().map(|variant| variant.name).collect::<Vec<_>>(),
+            preset
+                .iter()
+                .map(|variant| variant.name)
+                .collect::<Vec<_>>(),
             TPT_MATCHED_KERNELS
         );
         assert!(select_gpu_kernels(Some(&["missing".to_string()])).is_err());
-        assert!(select_gpu_kernels(Some(&[
-            "onpair_decompress".to_string(),
-            "onpair_decompress".to_string(),
-        ]))
-        .is_err());
+        assert!(
+            select_gpu_kernels(Some(&[
+                "onpair_decompress".to_string(),
+                "onpair_decompress".to_string(),
+            ]))
+            .is_err()
+        );
         Ok(())
     }
 }
@@ -4480,7 +4508,11 @@ mod fsst12_inputs_tests {
 
         // Every FSST-12 symbol fits the narrow half, so this is 1.0 -- the property that
         // makes the split dictionary's fallback path unreachable for this codec.
-        assert!((inputs.frac_le8 - 1.0).abs() < 1e-6, "frac_le8 {}", inputs.frac_le8);
+        assert!(
+            (inputs.frac_le8 - 1.0).abs() < 1e-6,
+            "frac_le8 {}",
+            inputs.frac_le8
+        );
         assert!(inputs.dict_max_len >= 1 && inputs.dict_max_len <= 8);
         assert!(inputs.distinct_codes > 0);
         assert!(!inputs.all_len_1 && !inputs.all_len_2);

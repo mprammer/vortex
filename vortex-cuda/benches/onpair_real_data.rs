@@ -1549,7 +1549,11 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         results.extend(bench_column(field.name(), raw_bytes, row_cap, varbin, 10)?);
     }
 
-    anyhow::ensure!(!results.is_empty(), "no eligible benchmark columns in {}", path.display());
+    anyhow::ensure!(
+        !results.is_empty(),
+        "no eligible benchmark columns in {}",
+        path.display()
+    );
 
     let label = path
         .file_stem()
@@ -1576,7 +1580,10 @@ fn bench_real_data(_c: &mut Criterion) {
         .filter(|path| !path.is_empty())
         .map(PathBuf::from)
         .collect();
-    assert!(!paths.is_empty(), "ONPAIR_DATA_PATH contains no parquet paths");
+    assert!(
+        !paths.is_empty(),
+        "ONPAIR_DATA_PATH contains no parquet paths"
+    );
     for path in paths {
         if let Err(e) = run_dataset(path.clone()) {
             panic!("{} failed: {e:#}", path.display());

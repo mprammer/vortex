@@ -471,7 +471,11 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         };
         results.push(bench_column(field.name(), raw_bytes, row_cap, vbn, iters)?);
     }
-    anyhow::ensure!(eligible_columns > 0, "no eligible string columns in {}", path.display());
+    anyhow::ensure!(
+        eligible_columns > 0,
+        "no eligible string columns in {}",
+        path.display()
+    );
     if dump_base.is_some() {
         return Ok(());
     }
@@ -485,7 +489,10 @@ fn bench(_c: &mut Criterion) {
         panic!("set ONPAIR_DATA_PATH (colon-separated parquet paths)");
     };
     let inputs: Vec<_> = paths.split(':').filter(|s| !s.is_empty()).collect();
-    assert!(!inputs.is_empty(), "ONPAIR_DATA_PATH contains no parquet paths");
+    assert!(
+        !inputs.is_empty(),
+        "ONPAIR_DATA_PATH contains no parquet paths"
+    );
     assert!(
         env::var("FSST_DUMP").is_err() || inputs.len() == 1,
         "FSST_DUMP requires exactly one input dataset to avoid overwriting same-named columns"

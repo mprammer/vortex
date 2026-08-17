@@ -424,7 +424,11 @@ fn run_dataset(path: PathBuf) -> anyhow::Result<()> {
         };
         results.push(bench_column(field.name(), raw_bytes, row_cap, vbv, iters)?);
     }
-    anyhow::ensure!(!results.is_empty(), "no eligible benchmark columns in {}", path.display());
+    anyhow::ensure!(
+        !results.is_empty(),
+        "no eligible benchmark columns in {}",
+        path.display()
+    );
     print_results(&label, &results);
     Ok(())
 }

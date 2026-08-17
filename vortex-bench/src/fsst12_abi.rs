@@ -24,7 +24,9 @@
 //! This module is deliberately free of any `cuda` gating: it is pure host-side data
 //! movement, and it is unit-tested on machines that have no GPU.
 
-use fsst12::fsst12::{Compressor12, FSST12_MAX_SYMBOLS, FSST12_RESERVED_CODES};
+use fsst12::fsst12::Compressor12;
+use fsst12::fsst12::FSST12_MAX_SYMBOLS;
+use fsst12::fsst12::FSST12_RESERVED_CODES;
 
 /// Byte stride of the padded decode table, matching the kernels' `dict + code * 16`.
 pub const DICT_STRIDE: usize = 16;
@@ -74,9 +76,13 @@ pub enum Fsst12AbiError {
     TableSize(usize),
     #[error("code {code} has length {len}, outside 1..=8")]
     SymbolLength { code: usize, len: u8 },
-    #[error("reserved code {code} is not the identity single-byte symbol (len {len}, value {value:#x})")]
+    #[error(
+        "reserved code {code} is not the identity single-byte symbol (len {len}, value {value:#x})"
+    )]
     ReservedCode { code: usize, len: u8, value: u64 },
-    #[error("code {code} at stream position {pos} is outside the trained table of {entries} entries")]
+    #[error(
+        "code {code} at stream position {pos} is outside the trained table of {entries} entries"
+    )]
     UntrainedCode {
         code: u16,
         pos: usize,
@@ -445,9 +451,12 @@ mod tests {
     #[test]
     fn no_symbol_exceeds_the_narrow_half() {
         let rows = corpus();
-        let (compressor, _, _) = train_and_compress(&rows);
+        let (compressor, ..) = train_and_compress(&rows);
         assert!(
-            compressor.symbol_lengths().iter().all(|&l| (1..=8).contains(&l)),
+            compressor
+                .symbol_lengths()
+                .iter()
+                .all(|&l| (1..=8).contains(&l)),
             "FSST-12 symbols must all fit the 8-byte narrow table"
         );
     }
@@ -474,7 +483,11 @@ mod tests {
             let lo = small_abi.row_code_offsets[i] as usize;
             let hi = small_abi.row_code_offsets[i + 1] as usize;
             let sliced = slice_rows(&small_abi, lo, hi);
-            assert_eq!(decode_via_abi(&sliced), *row, "row {i} decodes in isolation");
+            assert_eq!(
+                decode_via_abi(&sliced),
+                *row,
+                "row {i} decodes in isolation"
+            );
         }
 
         // Accounting: components must be individually nonzero and sum to total.
@@ -511,15 +524,29 @@ mod tests {
         // cannot detect.
         let last = compressor.symbol_table().len() - 1;
         let last_off = (table[last] >> 16) as usize;
-        assert!(last_off + DICT_STRIDE <= bytes.len(), "last trained fixed-width read");
+        assert!(
+            last_off + DICT_STRIDE <= bytes.len(),
+            "last trained fixed-width read"
+        );
         let untrained_off = (table[FSST12_CODE_SPACE - 1] >> 16) as usize;
-        assert_eq!(untrained_off, logical, "untrained entry points at the logical end");
+        assert_eq!(
+            untrained_off, logical,
+            "untrained entry points at the logical end"
+        );
         assert!(
             untrained_off + DICT_STRIDE <= bytes.len(),
             "untrained fixed-width read in bounds"
         );
-        assert_eq!(table[FSST12_CODE_SPACE - 1] & 0xffff, 0, "untrained length is zero");
-        assert_eq!(table.len(), FSST12_CODE_SPACE, "directory covers the code space");
+        assert_eq!(
+            table[FSST12_CODE_SPACE - 1] & 0xffff,
+            0,
+            "untrained length is zero"
+        );
+        assert_eq!(
+            table.len(),
+            FSST12_CODE_SPACE,
+            "directory covers the code space"
+        );
     }
 
     /// The padded table's unused upper half must actually be zero. decode_via_abi cannot
@@ -539,7 +566,10 @@ mod tests {
                 "code {code} has dirty bytes past its length {len}"
             );
         }
-        assert!(padded.len() >= FSST12_CODE_SPACE * DICT_STRIDE + DICT_STRIDE, "trailing pad");
+        assert!(
+            padded.len() >= FSST12_CODE_SPACE * DICT_STRIDE + DICT_STRIDE,
+            "trailing pad"
+        );
     }
 
     /// Hand-built packing vectors, independent of the codec, so a shared misreading between
@@ -547,7 +577,10 @@ mod tests {
     #[test]
     fn unpack_hand_built_vectors() {
         // One 3-byte triple: low code 0x123, high code 0x456 -> bytes 23 61 45.
-        assert_eq!(unpack_codes(&[0x23, 0x61, 0x45]).unwrap(), vec![0x123, 0x456]);
+        assert_eq!(
+            unpack_codes(&[0x23, 0x61, 0x45]).unwrap(),
+            vec![0x123, 0x456]
+        );
         // 2-byte odd tail: only the low 12 bits are a code; the high nibble is ignored.
         assert_eq!(unpack_codes(&[0x23, 0xf1]).unwrap(), vec![0x123]);
         // 5 bytes = one triple plus a 2-byte odd tail.
@@ -590,7 +623,10 @@ mod tests {
         let refs: Vec<&[u8]> = base.iter().map(|r| r.as_slice()).collect();
         let compressor = Compressor12::train(&refs);
         let entries = compressor.symbol_table().len();
-        assert!(entries < FSST12_CODE_SPACE, "corpus should not fill the table");
+        assert!(
+            entries < FSST12_CODE_SPACE,
+            "corpus should not fill the table"
+        );
         // Embed an untrained code in the middle of an otherwise valid stream.
         let codes = vec![b'a' as u16, entries as u16, b'b' as u16];
         assert!(matches!(
@@ -643,10 +679,14 @@ mod tests {
     #[test]
     fn tables_cover_the_whole_code_space() {
         let rows = corpus();
-        let (compressor, _, _) = train_and_compress(&rows);
+        let (compressor, ..) = train_and_compress(&rows);
         let abi = normalize(&compressor, &compressor.compress(b"abc")).expect("normalize");
         assert_eq!(abi.lens.len(), FSST12_CODE_SPACE);
         assert!(abi.dict_padded.len() >= FSST12_CODE_SPACE * DICT_STRIDE);
-        assert_eq!(abi.lens[FSST12_CODE_SPACE - 1], 0, "untrained code has length 0");
+        assert_eq!(
+            abi.lens[FSST12_CODE_SPACE - 1],
+            0,
+            "untrained code has length 0"
+        );
     }
 }

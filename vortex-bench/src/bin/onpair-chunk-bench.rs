@@ -303,7 +303,11 @@ fn generate_clickbench_urls(n: usize) -> Vec<String> {
     let mut rng = StdRng::seed_from_u64(123);
     (0..n)
         .map(|_| {
-            let scheme = if rng.random_bool(0.7) { "https" } else { "http" };
+            let scheme = if rng.random_bool(0.7) {
+                "https"
+            } else {
+                "http"
+            };
             let domain = CB_DOMAINS[rng.random_range(0..CB_DOMAINS.len())];
             let path = CB_PATHS[rng.random_range(0..CB_PATHS.len())];
             let params = CB_PARAMS[rng.random_range(0..CB_PARAMS.len())];
