@@ -8,11 +8,7 @@
 //! `Misaligned buffer cannot be used to build PrimitiveArray of u32`).
 
 #![cfg(feature = "onpair")]
-#![expect(
-    clippy::cast_possible_truncation,
-    clippy::tests_outside_test_module,
-    clippy::redundant_clone
-)]
+#![expect(clippy::cast_possible_truncation, clippy::tests_outside_test_module)]
 
 use std::sync::LazyLock;
 
@@ -35,6 +31,7 @@ use vortex_array::scalar_fn::session::ScalarFnSession;
 use vortex_array::session::ArraySession;
 use vortex_array::validity::Validity;
 use vortex_buffer::ByteBuffer;
+use vortex_error::VortexResult;
 use vortex_file::OpenOptionsSessionExt;
 use vortex_file::WriteOptionsSessionExt;
 use vortex_io::session::RuntimeSession;
@@ -86,7 +83,9 @@ fn corpus(n: usize, offset: u64) -> Vec<String> {
 /// `BtrBlocksCompressor::default()` cascading through every registered
 /// scheme, including OnPair), then open the resulting bytes via
 /// `OpenOptions::open_buffer` and stream every chunk back.
-async fn write_and_read_back(data: vortex_array::ArrayRef) -> Vec<vortex_array::ArrayRef> {
+async fn write_and_read_back(
+    data: vortex_array::ArrayRef,
+) -> VortexResult<Vec<vortex_array::ArrayRef>> {
     // `write_options()` builds a `VortexWriteOptions` whose `strategy` is
     // `WriteStrategyBuilder::default().build()` — the same path `vortex-bench`
     // uses for Parquet → Vortex conversion. No custom strategy injected.
@@ -94,30 +93,25 @@ async fn write_and_read_back(data: vortex_array::ArrayRef) -> Vec<vortex_array::
     SESSION
         .write_options()
         .write(&mut bytes, data.to_array_stream())
-        .await
-        .expect("write Vortex file");
+        .await?;
 
     // Read back from the in-memory byte buffer; no disk, no FS.
     let bytes = ByteBuffer::from(bytes);
-    let vxf = SESSION.open_options().open_buffer(bytes).expect("open");
+    let vxf = SESSION.open_options().open_buffer(bytes)?;
 
-    let stream = vxf
-        .scan()
-        .expect("scan")
-        .into_stream()
-        .expect("into_stream");
+    let stream = vxf.scan()?.into_stream()?;
     pin_mut!(stream);
 
     let mut chunks = Vec::new();
     while let Some(chunk) = stream.next().await {
-        chunks.push(chunk.expect("chunk"));
+        chunks.push(chunk?);
     }
-    chunks
+    Ok(chunks)
 }
 
 /// Single string column, single chunk. The simplest case.
 #[tokio::test]
-async fn single_column_single_chunk() {
+async fn single_column_single_chunk() -> VortexResult<()> {
     let n = 4096usize;
     let strings = corpus(n, 0);
     let str_array = VarBinViewArray::from_iter(
@@ -133,7 +127,7 @@ async fn single_column_single_chunk() {
     )
     .into_array();
 
-    let chunks = write_and_read_back(data).await;
+    let chunks = write_and_read_back(data).await?;
     let mut row = 0;
     for chunk in chunks {
         let strct = chunk
@@ -152,11 +146,12 @@ async fn single_column_single_chunk() {
         .unwrap();
     }
     assert_eq!(row, n);
+    Ok(())
 }
 
 /// Many rows → many chunks via the writer's default row_block_size.
 #[tokio::test]
-async fn single_column_many_chunks() {
+async fn single_column_many_chunks() -> VortexResult<()> {
     let n = 50_000usize;
     let strings = corpus(n, 0);
     let str_array = VarBinViewArray::from_iter(
@@ -172,7 +167,7 @@ async fn single_column_many_chunks() {
     )
     .into_array();
 
-    let chunks = write_and_read_back(data).await;
+    let chunks = write_and_read_back(data).await?;
     let mut row = 0;
     for chunk in chunks {
         let strct = chunk
@@ -191,6 +186,7 @@ async fn single_column_many_chunks() {
         .unwrap();
     }
     assert_eq!(row, n);
+    Ok(())
 }
 
 /// TPC-H supplier-shaped table: 5 string columns + a primary key + a
@@ -198,7 +194,7 @@ async fn single_column_many_chunks() {
 /// exercise multiple chunks. This is the configuration that surfaced the
 /// `Misaligned buffer` error in CI.
 #[tokio::test]
-async fn tpch_supplier_shape() {
+async fn tpch_supplier_shape() -> VortexResult<()> {
     let n = 32_000usize;
     let names = corpus(n, 1);
     let addresses = corpus(n, 2);
@@ -244,7 +240,7 @@ async fn tpch_supplier_shape() {
     )
     .into_array();
 
-    let chunks = write_and_read_back(data).await;
+    let chunks = write_and_read_back(data).await?;
 
     let mut row = 0;
     for chunk in chunks {
@@ -299,6 +295,7 @@ async fn tpch_supplier_shape() {
         row += chunk_len;
     }
     assert_eq!(row, n);
+    Ok(())
 }
 
 /// 30 short fixed strings where the dictionary blob length is unlikely to
@@ -307,7 +304,7 @@ async fn tpch_supplier_shape() {
 /// `Misaligned buffer cannot be used to build PrimitiveArray of u32` on
 /// read.
 #[tokio::test]
-async fn odd_dict_length_alignment() {
+async fn odd_dict_length_alignment() -> VortexResult<()> {
     let words: &[&str] = &[
         "a", "bb", "ccc", "dddd", "eeeee", "fffff", "ggggggg", "h", "ii", "jjj",
     ];
@@ -326,7 +323,7 @@ async fn odd_dict_length_alignment() {
     )
     .into_array();
 
-    let chunks = write_and_read_back(data).await;
+    let chunks = write_and_read_back(data).await?;
     let mut row = 0;
     for chunk in chunks {
         let strct = chunk
@@ -348,12 +345,13 @@ async fn odd_dict_length_alignment() {
         .unwrap();
     }
     assert_eq!(row, n);
+    Ok(())
 }
 
 /// Mixed-shape strings: empty, short, very long, with a fair chunk of nulls
 /// — exercising the validity child + edge offsets.
 #[tokio::test]
-async fn nullable_and_extreme_shapes() {
+async fn nullable_and_extreme_shapes() -> VortexResult<()> {
     let n = 16_000usize;
     let mut strings: Vec<Option<String>> = Vec::with_capacity(n);
     for i in 0..n {
@@ -378,7 +376,7 @@ async fn nullable_and_extreme_shapes() {
     )
     .into_array();
 
-    let chunks = write_and_read_back(data).await;
+    let chunks = write_and_read_back(data).await?;
     let mut row = 0;
     for chunk in chunks {
         let strct = chunk
@@ -401,4 +399,5 @@ async fn nullable_and_extreme_shapes() {
         .unwrap();
     }
     assert_eq!(row, n);
+    Ok(())
 }
