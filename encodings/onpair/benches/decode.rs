@@ -308,6 +308,7 @@ fn like_contains_kernel_dispatch(bencher: Bencher, case: (Shape, usize)) {
 /// What the system actually does for `LIKE '%sub%'` today on OnPair:
 ///   1. canonicalize into a VarBinViewArray
 ///   2. run the scalar (SIMD) `Like` function on it.
+///
 /// This is the "fallback path" cost when pushdown returns `None`.
 #[divan::bench(args = LIKE_FINEWEB_CASES)]
 fn like_contains_via_canonical(bencher: Bencher, case: (Shape, usize)) {
