@@ -199,6 +199,12 @@ pub struct GpuCellResult {
     pub decoded_bytes: u64,
     /// Number of OnPair chunks, and therefore launches per iteration.
     pub chunks: usize,
+    /// Exact number of dictionary codes decoded per iteration.
+    ///
+    /// This is the authoritative token count. It must not be inferred from
+    /// `compressed_bytes`, which also includes dictionary metadata.
+    #[serde(default)]
+    pub total_tokens: u64,
     /// Auto-selected kernel based on dictionary lengths.
     pub auto_kernel: String,
     /// Selector inputs (token-weighted fraction of tokens <= 8 bytes, mean/max
@@ -206,7 +212,7 @@ pub struct GpuCellResult {
     /// chunk's dict has <= 4096 entries). Surfaced so kernel-selection gates can
     /// be tuned from observed per-column statistics.
     pub frac_le8: f32,
-    /// Mean dict entry length, averaged across chunks.
+    /// Mean referenced dictionary-entry length, weighted by tokens across chunks.
     pub dict_mean_len: f32,
     /// Maximum dict entry length across chunks.
     pub dict_max_len: u8,
@@ -217,17 +223,18 @@ pub struct GpuCellResult {
     /// Max distinct dict entries actually referenced across chunks (the true
     /// working set, which may be far below the provisioned dict size).
     pub distinct_codes: u32,
-    /// Fraction of code accesses covered by the 4096 hottest entries, averaged
-    /// over chunks. High => access is concentrated (a bits12-sized hot set would
+    /// Fraction of code accesses covered by the 4096 hottest entries, weighted
+    /// by tokens across chunks. High => access is concentrated (a bits12-sized hot set would
     /// capture most reads); informs whether the large bits16 dict is needed.
     pub access_top4096_frac: f32,
-    /// Whole-decompress accounting: the compressed payload that must be copied
-    /// host->device to decode (codes + packed dict + lens, summed over chunks).
+    /// Logical decode-payload model (codes + compact dict + lens, summed over
+    /// chunks). This is not necessarily the bytes staged for a particular GPU
+    /// kernel layout and is not the codec's on-disk size.
     pub compressed_bytes: u64,
     /// Measured device host->device copy bandwidth (GiB/s, pageable host memory).
     pub h2d_gib_s: f64,
-    /// End-to-end output rate of the auto kernel including the H2D copy of the
-    /// compressed payload: `decoded_bytes / (compressed_bytes/h2d + auto_decode)`.
+    /// Modelled output rate of the auto kernel including an H2D copy of the
+    /// logical payload: `decoded_bytes / (compressed_bytes/h2d + auto_decode)`.
     /// Compare to `h2d_gib_s` (the raw-transfer output rate): when this is higher,
     /// GPU decompress delivers output faster than transferring the raw bytes.
     pub whole_decompress_gib_s: f64,
@@ -992,7 +999,8 @@ async fn run_cell(
             )
             .with_context(|| format!("ONPAIR_OFFSET_COST: write {oc_path} failed"))?;
         }
-        w.flush().ok();
+        w.flush()
+            .with_context(|| format!("ONPAIR_OFFSET_COST: flush {oc_path} failed"))?;
     }
 
     // 2. Group consecutive chunks into ~file_target_bytes files, written so the
@@ -1134,8 +1142,7 @@ struct GpuOnPairChunk {
     decoded_bytes: u64,
     total_tokens: usize,
     dict_max_len: u8,
-    /// Retained as a diagnostic; not currently consumed by `pick_auto_kernel`.
-    #[allow(dead_code)]
+    /// Token-weighted mean referenced dictionary-entry length for this chunk.
     dict_mean_len: f32,
     all_len_1: bool,
     all_len_2: bool,
@@ -1153,10 +1160,8 @@ struct GpuOnPairChunk {
     /// Empty if a 4-aligned offset exceeds 27 bits.
     dict_q4_dir: vortex::array::buffer::BufferHandle,
     /// Number of distinct dict entries actually referenced by the code stream.
-    #[allow(dead_code)]
     distinct_codes: u32,
     /// Fraction of code accesses covered by the 4096 most-frequent entries.
-    #[allow(dead_code)]
     access_top4096_frac: f32,
     codes: vortex::array::buffer::BufferHandle,
     codes_offsets: vortex::array::buffer::BufferHandle,
@@ -1656,33 +1661,46 @@ async fn run_gpu_kernel_bench(
     setup_ctx.synchronize_stream()?;
 
     let decoded_bytes = chunks.iter().map(|c| c.decoded_bytes).sum::<u64>();
+    let total_tokens = chunks.iter().map(|c| c.total_tokens as u64).sum::<u64>();
     let cc_major = device_cc_major(&setup_ctx);
     let auto_kernel = pick_auto_kernel(&chunks, cc_major).to_string();
-    let frac_le8 = if chunks.is_empty() {
+    let frac_le8 = if total_tokens == 0 {
         0.0
     } else {
-        chunks.iter().map(|c| c.frac_le8).sum::<f32>() / chunks.len() as f32
+        (chunks
+            .iter()
+            .map(|c| f64::from(c.frac_le8) * c.total_tokens as f64)
+            .sum::<f64>()
+            / total_tokens as f64) as f32
     };
-    let dict_mean_len = if chunks.is_empty() {
+    let dict_mean_len = if total_tokens == 0 {
         0.0
     } else {
-        chunks.iter().map(|c| c.dict_mean_len).sum::<f32>() / chunks.len() as f32
+        (chunks
+            .iter()
+            .map(|c| f64::from(c.dict_mean_len) * c.total_tokens as f64)
+            .sum::<f64>()
+            / total_tokens as f64) as f32
     };
     let dict_max_len = chunks.iter().map(|c| c.dict_max_len).max().unwrap_or(0);
     let dict_entries_max = chunks.iter().map(|c| c.lens.len()).max().unwrap_or(0);
     let small_dict = chunks.iter().all(|c| c.lens.len() <= 4096);
     let distinct_codes = chunks.iter().map(|c| c.distinct_codes).max().unwrap_or(0);
-    let access_top4096_frac = if chunks.is_empty() {
+    let access_top4096_frac = if total_tokens == 0 {
         0.0
     } else {
-        chunks.iter().map(|c| c.access_top4096_frac).sum::<f32>() / chunks.len() as f32
+        (chunks
+            .iter()
+            .map(|c| f64::from(c.access_top4096_frac) * c.total_tokens as f64)
+            .sum::<f64>()
+            / total_tokens as f64) as f32
     };
 
-    // Whole-decompress accounting: the compressed payload that must be copied
-    // host->device to decode = codes + packed dict bytes + per-entry lens, summed
-    // over chunks. `BufferHandle::len()` already returns BYTES (codes is u16, so
-    // its len() is the byte size, not the element count). Padded/s8 dicts are GPU
-    // staging artifacts, not part of the stored/transferred compressed column.
+    // Logical decode-payload model = codes + compact dict bytes + per-entry lens,
+    // summed over chunks. `BufferHandle::len()` already returns BYTES (codes is
+    // u16, so its len() is the byte size, not the element count). A specific GPU
+    // layout may stage a different dictionary representation and additional
+    // offset metadata; those bytes must not be silently attributed to this field.
     //
     // This is the STAGED host-to-device payload, for both codecs. It is NOT either codec's
     // stored size: OnPair's stored column is BtrBlocks-compressed with its own metadata, and
@@ -1725,17 +1743,19 @@ async fn run_gpu_kernel_bench(
             continue;
         }
 
+        let verified = if config.validate && !is_timing_only_ablation(variant.name) {
+            validate_kernel_variant(*variant, &chunks)
+                .await
+                .with_context(|| format!("GPU validation failed for {}", variant.name))?;
+            Some(true)
+        } else {
+            None
+        };
         let decode_ns_iters = time_kernel_variant(*variant, &chunks, iterations)?;
         // Convenience scalar = the fastest pass (min ns -> ms). All other reductions
         // are recoverable from `decode_ns_iters` at figure-generation.
         let min_ns = decode_ns_iters.iter().copied().min().unwrap_or(0);
         let decode_ms = min_ns as f64 / 1_000_000.0;
-        let validation_error = if config.validate {
-            validate_kernel_variant(*variant, &chunks).await.err()
-        } else {
-            None
-        };
-        let verified = config.validate.then_some(validation_error.is_none());
         kernels.push(GpuKernelResult {
             kernel: variant.name.to_string(),
             decode_ms,
@@ -1744,7 +1764,7 @@ async fn run_gpu_kernel_bench(
             applicable: true,
             verified,
             reason: None,
-            validation_error: validation_error.map(|e| e.to_string()),
+            validation_error: None,
         });
     }
 
@@ -1845,6 +1865,7 @@ async fn run_gpu_kernel_bench(
         iterations,
         decoded_bytes,
         chunks: chunks.len(),
+        total_tokens,
         auto_kernel,
         frac_le8,
         dict_mean_len,
@@ -1867,7 +1888,7 @@ async fn run_gpu_kernel_bench(
             // showing verified:false are that artifact, not a real mismatch.
             let mut judged = kernels
                 .iter()
-                .filter(|r| r.applicable && !r.kernel.contains("ablate"))
+                .filter(|r| r.applicable && !is_timing_only_ablation(&r.kernel))
                 .peekable();
             // An empty set must not verify vacuously.
             judged.peek().is_some() && judged.all(|r| r.verified == Some(true))
@@ -1878,6 +1899,11 @@ async fn run_gpu_kernel_bench(
         nvcomp_zstd_hw,
         nvcomp_zstd,
     })
+}
+
+#[cfg(feature = "cuda")]
+fn is_timing_only_ablation(kernel: &str) -> bool {
+    kernel.contains("_ablate_no") || kernel.ends_with("_ablate_cfree")
 }
 
 /// Decode-side dict relabeling for cache-layout experiments. Env-gated; a code
@@ -2391,31 +2417,27 @@ async fn stage_gpu_chunk(
     if let Ok(dump_path) = std::env::var("ONPAIR_DUMP_E2E") {
         use std::io::Write;
         let dict_size = lens_table.len();
-        match std::fs::File::create(&dump_path) {
-            Ok(file) => {
-                let mut w = std::io::BufWriter::new(file);
-                let mut hdr_ok = w.write_all(b"E2E1").is_ok();
-                hdr_ok &= w.write_all(&(codes_u16.len() as u64).to_le_bytes()).is_ok();
-                hdr_ok &= w.write_all(&(dict_size as u32).to_le_bytes()).is_ok();
-                hdr_ok &= w
-                    .write_all(&(vortex_onpair::MAX_TOKEN_SIZE as u32).to_le_bytes())
-                    .is_ok();
-                let mut codes_le = Vec::with_capacity(codes_u16.len() * 2);
-                for &c in &codes_u16 {
-                    codes_le.extend_from_slice(&c.to_le_bytes());
-                }
-                hdr_ok &= w.write_all(&codes_le).is_ok();
-                hdr_ok &= w.write_all(&lens_table).is_ok();
-                hdr_ok &= w.write_all(&dict_padded).is_ok();
-                hdr_ok &= w.flush().is_ok();
-                eprintln!(
-                    "ONPAIR_DUMP_E2E: wrote {dump_path} ok={hdr_ok} tokens={} dict={dict_size} max_token={}",
-                    codes_u16.len(),
-                    vortex_onpair::MAX_TOKEN_SIZE
-                );
-            }
-            Err(e) => eprintln!("ONPAIR_DUMP_E2E: create {dump_path} failed: {e}"),
+        let file = std::fs::File::create(&dump_path)
+            .with_context(|| format!("ONPAIR_DUMP_E2E: create {dump_path} failed"))?;
+        let mut w = std::io::BufWriter::new(file);
+        w.write_all(b"E2E1")?;
+        w.write_all(&(codes_u16.len() as u64).to_le_bytes())?;
+        w.write_all(&(dict_size as u32).to_le_bytes())?;
+        w.write_all(&(vortex_onpair::MAX_TOKEN_SIZE as u32).to_le_bytes())?;
+        let mut codes_le = Vec::with_capacity(codes_u16.len() * 2);
+        for &c in &codes_u16 {
+            codes_le.extend_from_slice(&c.to_le_bytes());
         }
+        w.write_all(&codes_le)?;
+        w.write_all(&lens_table)?;
+        w.write_all(&dict_padded)?;
+        w.flush()
+            .with_context(|| format!("ONPAIR_DUMP_E2E: flush {dump_path} failed"))?;
+        eprintln!(
+            "ONPAIR_DUMP_E2E: wrote {dump_path} tokens={} dict={dict_size} max_token={}",
+            codes_u16.len(),
+            vortex_onpair::MAX_TOKEN_SIZE
+        );
     }
 
     // EXPERIMENTAL, env-gated: OP1 dump — like E2E1 but ALSO carries the per-row code offsets
@@ -2433,37 +2455,33 @@ async fn stage_gpu_chunk(
         let row_offsets: Vec<u64> = row_code_offsets.clone();
         // codes_offsets has n_rows+1 entries (row r = codes[row_offsets[r]..row_offsets[r+1]]).
         let n_rows = row_offsets.len().saturating_sub(1);
-        match std::fs::File::create(&dump_path) {
-            Ok(file) => {
-                let mut w = std::io::BufWriter::new(file);
-                let mut ok = w.write_all(b"OP11").is_ok();
-                ok &= w.write_all(&(codes_u16.len() as u64).to_le_bytes()).is_ok();
-                ok &= w.write_all(&(n_rows as u64).to_le_bytes()).is_ok();
-                ok &= w.write_all(&(dict_size as u32).to_le_bytes()).is_ok();
-                ok &= w
-                    .write_all(&(vortex_onpair::MAX_TOKEN_SIZE as u32).to_le_bytes())
-                    .is_ok();
-                let mut codes_le = Vec::with_capacity(codes_u16.len() * 2);
-                for &c in &codes_u16 {
-                    codes_le.extend_from_slice(&c.to_le_bytes());
-                }
-                ok &= w.write_all(&codes_le).is_ok();
-                let mut roff_le = Vec::with_capacity(row_offsets.len() * 8);
-                for &o in &row_offsets {
-                    roff_le.extend_from_slice(&o.to_le_bytes());
-                }
-                ok &= w.write_all(&roff_le).is_ok();
-                ok &= w.write_all(&lens_table).is_ok();
-                ok &= w.write_all(&dict_padded).is_ok();
-                ok &= w.flush().is_ok();
-                eprintln!(
-                    "ONPAIR_DUMP_OP1: wrote {dump_path} ok={ok} tokens={} rows={n_rows} dict={dict_size} max_token={}",
-                    codes_u16.len(),
-                    vortex_onpair::MAX_TOKEN_SIZE
-                );
-            }
-            Err(e) => eprintln!("ONPAIR_DUMP_OP1: create {dump_path} failed: {e}"),
+        let file = std::fs::File::create(&dump_path)
+            .with_context(|| format!("ONPAIR_DUMP_OP1: create {dump_path} failed"))?;
+        let mut w = std::io::BufWriter::new(file);
+        w.write_all(b"OP11")?;
+        w.write_all(&(codes_u16.len() as u64).to_le_bytes())?;
+        w.write_all(&(n_rows as u64).to_le_bytes())?;
+        w.write_all(&(dict_size as u32).to_le_bytes())?;
+        w.write_all(&(vortex_onpair::MAX_TOKEN_SIZE as u32).to_le_bytes())?;
+        let mut codes_le = Vec::with_capacity(codes_u16.len() * 2);
+        for &c in &codes_u16 {
+            codes_le.extend_from_slice(&c.to_le_bytes());
         }
+        w.write_all(&codes_le)?;
+        let mut roff_le = Vec::with_capacity(row_offsets.len() * 8);
+        for &o in &row_offsets {
+            roff_le.extend_from_slice(&o.to_le_bytes());
+        }
+        w.write_all(&roff_le)?;
+        w.write_all(&lens_table)?;
+        w.write_all(&dict_padded)?;
+        w.flush()
+            .with_context(|| format!("ONPAIR_DUMP_OP1: flush {dump_path} failed"))?;
+        eprintln!(
+            "ONPAIR_DUMP_OP1: wrote {dump_path} tokens={} rows={n_rows} dict={dict_size} max_token={}",
+            codes_u16.len(),
+            vortex_onpair::MAX_TOKEN_SIZE
+        );
     }
 
     // EXPERIMENTAL, env-gated: APPEND this row-group's decode inputs as one RGB1

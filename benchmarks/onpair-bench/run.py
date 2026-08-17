@@ -444,6 +444,8 @@ def main() -> int:
     p.add_argument("--columns", type=lambda s: {x.strip() for x in s.split(",")},
                    default=None,
                    help="only these column names (comma-separated), e.g. l_comment,text")
+    p.add_argument("--allow-missing-inputs", action="store_true",
+                   help="skip requested datasets/columns whose parquet or string column is missing")
     p.add_argument("--list", action="store_true",
                    help="list available dataset/column pairs and exit")
     p.add_argument("--clean", action="store_true",
@@ -478,6 +480,18 @@ def main() -> int:
     columns = [c for c in COLUMNS
                if (args.datasets is None or c.dataset_id in args.datasets)
                and (args.columns is None or c.column in args.columns)]
+    missing_filters = []
+    if args.datasets is not None:
+        missing_filters.extend(
+            f"dataset {name!r}" for name in sorted(args.datasets - {c.dataset_id for c in columns})
+        )
+    if args.columns is not None:
+        missing_filters.extend(
+            f"column {name!r}" for name in sorted(args.columns - {c.column for c in columns})
+        )
+    if missing_filters:
+        print("unmatched selection(s): " + ", ".join(missing_filters), file=sys.stderr)
+        return 1
     if not columns:
         print("no columns match the given --datasets/--columns filters", file=sys.stderr)
         return 1
@@ -490,6 +504,7 @@ def main() -> int:
     # columns never race on generation, then keep only columns that are present
     # and string-typed.
     selected: list[Column] = []
+    unavailable: list[str] = []
     for col in columns:
         try:
             parquet = ensure_parquet(binary, col)
@@ -499,12 +514,21 @@ def main() -> int:
             # run still completes on whatever data is present (TPC-H always
             # generates locally).
             print(f"-- skip {col.dataset_id}/{col.column}: {e}", file=sys.stderr)
+            unavailable.append(f"{col.dataset_id}/{col.column}: {e}")
             continue
         if column_is_string(parquet, col.column):
             selected.append(col)
         else:
             print(f"-- skip {col.dataset_id}/{col.column} (missing or non-string)",
                   file=sys.stderr)
+            unavailable.append(f"{col.dataset_id}/{col.column}: missing or non-string")
+    if unavailable and not args.allow_missing_inputs:
+        print("requested benchmark inputs are unavailable; refusing a partial campaign:",
+              file=sys.stderr)
+        for item in unavailable:
+            print(f"   - {item}", file=sys.stderr)
+        print("pass --allow-missing-inputs to opt into a partial campaign", file=sys.stderr)
+        return 1
     print(f"==> {len(selected)}/{len(columns)} columns selected", file=sys.stderr)
 
     jobs = args.jobs if args.jobs > 0 else available_cores()
