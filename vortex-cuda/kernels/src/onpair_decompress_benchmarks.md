@@ -376,3 +376,52 @@ six fills two and seven fills three. That fixed scan cost and the compiler's
 Raw profiles are `/tmp/onpair-ncu-5tpt-resource.csv` and
 `/tmp/onpair-ncu-7tpt-resource.csv`; comparable 4/6 profiles are
 `/tmp/onpair-ncu-{4tpt,6tpt}.csv`.
+
+## Five TPT four-block launch bound
+
+The five-TPT wrapper now overrides the generic two-block launch bound with
+`__launch_bounds__(256, 4)`. On sm_90 this changes ptxas allocation from 72 to
+64 registers/thread with zero spills and unchanged 25,856-byte static shared
+memory. The kernel code and data layout are otherwise identical.
+
+Protocol: the same seven bits12 cells as the 4/5/6/7 experiment; orders
+baseline→candidate→4TPT and candidate→baseline→4TPT; one discarded warm-up plus
+five fresh measured processes per order and row; 100 iterations per kernel;
+serial execution; full byte validation. All 70 measured processes and all 210
+kernel results verified.
+
+| dataset / column | 72-reg 5 TPT GB/s | 64-reg 5 TPT GB/s | candidate speedup | 4 TPT GB/s | candidate vs 4 |
+|---|---:|---:|---:|---:|---:|
+| TPC-H `l_comment` | 1,055.2 | **1,181.7** | +11.99% | 1,178.5 | +0.27% |
+| TPC-H `l_shipmode` | 959.1 | **1,084.6** | +13.08% | 1,018.2 | +6.52% |
+| ClickBench `URL` | 814.4 | **909.8** | +11.72% | 885.3 | +2.77% |
+| ClickBench `SearchPhrase` | 933.3 | **1,040.7** | +11.50% | 1,017.5 | +2.28% |
+| FineWeb `text` | 687.5 | **770.1** | +12.02% | 740.1 | +4.05% |
+| FineWeb `url` | 639.0 | **704.9** | +10.31% | 681.9 | +3.37% |
+| Wikipedia `text` | 652.0 | **725.8** | +11.32% | 697.9 | +4.00% |
+
+The geomean of per-row median throughput ratios is **+11.702%**; the geomean
+of all 70 process-paired ratios is **+11.651%**. The candidate wins every row
+against both the old 72-register five-TPT kernel and four TPT. Six TPT remains
+faster on every row.
+
+A representative Nsight Compute `l_comment` launch confirms the mechanism:
+
+| metric | 72-reg baseline | 64-reg launch bound |
+|---|---:|---:|
+| register-limited blocks/SM | 3 | 4 |
+| achieved occupancy | 33.45% | 45.78% |
+| instructions | 545.1M | 544.3M |
+| L1 hit | 85.52% | 85.54% |
+| L2 read sectors | 23.14M | 23.07M |
+| long-scoreboard stall | 19.62% | 18.63% |
+
+Instruction and cache work are essentially unchanged; the performance gain
+tracks the restored fourth resident block and 12.3-point occupancy increase.
+This makes register scheduling, rather than the high-plane data representation,
+the sufficient fix for five TPT.
+
+Raw timings are under
+`/tmp/onpair-5tpt-lb4-20260817/{base-first,lb4-first}/`; the candidate profile
+is `/tmp/onpair-ncu-5tpt-lb4.csv` and the baseline profile is
+`/tmp/onpair-ncu-5tpt-resource.csv`.
