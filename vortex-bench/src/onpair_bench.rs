@@ -1795,7 +1795,8 @@ async fn run_gpu_kernel_bench(
     let decoded_bytes = chunks.iter().map(|c| c.decoded_bytes).sum::<u64>();
     let total_tokens = chunks.iter().map(|c| c.total_tokens as u64).sum::<u64>();
     let cc_major = device_cc_major(&setup_ctx);
-    let selector_kernel = pick_auto_kernel(&chunks, cc_major).to_string();
+    let cc_minor = device_cc_minor(&setup_ctx);
+    let selector_kernel = pick_auto_kernel(&chunks, cc_major, cc_minor).to_string();
     let frac_le8 = if total_tokens == 0 {
         0.0
     } else {
@@ -3443,12 +3444,23 @@ fn device_cc_major(ctx: &CudaExecutionCtx) -> i32 {
         .unwrap_or(0)
 }
 
+/// Compute-capability minor. Needed because Ampere (sm_80, A100) and Ada (sm_89, L40S)
+/// share a major version but want opposite coarsening: see `pick_general_ada`.
+#[cfg(feature = "cuda")]
+fn device_cc_minor(ctx: &CudaExecutionCtx) -> i32 {
+    use cudarc::driver::sys;
+    ctx.stream()
+        .context()
+        .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MINOR)
+        .unwrap_or(0)
+}
+
 /// Pick the fastest validated kernel for the active GPU. The optimum is
 /// architecture-dependent, so the choice branches on compute capability:
 /// kernels measured best on Hopper (sm_90) are kept for Hopper, and the
 /// Blackwell (sm_100) winners are used on B200 — neither overwrites the other.
 #[cfg(feature = "cuda")]
-fn pick_auto_kernel(chunks: &[GpuOnPairChunk], cc_major: i32) -> &'static str {
+fn pick_auto_kernel(chunks: &[GpuOnPairChunk], cc_major: i32, cc_minor: i32) -> &'static str {
     if chunks.iter().all(|c| c.all_len_1) {
         return "onpair_shmem_const1";
     }
@@ -3478,8 +3490,10 @@ fn pick_auto_kernel(chunks: &[GpuOnPairChunk], cc_major: i32) -> &'static str {
 
     if cc_major >= 10 {
         pick_general_blackwell(max_entries, frac_le8)
+    } else if cc_major == 8 && cc_minor == 9 {
+        pick_general_ada(max_entries)
     } else {
-        pick_general_hopper(max_entries, frac_le8)
+        pick_general_ampere_hopper(max_entries, frac_le8)
     }
 }
 
@@ -3517,17 +3531,49 @@ fn pick_general_blackwell(max_entries: usize, frac_le8: f32) -> &'static str {
     }
 }
 
-/// Hopper (sm_90 / GH200) general-case selector — the original pre-Blackwell
-/// behaviour, kept verbatim. Decode is L1/TEX-request bound; `split8read` (8 B
-/// reads from the 32 KB `dict_s8`) wins for small bits12 dicts with mostly short
-/// tokens, otherwise plain `4tpt` is the robust default. Not re-tuned for
-/// Blackwell; left exactly as measured on GH200.
+/// Ada (sm_89 / L40S) general-case selector.
+///
+/// Ada is the one architecture that wants *less* coarsening, not more: across the
+/// 18 committed L40S cells, two codes per thread beats four on 13 of them, by up to
+/// 80% (fineweb bits12: 409 vs 343 GB/s). The exception is a dictionary small enough
+/// to stay resident, where the opposite holds and eight codes per thread wins
+/// (synthetic/url, ~900 entries: 536 vs 444). The threshold sits on a plateau — 1024
+/// and 2048 score identically — and breaks at 4096, where the 4096-entry columns
+/// swing back to preferring two.
+///
+/// Ada shared a branch with Hopper until 2026-08-17 purely because they share nothing
+/// but a selector fallthrough; that is what produced the 44% worst-case shortfall the
+/// paper reports for the L40S. Refit here to 8.0% worst / 1.0% mean.
 #[cfg(feature = "cuda")]
-fn pick_general_hopper(max_entries: usize, frac_le8: f32) -> &'static str {
-    if max_entries <= 4096 && frac_le8 >= 0.90 {
-        "onpair_shmem_4tpt_split8read"
+fn pick_general_ada(max_entries: usize) -> &'static str {
+    const ADA_RESIDENT_DICT_MAX_ENTRIES: usize = 2048;
+    if max_entries <= ADA_RESIDENT_DICT_MAX_ENTRIES {
+        "onpair_shmem_8tpt_b128"
     } else {
-        "onpair_shmem_4tpt"
+        "onpair_shmem_2tpt"
+    }
+}
+
+/// Ampere (sm_80 / A100) and Hopper (sm_90 / H100) general-case selector.
+///
+/// Both chips lose to the same thing under the pre-2026-08-17 rule: the 128-thread
+/// block variant of the kernel the selector had already chosen. Adopting `b128` as
+/// the base — the lever Blackwell's branch has used since the 2026-05 sweep — takes
+/// A100 from 6.7% to 0.9% mean shortfall and H100 from 8.2% to 1.5%.
+///
+/// The gates are shared rather than fitted per chip: shortfall is flat for any
+/// `frac_le8` gate in 0.60–0.95 on both (it only breaks below 0.60, on A100), so a
+/// single 0.70 threshold matching Blackwell's is used instead of two tuned constants
+/// on 18 cells each. `max_entries <= 16384` likewise matches Blackwell: `dict_s8` is
+/// entries × 8 B, and the win lasts while that fits L1.
+#[cfg(feature = "cuda")]
+fn pick_general_ampere_hopper(max_entries: usize, frac_le8: f32) -> &'static str {
+    const SPLIT8READ_MAX_ENTRIES: usize = 16384;
+    const SPLIT8READ_FRAC_LE8: f32 = 0.70;
+    if max_entries <= SPLIT8READ_MAX_ENTRIES && frac_le8 >= SPLIT8READ_FRAC_LE8 {
+        "onpair_shmem_4tpt_split8read_b128o12"
+    } else {
+        "onpair_shmem_4tpt_b128"
     }
 }
 
@@ -4315,6 +4361,62 @@ pub async fn ensure_tpch_all_parquet(sf: f64, out_dir: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every kernel the selector can name must exist in `GPU_KERNELS`. The selector
+    /// returns a `&'static str` looked up at launch time, so a typo or a renamed
+    /// kernel is invisible to the compiler and only fails once a GPU is in hand —
+    /// which, on a preemptible box, means losing the run.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn selector_names_only_registered_kernels() {
+        let known: std::collections::HashSet<&str> =
+            GPU_KERNELS.iter().map(|v| v.name).collect();
+        // (cc_major, cc_minor) for every architecture with its own branch, plus the
+        // fallthrough used by anything unrecognized.
+        let arches = [(8, 0), (8, 9), (9, 0), (10, 0), (0, 0)];
+        // Bracket both gates: dictionary sizes either side of 2048 / 16384, and
+        // frac_le8 either side of 0.70.
+        let entries = [512usize, 2048, 2049, 16384, 16385, 65536];
+        let fracs = [0.0f32, 0.69, 0.70, 1.0];
+        for (maj, min) in arches {
+            for &e in &entries {
+                for &f in &fracs {
+                    for name in [
+                        if maj >= 10 {
+                            pick_general_blackwell(e, f)
+                        } else if maj == 8 && min == 9 {
+                            pick_general_ada(e)
+                        } else {
+                            pick_general_ampere_hopper(e, f)
+                        },
+                        "onpair_shmem_const1",
+                        "onpair_shmem_const2",
+                        "onpair_shmem_s4l1_16tpt",
+                        "onpair_shmem_s8_4tpt",
+                    ] {
+                        assert!(
+                            known.contains(name),
+                            "selector returned {name:?} for cc {maj}.{min} \
+                             (entries={e}, frac_le8={f}), which is not in GPU_KERNELS"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Ada must not inherit the Ampere/Hopper choice. These two architectures share a
+    /// compute-capability major and want opposite coarsening; conflating them is what
+    /// produced the L40S's 44% worst-case shortfall before 2026-08-17.
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn ada_and_ampere_diverge() {
+        // A dictionary too large to stay resident: Ada wants 2 codes/thread, Ampere 4.
+        assert_eq!(pick_general_ada(65536), "onpair_shmem_2tpt");
+        assert_eq!(pick_general_ampere_hopper(65536, 0.0), "onpair_shmem_4tpt_b128");
+        // A resident dictionary flips Ada the other way, to 8.
+        assert_eq!(pick_general_ada(512), "onpair_shmem_8tpt_b128");
+    }
 
     #[test]
     fn chunk_ranges_equal_ish() {
