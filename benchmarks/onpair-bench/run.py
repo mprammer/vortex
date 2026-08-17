@@ -25,6 +25,7 @@ Usage::
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import shutil
@@ -173,6 +174,163 @@ def amazon_to_parquet(col: Column) -> Path:
     return dest
 
 
+# Byte cap for the streamed corpora (parquet_stream / jsonl). run.py samples 1 GB per
+# column, so ~1.5 GB of extracted text leaves headroom without pulling whole shards.
+STREAM_CAP_BYTES = int(os.environ.get("STREAM_CAP_BYTES", 1_500_000_000))
+
+
+class _HttpRangeFile(io.RawIOBase):
+    """Seekable read-only file over HTTP range requests.
+
+    Exists so a multi-GB remote parquet can be read row group by row group: pyarrow
+    seeks to the footer, then to the row groups it wants, and only those byte ranges
+    cross the network. Servers that ignore `Range` would silently return the whole
+    body, so the first request asserts a 206 rather than trusting the response."""
+
+    def __init__(self, url: str, headers: dict[str, str] | None = None):
+        import urllib.request
+        self._url, self._headers, self._pos = url, dict(headers or {}), 0
+        self._req = urllib.request
+        head = urllib.request.Request(url, method="HEAD", headers=self._headers)
+        with urllib.request.urlopen(head) as r:
+            self._size = int(r.headers["Content-Length"])
+            # HEAD follows redirects; read subsequent ranges from where we landed.
+            self._url = r.geturl()
+
+    def readable(self) -> bool:
+        return True
+
+    def seekable(self) -> bool:
+        return True
+
+    def tell(self) -> int:
+        return self._pos
+
+    def seek(self, offset: int, whence: int = io.SEEK_SET) -> int:
+        base = {io.SEEK_SET: 0, io.SEEK_CUR: self._pos, io.SEEK_END: self._size}[whence]
+        self._pos = max(0, min(self._size, base + offset))
+        return self._pos
+
+    def readinto(self, b) -> int:
+        n = min(len(b), self._size - self._pos)
+        if n <= 0:
+            return 0
+        h = dict(self._headers)
+        h["Range"] = f"bytes={self._pos}-{self._pos + n - 1}"
+        with self._req.urlopen(self._req.Request(self._url, headers=h)) as r:
+            if r.status != 206:
+                raise OSError(
+                    f"{self._url} ignored a Range request (status {r.status}); "
+                    "refusing to download the whole object")
+            data = r.read(n)
+        b[: len(data)] = data
+        self._pos += len(data)
+        return len(data)
+
+
+def parquet_stream_to_parquet(col: Column) -> Path:
+    """Pull row groups from a remote parquet over HTTP ranges until `cap_bytes` of the
+    dataset's columns have accumulated, then write them to the shared cache. Used for
+    shards far larger than the ~1 GB the benchmark samples."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = col.cache_path()
+    cap = col.cap_bytes or STREAM_CAP_BYTES
+    cols = list(col.siblings) or [col.column]
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    hdr = {"User-Agent": "vortex-bench/onpair"}
+    tok = os.environ.get("HF_TOKEN") or os.environ.get("HUGGING_FACE_HUB_TOKEN")
+    if tok and "huggingface.co" in (col.url or ""):
+        hdr["Authorization"] = "Bearer " + tok
+    urls = list(col.urls) or [col.url]
+    print(f"==> streaming remote parquet columns {cols} from {len(urls)} shard(s) "
+          f"(cap {cap} B)\n        {urls[0]}\n        -> {dest}", file=sys.stderr)
+
+    # The cap tracks the *widest* column, not the total: the benchmark samples each column
+    # independently, so a dataset with one long column and three short ones must keep
+    # reading until the long one is full.
+    batches, per_col, total = [], {c: 0 for c in cols}, 0
+    for si, url in enumerate(urls, 1):
+        pf = pq.ParquetFile(_HttpRangeFile(url, hdr))
+        for rg in range(pf.num_row_groups):
+            t = pf.read_row_group(rg, columns=cols)
+            batches.append(t)
+            for c in cols:
+                per_col[c] += t.column(c).nbytes
+            total = max(per_col.values())
+            print(f"    shard {si}/{len(urls)} row group {rg + 1}/{pf.num_row_groups}: "
+                  f"{total} B", file=sys.stderr)
+            if total >= cap:
+                break
+        if total >= cap:
+            break
+    table = pa.concat_tables(batches)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    pq.write_table(table, tmp)
+    tmp.rename(dest)
+    print(f"==> wrote {table.num_rows} rows ~{total} B -> {dest}", file=sys.stderr)
+    return dest
+
+
+def jsonl_to_parquet(col: Column) -> Path:
+    """Stream gzipped JSON-lines URLs in order, extract a dotted path per output column,
+    and write them all to the shared cache. Stops at the byte cap or when the URLs run
+    out; a URL that 404s ends the stream rather than failing the run, so a corpus that
+    has lost a shard still yields a (smaller, reported) sample."""
+    import gzip
+    import json
+    import urllib.error
+    import urllib.request
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    dest = col.cache_path()
+    cap = col.cap_bytes or STREAM_CAP_BYTES
+    paths = dict(col.json_paths)
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    hdr = {"User-Agent": "vortex-bench/onpair"}
+    print(f"==> streaming {len(col.urls)} JSON-lines shards for columns {list(paths)} "
+          f"(cap {cap} B)\n        {col.urls[0]} ...\n        -> {dest}", file=sys.stderr)
+
+    out: dict[str, list[str]] = {c: [] for c in paths}
+    per_col = {c: 0 for c in paths}
+    total, shards = 0, 0
+    for url in col.urls:
+        try:
+            req = urllib.request.Request(url, headers=hdr)
+            resp = urllib.request.urlopen(req)
+        except urllib.error.HTTPError as e:
+            print(f"    {url}: HTTP {e.code}, stopping here", file=sys.stderr)
+            break
+        shards += 1
+        with resp, gzip.GzipFile(fileobj=resp) as stream:
+            for line in stream:
+                try:
+                    rec = json.loads(line)
+                except Exception:
+                    continue
+                for name, path in paths.items():
+                    v = rec
+                    for part in path.split("."):
+                        v = v.get(part) if isinstance(v, dict) else None
+                    s = v if isinstance(v, str) else ""
+                    out[name].append(s)
+                    per_col[name] += len(s.encode("utf-8"))
+        total = max(per_col.values())
+        print(f"    shard {shards}/{len(col.urls)}: {total} B", file=sys.stderr)
+        if total >= cap:
+            break
+    table = pa.table({c: pa.array(v, type=pa.string()) for c, v in out.items()})
+    tmp = dest.with_suffix(dest.suffix + ".part")
+    pq.write_table(table, tmp)
+    tmp.rename(dest)
+    print(f"==> wrote {table.num_rows} rows from {shards} shards ~{total} B -> {dest}",
+          file=sys.stderr)
+    return dest
+
+
 def ensure_parquet(binary: Path, col: Column) -> Path:
     path = col.parquet_path()
     if path.exists():
@@ -209,6 +367,10 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
             download(col.url, raw_path)
         text_to_parquet(raw_path, col.cache_path(), col.column)
         return col.cache_path()
+    if col.kind == "parquet_stream" and col.url:
+        return parquet_stream_to_parquet(col)
+    if col.kind == "jsonl" and col.urls:
+        return jsonl_to_parquet(col)
     if col.kind == "amazon":
         return amazon_to_parquet(col)
     if col.kind == "synthetic":
