@@ -1353,18 +1353,24 @@ struct KernelVariant {
 }
 
 #[cfg(feature = "cuda")]
+// The experiment surface is the PACKED decoder plus the kernels the selector still
+// dispatches to. 45 variants were archived to kernels/src/_archive on 2026-08-18: the
+// packed decoder changes four things at once against the split8read family (dense deduped
+// high plane, four-bit packed lengths, ballot/rank request compaction, hoisted first high
+// load), so any cross-family measurement confounds them. Every ablation and sensitivity
+// study is being rebuilt inside the packed family; until a packed counterpart exists, the
+// study simply is not run rather than run against the wrong baseline.
+//
+// Kept here and NOT part of any study: the `onpair` reference (byte-exact validation), and
+// the selector's non-packed branches (const1/const2, s4l1_16tpt, s8_4tpt, 4tpt_b128,
+// 4tpt_b128o12, 8tpt_b128, 2tpt). 4tpt/8tpt/4tpt_split8read remain only because kept
+// wrappers #include them.
 const GPU_KERNELS: &[KernelVariant] = &[
     KernelVariant {
         name: "onpair",
         layout: KernelLayout::Ref,
         chunk_size: 0,
         block_warps: 0,
-    },
-    KernelVariant {
-        name: "onpair_shmem",
-        layout: KernelLayout::Stride16,
-        chunk_size: 32,
-        block_warps: 16,
     },
     KernelVariant {
         name: "onpair_shmem_2tpt",
@@ -1378,26 +1384,6 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
     },
-    // Byte-exact counterfactual for the staged aligned drain: retain the
-    // 4tpt decode and scan, but store each token's true-length bytes directly.
-    KernelVariant {
-        name: "onpair_shmem_4tpt_directstore",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_wpb8",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_wpb8_occ",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
     // Track B: block-granularity + forced-occupancy sweep on the 4tpt body.
     KernelVariant {
         name: "onpair_shmem_4tpt_b128",
@@ -1406,70 +1392,27 @@ const GPU_KERNELS: &[KernelVariant] = &[
         block_warps: 4,
     },
     KernelVariant {
-        name: "onpair_shmem_4tpt_o6",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_b512o3",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
         name: "onpair_shmem_4tpt_b128o12",
         layout: KernelLayout::Stride16,
         chunk_size: 128,
         block_warps: 4,
     },
     KernelVariant {
-        name: "onpair_shmem_4tpt_b64",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 2,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_b64o24",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 2,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8read_b128o12",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    // Track B": split8read at finer granularity (256-thread blocks).
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8read_occ",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 128,
+        name: "onpair_decompress_1tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 32,
         block_warps: 8,
     },
     KernelVariant {
-        name: "onpair_shmem_5tpt_split8read",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 160,
+        name: "onpair_decompress_2tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 64,
         block_warps: 8,
     },
     KernelVariant {
-        name: "onpair_shmem_6tpt_split8read",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 192,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_7tpt_split8read",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 224,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_8tpt_split8read",
-        layout: KernelLayout::SplitRead8,
-        chunk_size: 256,
+        name: "onpair_decompress_3tpt",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 96,
         block_warps: 8,
     },
     KernelVariant {
@@ -1503,82 +1446,10 @@ const GPU_KERNELS: &[KernelVariant] = &[
         block_warps: 8,
     },
     KernelVariant {
-        name: "onpair_shmem_4tpt_split8",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8_wpb8",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split8_wpb8_occ",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_pdict",
-        layout: KernelLayout::PersistDict16,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_vdict",
-        layout: KernelLayout::PersistVDict,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    KernelVariant {
         name: "onpair_shmem_4tpt_split8read",
         layout: KernelLayout::SplitRead8,
         chunk_size: 128,
         block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ldcs",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_lenbucket",
-        layout: KernelLayout::LenBucket,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_lenbucket_b128",
-        layout: KernelLayout::LenBucket,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_regcache",
-        layout: KernelLayout::RegCache,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split4read",
-        layout: KernelLayout::SplitRead4,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_split4read_b128o12",
-        layout: KernelLayout::SplitRead4,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_cluster_dsmem",
-        layout: KernelLayout::ClusterDsmem,
-        chunk_size: 128,
-        block_warps: 8,
     },
     // 8tpt reuses the Stride16 launch path (identical kernel signature); only
     // chunk_size differs (256 tokens/warp-chunk vs 128), which is parameterized.
@@ -1595,132 +1466,15 @@ const GPU_KERNELS: &[KernelVariant] = &[
         block_warps: 4,
     },
     KernelVariant {
-        name: "onpair_shmem_4tpt_vwidth",
-        layout: KernelLayout::VWidth,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_vwidth_b128",
-        layout: KernelLayout::VWidth,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_vwidth4",
-        layout: KernelLayout::VWidth4,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_vwidth4_b128",
-        layout: KernelLayout::VWidth4,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_shdict8",
-        layout: KernelLayout::ShDict8,
-        chunk_size: 128,
-        block_warps: 8,
-    },
-    // Ablation proxies (NCU substitute): full minus one stage. `_ablate` is the
-    // byte-exact full baseline; `_no*` are timing-only (not byte-exact). The
-    // removed stage's cost = baseline GiB/s gained by its `_no*` variant.
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate_nogather",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate_noemit",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate_nodrain",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate_noscan",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_4tpt_ablate_cfree",
-        layout: KernelLayout::Stride16,
-        chunk_size: 128,
-        block_warps: 4,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s8",
-        layout: KernelLayout::Stride8,
-        chunk_size: 32,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s8_2tpt",
-        layout: KernelLayout::Stride8,
-        chunk_size: 64,
-        block_warps: 16,
-    },
-    KernelVariant {
         name: "onpair_shmem_s8_4tpt",
         layout: KernelLayout::Stride8,
         chunk_size: 128,
         block_warps: 16,
     },
     KernelVariant {
-        name: "onpair_shmem_s8_8tpt",
-        layout: KernelLayout::Stride8,
-        chunk_size: 256,
-        block_warps: 12,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s4l1",
-        layout: KernelLayout::Stride4,
-        chunk_size: 32,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s4l1_2tpt",
-        layout: KernelLayout::Stride4,
-        chunk_size: 64,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s4l1_4tpt",
-        layout: KernelLayout::Stride4,
-        chunk_size: 128,
-        block_warps: 16,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s4l1_8tpt",
-        layout: KernelLayout::Stride4,
-        chunk_size: 256,
-        block_warps: 12,
-    },
-    KernelVariant {
         name: "onpair_shmem_s4l1_16tpt",
         layout: KernelLayout::Stride4,
         chunk_size: 512,
-        block_warps: 8,
-    },
-    KernelVariant {
-        name: "onpair_shmem_s4l1_32tpt",
-        layout: KernelLayout::Stride4,
-        chunk_size: 1024,
         block_warps: 8,
     },
     KernelVariant {
@@ -1735,15 +1489,14 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 16,
     },
+
 ];
 
 #[cfg(feature = "cuda")]
 const TPT_MATCHED_KERNELS: &[&str] = &[
-    "onpair_shmem_4tpt_split8read_occ",
-    "onpair_shmem_5tpt_split8read",
-    "onpair_shmem_6tpt_split8read",
-    "onpair_shmem_7tpt_split8read",
-    "onpair_shmem_8tpt_split8read",
+    "onpair_decompress_1tpt",
+    "onpair_decompress_2tpt",
+    "onpair_decompress_3tpt",
     "onpair_decompress",
     "onpair_decompress_5tpt",
     "onpair_decompress_6tpt",
@@ -4709,7 +4462,7 @@ mod tests {
     fn gpu_kernel_allowlist_is_exact_and_ordered() -> Result<()> {
         let requested = vec![
             "onpair_decompress_6tpt".to_string(),
-            "onpair_shmem_6tpt_split8read".to_string(),
+            "onpair_decompress_5tpt".to_string(),
         ];
         let selected = select_gpu_kernels(Some(&requested))?;
         assert_eq!(
