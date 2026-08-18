@@ -1994,7 +1994,11 @@ fn kernel_result_metadata(
         staged_input_bytes,
         comparison: in_comparison.then(|| "tpt-matched".to_string()),
         abi_family,
-        launch_bounds_max_threads: in_comparison.then_some(256),
+        // Derived from the variant rather than restated, so a variant that changes its block
+        // size cannot report someone else's. min_blocks is still a literal: it lives only in
+        // the .cu as ONPAIR_MIN_BLOCKS and the registration has no field for it yet, which is
+        // the host-side half of the single-source-of-truth fix (see the packed-only spec).
+        launch_bounds_max_threads: in_comparison.then_some(variant.block_warps * 32),
         launch_bounds_min_blocks: in_comparison.then_some(4),
     })
 }

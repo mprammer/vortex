@@ -15,17 +15,22 @@
 #ifndef ONPAIR_KERNEL_NAME
 #error "ONPAIR_KERNEL_NAME must be defined"
 #endif
+// The block size is ONE definition, and both the launch bound and the shared-memory
+// allocation derive from it. They were previously independent -- __launch_bounds__(256, 4)
+// in each variant and a hardcoded WARPS_PER_BLOCK_MAX of 8 here -- so a variant that changed
+// its block size without changing the other silently either over-allocated shared memory for
+// warps it never launches, or, in the dangerous direction, indexed s_buf_all and s_requests
+// past their end. Derive both and the failure mode cannot occur.
+#ifndef ONPAIR_BLOCK_THREADS
+#define ONPAIR_BLOCK_THREADS 256u
+#endif
+#ifndef ONPAIR_MIN_BLOCKS
+#define ONPAIR_MIN_BLOCKS 4u
+#endif
 #ifndef ONPAIR_LAUNCH_BOUNDS
-#define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 4)
+#define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(ONPAIR_BLOCK_THREADS, ONPAIR_MIN_BLOCKS)
 #endif
-
-// Sized to the block, not to the largest block we happen to ship. Left at 8 this
-// over-allocates shared memory for warps a smaller block never launches -- at 128 threads
-// that is twice what the kernel needs, which would surface as a block-size effect that is
-// really an allocation artifact. Any variant setting a block size should set this to match.
-#ifndef WARPS_PER_BLOCK_MAX
-#define WARPS_PER_BLOCK_MAX 8u
-#endif
+#define WARPS_PER_BLOCK_MAX (ONPAIR_BLOCK_THREADS / 32u)
 #define TOKENS_PER_WARP     (TOKENS_PER_THREAD * 32u)
 #define WARP_BUF_BYTES      (TOKENS_PER_WARP * 16u + 32u)
 #define REQUESTS_PER_WARP   TOKENS_PER_WARP
@@ -76,6 +81,14 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     constexpr unsigned mask = 0xffffffffu;
     const int lane = threadIdx.x & 31;
     const uint32_t warp_id = threadIdx.x >> 5;
+    // Every shared index below is relative to warp_id, so a block launched wider than the
+    // kernel was compiled for would run off the end of s_buf_all and s_requests and corrupt
+    // another warp's staging silently. The host is expected to launch ONPAIR_BLOCK_THREADS;
+    // this makes a mismatch drop work rather than produce wrong bytes, and the host-side
+    // check on MAX_THREADS_PER_BLOCK is what turns it into a loud failure.
+    if (warp_id >= WARPS_PER_BLOCK_MAX) {
+        return;
+    }
     const uint64_t chunk = (uint64_t)blockIdx.x * (uint64_t)(blockDim.x >> 5) + (uint64_t)warp_id;
     if (chunk * TOKENS_PER_WARP >= total_tokens) {
         return;
