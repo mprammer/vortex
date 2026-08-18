@@ -137,6 +137,10 @@ pub struct CellResult {
     pub bits: u32,
     /// OnPair training threshold.
     pub threshold: f64,
+    /// OnPair training-shuffle seed. Zero requests the trainer's historical
+    /// random-device behavior; a nonzero value makes the dictionary reproducible.
+    #[serde(default)]
+    pub training_seed: u64,
     /// Per-chunk uncompressed byte budget.
     pub chunk_bytes: u64,
     /// Rows in the sampled prefix.
@@ -657,6 +661,7 @@ pub async fn run_column(
     bits: &[u32],
     chunk_bytes: &[u64],
     thresholds: &[f64],
+    training_seed: u64,
     sample_bytes: u64,
     file_target_bytes: u64,
     out_root: &Path,
@@ -710,6 +715,7 @@ pub async fn run_column(
                     &sample,
                     b,
                     thr,
+                    training_seed,
                     cb,
                     file_target_bytes,
                     out_root,
@@ -858,6 +864,7 @@ async fn run_cell_fsst12(
         codec: "fsst12".to_string(),
         bits: 12,
         threshold: 0.0,
+        training_seed: 0,
         chunk_bytes,
         rows: sample.rows as u64,
         unique_count: sample.unique_count,
@@ -897,13 +904,19 @@ async fn run_cell(
     sample: &Sample,
     bits: u32,
     threshold: f64,
+    training_seed: u64,
     chunk_bytes: u64,
     file_target_bytes: u64,
     out_root: &Path,
     gpu_config: Option<GpuBenchmarkConfig>,
 ) -> Result<CellResult> {
+    let seed_suffix = if training_seed == 0 {
+        String::new()
+    } else {
+        format!("_seed{training_seed}")
+    };
     let out_dir = out_root.join(dataset_id).join(column).join(format!(
-        "bits{bits}_chunk{}_thr{:.2}",
+        "bits{bits}_chunk{}_thr{:.2}{seed_suffix}",
         human_bytes(chunk_bytes),
         threshold,
     ));
@@ -912,6 +925,7 @@ async fn run_cell(
     let ranges = chunk_ranges(sample.rows, sample.raw_bytes, chunk_bytes);
     let mut config = config_with_bits(bits);
     config.threshold = threshold;
+    config.seed = training_seed;
 
     // 1. Compress each chunk (own dictionary), then BtrBlocks-compress the
     //    OnPair children, in parallel.
@@ -1109,6 +1123,7 @@ async fn run_cell(
         codec: "onpair".to_string(),
         bits,
         threshold,
+        training_seed,
         chunk_bytes,
         rows: sample.rows as u64,
         unique_count: sample.unique_count,

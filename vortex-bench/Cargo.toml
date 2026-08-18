@@ -82,6 +82,7 @@ cudarc = { workspace = true, optional = true }
 
 [dev-dependencies]
 insta = { workspace = true }
+vortex-fsst = { workspace = true, features = ["_test-harness"] }
 
 [features]
 cuda = ["dep:cudarc", "dep:vortex-cuda"]

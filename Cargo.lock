@@ -10350,6 +10350,7 @@ dependencies = [
  "uuid",
  "vortex",
  "vortex-cuda",
+ "vortex-fsst",
  "vortex-onpair",
  "vortex-tensor",
 ]

@@ -99,6 +99,10 @@ enum Command {
         /// OnPair training thresholds.
         #[arg(long, value_delimiter = ',', default_value = "0.2")]
         threshold: Vec<f64>,
+        /// OnPair training-shuffle seed. 0 preserves the historical random-device behavior;
+        /// a nonzero seed makes the trained dictionary reproducible.
+        #[arg(long, default_value_t = 0)]
+        training_seed: u64,
         /// Raw-payload sample cap (default ~1GB).
         #[arg(long, default_value_t = 1_000_000_000)]
         sample_bytes: u64,
@@ -175,6 +179,7 @@ async fn main() -> Result<()> {
             bits,
             chunk_bytes,
             threshold,
+            training_seed,
             sample_bytes,
             file_target_bytes,
             out_dir,
@@ -191,6 +196,7 @@ async fn main() -> Result<()> {
                 &bits,
                 &chunk_bytes,
                 &threshold,
+                training_seed,
                 sample_bytes,
                 file_target_bytes,
                 &out_dir,
@@ -301,26 +307,37 @@ const CB_FRAGMENTS: &[&str] = &[
     "",
 ];
 
-/// One distinct filler segment, base-36 encoded. Short by construction, so widening the
-/// vocabulary moves token *diversity* far more than mean token length — the ladder has to
-/// move dictionary size without sliding every other selector predictor with it.
-fn vocab_segment(i: usize) -> String {
-    const ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
-    let (mut v, mut s) = (i, String::new());
-    loop {
-        s.push(ALPHABET[v % ALPHABET.len()] as char);
-        v /= ALPHABET.len();
-        if v == 0 {
-            break;
-        }
+const VOCAB_SEGMENT_WIDTH: usize = 3;
+const VOCAB_ALPHABET: &[u8] = b"abcdefghijklmnopqrstuvwxyz0123456789";
+const VOCAB_CAPACITY: usize = 36 * 36 * 36;
+const VOCAB_RNG_SEED: u64 = 456;
+const VOCAB_DIVERSE_EVERY: u64 = 8;
+
+/// One fixed-width, base-36 filler segment. Every positive rung adds exactly the same
+/// number of bytes per row, so vocabulary size does not also become a row-length knob.
+fn vocab_segment(mut i: usize) -> String {
+    let mut s = String::with_capacity(VOCAB_SEGMENT_WIDTH);
+    for _ in 0..VOCAB_SEGMENT_WIDTH {
+        s.push(VOCAB_ALPHABET[i % VOCAB_ALPHABET.len()] as char);
+        i /= VOCAB_ALPHABET.len();
     }
     s
+}
+
+/// Map one filler RNG draw to the pool. Keeping seven-eighths of the probability mass on
+/// a common sentinel lets `vocab` vary tail diversity without also varying its frequency.
+fn vocab_index(draw: u64, pool_len: u64) -> Result<usize> {
+    anyhow::ensure!(pool_len > 0, "synthetic URL vocabulary must be nonzero");
+    if pool_len == 1 || !draw.is_multiple_of(VOCAB_DIVERSE_EVERY) {
+        return Ok(0);
+    }
+    Ok(1 + usize::try_from((draw / VOCAB_DIVERSE_EVERY) % (pool_len - 1))?)
 }
 
 /// Deterministic ClickBench-style URL generator (seed 123), deterministic for the
 /// committed `Cargo.lock`. Mirrors `vortex_fsst::test_utils::generate_clickbench_urls`.
 ///
-/// `vocab` widens the token vocabulary — and so the OnPair dictionary — by drawing one
+/// `vocab` widens the token vocabulary — and so the OnPair dictionary — by selecting one
 /// extra path segment per row from a pool of `vocab` distinct strings. It exists to make
 /// the kernel selector's dictionary-size thresholds *identifiable*. The measured corpus
 /// clusters near 870, 4096, and 65536 entries with nothing in between, so a threshold
@@ -331,13 +348,27 @@ fn vocab_segment(i: usize) -> String {
 /// random values per row in the same order. That is load-bearing rather than tidy: the
 /// committed `synthetic/url` cell must stay byte-identical or it stops being comparable
 /// with every measurement already in the artifact.
-fn generate_clickbench_urls(n: usize, vocab: usize) -> Vec<String> {
+///
+/// Positive rungs use a second RNG, so the scheme/domain/path/params/fragment stream is
+/// also identical between rungs. Every row receives a fixed-width segment: seven-eighths
+/// use the common pool entry and one-eighth draw from the diverse tail. Holding that
+/// diversity mass fixed makes `vocab` a smoother dictionary-cardinality control than a
+/// uniform pool, which abruptly fills the dictionary at campaign chunk sizes. A raw draw
+/// is mapped without range-sampling rejection, so every positive rung consumes exactly
+/// one filler draw per row.
+fn generate_clickbench_urls(n: usize, vocab: usize) -> Result<Vec<String>> {
     use rand::RngExt;
     use rand::SeedableRng;
     use rand::prelude::StdRng;
 
+    anyhow::ensure!(
+        vocab <= VOCAB_CAPACITY,
+        "synthetic URL vocabulary {vocab} exceeds the {VOCAB_CAPACITY}-segment fixed-width capacity"
+    );
     let pool: Vec<String> = (0..vocab).map(vocab_segment).collect();
     let mut rng = StdRng::seed_from_u64(123);
+    let mut vocab_rng = StdRng::seed_from_u64(VOCAB_RNG_SEED);
+    let pool_len = u64::try_from(pool.len())?;
     (0..n)
         .map(|_| {
             let scheme = if rng.random_bool(0.7) {
@@ -351,10 +382,11 @@ fn generate_clickbench_urls(n: usize, vocab: usize) -> Vec<String> {
             let fragment = CB_FRAGMENTS[rng.random_range(0..CB_FRAGMENTS.len())];
             if pool.is_empty() {
                 // No sixth draw: the RNG stream stays identical to the original generator.
-                format!("{scheme}://{domain}{path}{params}{fragment}")
+                Ok(format!("{scheme}://{domain}{path}{params}{fragment}"))
             } else {
-                let seg = &pool[rng.random_range(0..pool.len())];
-                format!("{scheme}://{domain}{path}/{seg}{params}{fragment}")
+                let idx = vocab_index(vocab_rng.random::<u64>(), pool_len)?;
+                let seg = &pool[idx];
+                Ok(format!("{scheme}://{domain}{path}/{seg}{params}{fragment}"))
             }
         })
         .collect()
@@ -379,7 +411,7 @@ fn gen_synth_urls(rows: usize, vocab: usize, out: &Path) -> Result<()> {
         std::fs::create_dir_all(parent)?;
     }
 
-    let urls = generate_clickbench_urls(rows, vocab);
+    let urls = generate_clickbench_urls(rows, vocab)?;
     let schema = Arc::new(Schema::new(vec![Field::new("url", DataType::Utf8, false)]));
 
     let tmp = out.with_extension("parquet.part");
@@ -424,37 +456,39 @@ fn collect_vortex_files(paths: &[PathBuf]) -> Result<Vec<PathBuf>> {
 mod tests {
     use super::*;
 
-    /// `vocab == 0` must reproduce the pre-2026-08-17 corpus exactly. The committed
-    /// `synthetic/url` cell was measured with that generator, so any drift here silently
-    /// decouples every new synthetic measurement from the ones already in the artifact.
-    /// The guarantee holds because the zero case takes no sixth draw from the RNG.
+    /// Compare element-by-element with the still-maintained mirror of the original
+    /// pre-2026-08-17 implementation. One million rows exercises the RNG stream far past
+    /// a shape or spot-check without making the ordinary test suite materialise all 10M.
     #[test]
-    fn vocab_zero_preserves_the_original_corpus() {
-        let urls = generate_clickbench_urls(64, 0);
-        assert_eq!(urls.len(), 64);
-        // Spot-check the shape rather than a golden blob: no filler segment is spliced in,
-        // and the scheme/domain/path/params/fragment concatenation is unchanged.
-        for u in &urls {
-            assert!(u.starts_with("https://") || u.starts_with("http://"), "{u}");
+    fn vocab_zero_preserves_the_original_corpus() -> Result<()> {
+        const ROWS: usize = 1_000_000;
+        let actual = generate_clickbench_urls(ROWS, 0)?;
+        let original = vortex_fsst::test_utils::generate_clickbench_urls(ROWS);
+        assert_eq!(actual.len(), original.len());
+        for (row, (actual, original)) in actual.iter().zip(&original).enumerate() {
+            assert_eq!(actual, original, "synthetic URL changed at row {row}");
         }
-        // Determinism: the same seed yields the same sequence.
-        assert_eq!(urls, generate_clickbench_urls(64, 0));
+        Ok(())
     }
 
-    /// The ladder must actually move token diversity, monotonically, or it cannot make the
-    /// selector's dictionary-size threshold identifiable.
+    /// A positive rung may add only its fixed-width segment; drawing the segment must not
+    /// perturb any of the five base URL choices on this or a later row.
     #[test]
-    fn widening_the_vocabulary_raises_distinct_values() {
-        use std::collections::HashSet;
-        let distinct = |vocab| {
-            generate_clickbench_urls(20_000, vocab)
-                .into_iter()
-                .collect::<HashSet<_>>()
-                .len()
-        };
-        let (base, mid, wide) = (distinct(0), distinct(256), distinct(4096));
-        assert!(mid > base, "vocab 256 ({mid}) should exceed baseline ({base})");
-        assert!(wide > mid, "vocab 4096 ({wide}) should exceed vocab 256 ({mid})");
+    fn filler_rng_does_not_shift_the_base_corpus() -> Result<()> {
+        let base = generate_clickbench_urls(20_000, 0)?;
+        let widened = generate_clickbench_urls(20_000, 3584)?;
+        for (row, (base, widened)) in base.iter().zip(&widened).enumerate() {
+            let only_inserts_one_segment = (0..=base.len()).any(|at| {
+                widened.as_bytes().get(at) == Some(&b'/')
+                    && widened.get(..at) == base.get(..at)
+                    && widened.get(at + 1 + VOCAB_SEGMENT_WIDTH..) == base.get(at..)
+            });
+            assert!(
+                only_inserts_one_segment,
+                "base URL stream changed at row {row}"
+            );
+        }
+        Ok(())
     }
 
     /// Distinct pool indices must give distinct segments, otherwise the pool silently
@@ -462,7 +496,22 @@ mod tests {
     #[test]
     fn vocab_segments_are_distinct() {
         use std::collections::HashSet;
-        let segs: HashSet<String> = (0..4096).map(vocab_segment).collect();
-        assert_eq!(segs.len(), 4096);
+        let segs: HashSet<String> = (0..VOCAB_CAPACITY).map(vocab_segment).collect();
+        assert_eq!(segs.len(), VOCAB_CAPACITY);
+        assert!(segs.iter().all(|seg| seg.len() == VOCAB_SEGMENT_WIDTH));
+        assert!(generate_clickbench_urls(1, VOCAB_CAPACITY + 1).is_err());
+    }
+
+    #[test]
+    fn sparse_vocab_keeps_diversity_mass_fixed() -> Result<()> {
+        const POOL_LEN_U64: u64 = 512;
+        const POOL_LEN_USIZE: usize = 512;
+        let indices = (0..8_000)
+            .map(|draw| vocab_index(draw, POOL_LEN_U64))
+            .collect::<Result<Vec<_>>>()?;
+        assert_eq!(indices.iter().filter(|&&idx| idx != 0).count(), 1_000);
+        assert!(indices.iter().all(|&idx| idx < POOL_LEN_USIZE));
+        assert!((0..8_000).all(|draw| matches!(vocab_index(draw, 1), Ok(0))));
+        Ok(())
     }
 }

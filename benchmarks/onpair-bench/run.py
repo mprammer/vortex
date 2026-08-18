@@ -789,6 +789,7 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
             "--bits", bits,
             "--chunk-bytes", chunk_bytes,
             "--threshold", thresholds,
+            "--training-seed", str(col.synth_training_seed),
             "--codec", args.codec,
             "--sample-bytes", str(args.sample_bytes),
             "--file-target-bytes", str(int(args.file_target_mb * MB)),

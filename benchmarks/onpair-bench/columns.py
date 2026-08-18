@@ -124,6 +124,9 @@ class Column:
     # synthetic: distinct filler path segments, widening the OnPair dictionary. 0 keeps the
     # original seed-123 corpus byte-for-byte; positive values are the selector ladder.
     synth_vocab: int = 0
+    # synthetic ladder only: 0 preserves the harness's historical random-device training;
+    # a nonzero value pins OnPair's row shuffle so rung comparisons are reproducible.
+    synth_training_seed: int = 0
     # amazon
     category: str | None = None  # HF Amazon-Reviews-2023 category, e.g. "Books"
     # parquet_stream / jsonl: every column of the dataset shares one cache file, so the
@@ -310,13 +313,19 @@ COLUMNS: list[Column] = [
     # Dictionary-cardinality ladder. The measured corpus clusters near 870, 4096 and 65536
     # dictionary entries with nothing in between, so any selector threshold placed inside
     # those gaps classifies no observation and cannot be fitted -- the Ada rule's 2048 sits
-    # in exactly such a gap, which is why 1024 and 2048 score identically. These rungs put
-    # observations in the gap so the threshold becomes identifiable instead of asserted.
-    # Same generator, same seed, one extra path segment drawn from a pool of `synth_vocab`
-    # distinct strings; each rung gets its own cache because the corpora differ.
+    # in exactly such a gap, which is why 1024 and 2048 score identically. These candidate
+    # rungs are intended to put observations in the gap so the threshold can be fitted.
+    # Same base URL stream, plus one fixed-width path segment selected by an independent
+    # RNG from `synth_vocab` distinct strings. One-eighth of rows use the diverse tail and
+    # the rest use a common sentinel, holding diversity frequency fixed while pool size
+    # changes. The rungs are candidates from CPU preflight; `gpu.dict_entries_max`, not the
+    # vocabulary value or `dict_bytes`, decides which cells actually straddle the gate.
+    # Cache names include the generator revision so corpora from the earlier
+    # variable-width/single-RNG design cannot be silently reused.
     *(
         Column(dataset_id=f"synthdict-{v}", column="url", kind="synthetic",
-               synth_vocab=v, cache=f"synthetic_urls_vocab{v}.parquet")
-        for v in (256, 1024, 2048, 3072, 6144, 16384)
+               synth_vocab=v, synth_training_seed=1,
+               cache=f"synthetic_urls_fixed3_sparse8_v2_vocab{v}.parquet")
+        for v in (512, 1024, 2048, 3072, 6144, 16384)
     ),
 ]
