@@ -1251,6 +1251,9 @@ struct GpuOnPairChunk {
     chunk_offsets_32: vortex::array::buffer::BufferHandle,
     chunk_offsets_64: vortex::array::buffer::BufferHandle,
     chunk_offsets_128: vortex::array::buffer::BufferHandle,
+    // K=3 in the coarsening grid decodes 96 codes per warp; every other rung's chunk size
+    // was already precomputed here.
+    chunk_offsets_96: vortex::array::buffer::BufferHandle,
     chunk_offsets_160: vortex::array::buffer::BufferHandle,
     chunk_offsets_192: vortex::array::buffer::BufferHandle,
     chunk_offsets_224: vortex::array::buffer::BufferHandle,
@@ -3561,6 +3564,7 @@ async fn stage_gpu_chunk(
     let chunk_offsets_32 = chunk_offsets(&codes_u16, &lens_table, 32, decoded_bytes);
     let chunk_offsets_64 = chunk_offsets(&codes_u16, &lens_table, 64, decoded_bytes);
     let chunk_offsets_128 = chunk_offsets(&codes_u16, &lens_table, 128, decoded_bytes);
+    let chunk_offsets_96 = chunk_offsets(&codes_u16, &lens_table, 96, decoded_bytes);
     let chunk_offsets_160 = chunk_offsets(&codes_u16, &lens_table, 160, decoded_bytes);
     let chunk_offsets_192 = chunk_offsets(&codes_u16, &lens_table, 192, decoded_bytes);
     let chunk_offsets_224 = chunk_offsets(&codes_u16, &lens_table, 224, decoded_bytes);
@@ -3593,6 +3597,7 @@ async fn stage_gpu_chunk(
         chunk_offsets_32: ctx.copy_to_device::<u64, _>(chunk_offsets_32)?.await?,
         chunk_offsets_64: ctx.copy_to_device::<u64, _>(chunk_offsets_64)?.await?,
         chunk_offsets_128: ctx.copy_to_device::<u64, _>(chunk_offsets_128)?.await?,
+        chunk_offsets_96: ctx.copy_to_device::<u64, _>(chunk_offsets_96)?.await?,
         chunk_offsets_160: ctx.copy_to_device::<u64, _>(chunk_offsets_160)?.await?,
         chunk_offsets_192: ctx.copy_to_device::<u64, _>(chunk_offsets_192)?.await?,
         chunk_offsets_224: ctx.copy_to_device::<u64, _>(chunk_offsets_224)?.await?,
@@ -4754,6 +4759,7 @@ fn chunk_offsets_for_variant(
         32 => Ok(chunk.chunk_offsets_32.cuda_view::<u64>()?),
         64 => Ok(chunk.chunk_offsets_64.cuda_view::<u64>()?),
         128 => Ok(chunk.chunk_offsets_128.cuda_view::<u64>()?),
+        96 => Ok(chunk.chunk_offsets_96.cuda_view::<u64>()?),
         160 => Ok(chunk.chunk_offsets_160.cuda_view::<u64>()?),
         192 => Ok(chunk.chunk_offsets_192.cuda_view::<u64>()?),
         224 => Ok(chunk.chunk_offsets_224.cuda_view::<u64>()?),
@@ -4770,6 +4776,7 @@ fn chunk_offsets_len(chunk: &GpuOnPairChunk, chunk_size: usize) -> Result<usize>
         32 => Ok(chunk.chunk_offsets_32.len()),
         64 => Ok(chunk.chunk_offsets_64.len()),
         128 => Ok(chunk.chunk_offsets_128.len()),
+        96 => Ok(chunk.chunk_offsets_96.len()),
         160 => Ok(chunk.chunk_offsets_160.len()),
         192 => Ok(chunk.chunk_offsets_192.len()),
         224 => Ok(chunk.chunk_offsets_224.len()),
