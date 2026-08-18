@@ -19,7 +19,13 @@
 #define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(256, 4)
 #endif
 
+// Sized to the block, not to the largest block we happen to ship. Left at 8 this
+// over-allocates shared memory for warps a smaller block never launches -- at 128 threads
+// that is twice what the kernel needs, which would surface as a block-size effect that is
+// really an allocation artifact. Any variant setting a block size should set this to match.
+#ifndef WARPS_PER_BLOCK_MAX
 #define WARPS_PER_BLOCK_MAX 8u
+#endif
 #define TOKENS_PER_WARP     (TOKENS_PER_THREAD * 32u)
 #define WARP_BUF_BYTES      (TOKENS_PER_WARP * 16u + 32u)
 #define REQUESTS_PER_WARP   TOKENS_PER_WARP
