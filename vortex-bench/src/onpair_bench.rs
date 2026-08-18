@@ -1810,6 +1810,10 @@ async fn run_gpu_kernel_bench(
     let total_tokens = chunks.iter().map(|c| c.total_tokens as u64).sum::<u64>();
     let cc_major = device_cc_major(&setup_ctx)?;
     let cc_minor = device_cc_minor(&setup_ctx)?;
+    // Not fail-closed: 0 means "could not ask", and applicability then falls back to the
+    // static cap, which is the pre-existing behaviour. A missing attribute should not stop
+    // a run; asking for more shared memory than the device grants should stop a kernel.
+    let max_dynamic_shared = device_max_dynamic_shared(&setup_ctx);
     let selector_inputs = auto_kernel_inputs(&chunks);
     let selector_kernel = pick_auto_kernel(selector_inputs, cc_major, cc_minor).to_string();
     // Persist the exact feature consumed by the selector. In particular, this is
@@ -1890,7 +1894,9 @@ async fn run_gpu_kernel_bench(
         // sm_80) report inapplicable rather than launching the arch stub.
         let cc_reason = (cc_major < 9 && matches!(variant.layout, KernelLayout::ClusterDsmem))
             .then(|| format!("thread-block clusters require sm_90+ (device cc {cc_major}.x)"));
-        if let Some(reason) = cc_reason.or_else(|| inapplicable_reason(*variant, &chunks)) {
+        if let Some(reason) =
+            cc_reason.or_else(|| inapplicable_reason(*variant, &chunks, max_dynamic_shared))
+        {
             if explicit_selection {
                 anyhow::bail!(
                     "requested GPU kernel {} is inapplicable: {reason}",
@@ -3340,7 +3346,11 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
 }
 
 #[cfg(feature = "cuda")]
-fn inapplicable_reason(variant: KernelVariant, chunks: &[GpuOnPairChunk]) -> Option<String> {
+fn inapplicable_reason(
+    variant: KernelVariant,
+    chunks: &[GpuOnPairChunk],
+    max_dynamic_shared: usize,
+) -> Option<String> {
     match variant.layout {
         KernelLayout::Ref
         | KernelLayout::Stride16
@@ -3402,8 +3412,14 @@ fn inapplicable_reason(variant: KernelVariant, chunks: &[GpuOnPairChunk]) -> Opt
             .then(|| "quantized variable-width dict not built (offset > 27 bits)".to_string()),
         KernelLayout::ShDict8 => chunks.iter().find_map(|c| {
             let shared = shdict8_shared_bytes(c.lens.len(), variant.block_warps);
-            (shared > CLUSTER_DSMEM_SHARED_CAP).then(|| {
-                format!("dict_s8 + staging needs {shared} B shared, over {CLUSTER_DSMEM_SHARED_CAP} B cap")
+            // Bound by whichever is smaller: our own tuning cap, or what this device will
+            // actually grant. Comparing only against the static cap let an Ada part accept a
+            // kernel it could not launch, and the failure surfaced as a hard error that took
+            // the whole column down instead of skipping one variant.
+            let cap = if max_dynamic_shared == 0 { CLUSTER_DSMEM_SHARED_CAP }
+                      else { CLUSTER_DSMEM_SHARED_CAP.min(max_dynamic_shared) };
+            (shared > cap).then(|| {
+                format!("dict_s8 + staging needs {shared} B shared, over the {cap} B cap for this device")
             })
         }),
     }
@@ -3453,6 +3469,20 @@ fn device_cc_major(ctx: &CudaExecutionCtx) -> Result<i32> {
             .context()
             .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_COMPUTE_CAPABILITY_MAJOR),
     )
+}
+
+/// Largest dynamic shared memory a single block may opt into on this device. Ada (sm_89)
+/// allows ~100 KB where Hopper and Blackwell allow ~228 KB, and a kernel that asks for more
+/// than the device permits fails at launch with CUDA_ERROR_INVALID_VALUE rather than being
+/// skipped. Queried so applicability can be decided against the actual part.
+#[cfg(feature = "cuda")]
+fn device_max_dynamic_shared(ctx: &CudaExecutionCtx) -> usize {
+    use cudarc::driver::sys;
+    ctx.stream()
+        .context()
+        .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        .unwrap_or(0)
+        .max(0) as usize
 }
 
 /// Compute-capability minor. Needed because Ampere (sm_80, A100) and Ada (sm_89, L40S)
