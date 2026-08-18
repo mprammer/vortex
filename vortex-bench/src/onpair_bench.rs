@@ -3617,15 +3617,37 @@ fn pick_auto_kernel(inputs: AutoKernelInputs, cc_major: i32, cc_minor: i32) -> &
 /// (65536 = 512 KB `dict_s8`) does not fit and only ties `b128o12`, so it stays
 /// the default.
 #[cfg(feature = "cuda")]
-fn pick_general_blackwell(max_entries: usize, frac_le8: f32) -> &'static str {
-    const B200_SPLIT8READ_MAX_ENTRIES: usize = 16384;
-    const B200_SPLIT8READ_FRAC_LE8: f32 = 0.70;
-    if max_entries <= B200_SPLIT8READ_MAX_ENTRIES && frac_le8 >= B200_SPLIT8READ_FRAC_LE8 {
-        "onpair_shmem_4tpt_split8read_b128o12"
+fn pick_general_blackwell(_max_entries: usize, frac_le8: f32) -> &'static str {
+    if frac_le8 >= PACKED_FRAC_LE8 {
+        "onpair_decompress_6tpt"
     } else {
         "onpair_shmem_4tpt_b128o12"
     }
 }
+
+/// Gate for the packed-dictionary decoder on HBM parts, as a token-weighted fraction of
+/// tokens at most eight bytes.
+///
+/// The packed decoder compacts its long-token ("high plane") reads and stages them in shared
+/// memory, betting that few tokens exceed eight bytes. On the 2026-08-18 campaign that bet
+/// pays on every HBM part: packed at six codes per thread wins 7 of 7 real text columns on
+/// A100, H100 and B300. Where it loses, it loses for the reason the design implies -- every
+/// worst-case cell has frac_le8 between 0.16 and 0.45, i.e. long tokens, where the staged
+/// high plane is the common path rather than the exception.
+///
+/// 0.50 sits between the two populations. Shortfall against the per-cell byte-exact oracle
+/// over 46 real cells per chip, median/mean/worst, previous rule then this one:
+///   A100  4.6/6.6/26.8 -> 0.0/4.6/23.2
+///   H100  4.9/6.6/17.5 -> 0.2/2.2/13.7
+///   B300  6.3/7.6/18.5 -> 0.0/2.2/15.7
+/// Sensitivity is mild between 0.40 and 0.70; 0.80 is worse on Blackwell.
+///
+/// The worst case stays in the teens. That is the honest out-of-sample cost of the earlier
+/// in-sample fit, which a review predicted would not hold, and one more threshold on these
+/// two features does not close it. The remaining tail is bits16, low-frac_le8 cells where the
+/// oracle picks a block-geometry variant (b64, b512o3, ldcs) that no rule here reaches.
+#[cfg(feature = "cuda")]
+const PACKED_FRAC_LE8: f32 = 0.50;
 
 /// Ada (sm_89 / L40S) general-case selector.
 ///
@@ -3662,11 +3684,9 @@ fn pick_general_ada(max_entries: usize) -> &'static str {
 /// likewise matches Blackwell: `dict_s8` is entries × 8 B, and the win lasts while
 /// that fits L1.
 #[cfg(feature = "cuda")]
-fn pick_general_ampere_hopper(max_entries: usize, frac_le8: f32) -> &'static str {
-    const SPLIT8READ_MAX_ENTRIES: usize = 16384;
-    const SPLIT8READ_FRAC_LE8: f32 = 0.70;
-    if max_entries <= SPLIT8READ_MAX_ENTRIES && frac_le8 >= SPLIT8READ_FRAC_LE8 {
-        "onpair_shmem_4tpt_split8read_b128o12"
+fn pick_general_ampere_hopper(_max_entries: usize, frac_le8: f32) -> &'static str {
+    if frac_le8 >= PACKED_FRAC_LE8 {
+        "onpair_decompress_6tpt"
     } else {
         "onpair_shmem_4tpt_b128"
     }
@@ -4503,16 +4523,20 @@ mod tests {
 
         for cc in [(8, 0), (9, 0)] {
             assert_eq!(
-                pick_auto_kernel(general(16384, 0.69), cc.0, cc.1),
+                pick_auto_kernel(general(16384, 0.49), cc.0, cc.1),
                 "onpair_shmem_4tpt_b128"
             );
             assert_eq!(
-                pick_auto_kernel(general(16384, 0.70), cc.0, cc.1),
-                "onpair_shmem_4tpt_split8read_b128o12"
+                pick_auto_kernel(general(16384, 0.50), cc.0, cc.1),
+                "onpair_decompress_6tpt"
             );
+            // Dictionary size does NOT gate packed on HBM. The 2026-08-18 campaign has 27
+            // cells with frac_le8 >= 0.50 and more than 16384 entries where packed still
+            // wins, and reinstating an entry-count gate measurably hurts H100 and B300 --
+            // packed's advantage is the staged high plane, not dictionary residency.
             assert_eq!(
-                pick_auto_kernel(general(16385, 1.0), cc.0, cc.1),
-                "onpair_shmem_4tpt_b128"
+                pick_auto_kernel(general(65536, 1.0), cc.0, cc.1),
+                "onpair_decompress_6tpt"
             );
         }
 
@@ -4525,17 +4549,18 @@ mod tests {
             "onpair_shmem_2tpt"
         );
 
+        // Blackwell takes the same packed gate, with its own long-token fallback.
         assert_eq!(
-            pick_auto_kernel(general(16384, 0.69), 10, 0),
+            pick_auto_kernel(general(16384, 0.49), 10, 0),
             "onpair_shmem_4tpt_b128o12"
         );
         assert_eq!(
-            pick_auto_kernel(general(16384, 0.70), 10, 0),
-            "onpair_shmem_4tpt_split8read_b128o12"
+            pick_auto_kernel(general(16384, 0.50), 10, 0),
+            "onpair_decompress_6tpt"
         );
         assert_eq!(
-            pick_auto_kernel(general(16385, 1.0), 10, 0),
-            "onpair_shmem_4tpt_b128o12"
+            pick_auto_kernel(general(65536, 1.0), 10, 0),
+            "onpair_decompress_6tpt"
         );
     }
 
@@ -4563,13 +4588,14 @@ mod tests {
     #[cfg(feature = "cuda")]
     #[test]
     fn selector_uses_token_weighted_frac_le8() {
-        // The unweighted chunk mean is 0.50, but 75% of tokens are in the short-token
-        // chunk. The production feature must therefore cross the fitted 0.70 gate.
+        // The unweighted chunk mean is 0.50, which sits exactly ON the packed gate; the
+        // token-weighted feature is 0.75 and clears it. Keeps the two aggregations
+        // distinguishable, which is the point of the test.
         let frac_le8 = token_weighted_fraction([(0.0, 1), (1.0, 3)]);
         assert_eq!(frac_le8, 0.75);
         assert_eq!(
             pick_auto_kernel(selector_inputs(false, false, 16, 4096, frac_le8), 9, 0),
-            "onpair_shmem_4tpt_split8read_b128o12"
+            "onpair_decompress_6tpt"
         );
     }
 
