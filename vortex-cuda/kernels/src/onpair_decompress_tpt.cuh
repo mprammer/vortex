@@ -75,8 +75,8 @@
 // high-length field, and silently corrupts requests. Widening the destination to thirteen bits
 // (bits 28:16, moving the three-bit high length to 31:29 and using the currently unused bit 31)
 // would raise the limit to K<=16.
-#if TOKENS_PER_THREAD > 8u
-#error "TOKENS_PER_THREAD > 8 overflows the 12-bit destination in pack_high_request"
+#if (TOKENS_PER_THREAD * 32u * ONPAIR_STAGE_BYTES) > 4096u
+#error "32*K*S exceeds the 12-bit destination field in pack_high_request"
 #endif
 // The kernel indexes shared state by warp and assumes whole warps.
 #if (ONPAIR_BLOCK_THREADS % 32u) != 0u
@@ -89,9 +89,28 @@
 #define ONPAIR_LO_VEC uint2
 #endif
 
+// S, staging bytes reserved per token. NOT a per-token quantity in any real sense: the buffer
+// must hold warp_total = sum of this batch's token lengths, and S=16 is simply the worst case
+// that is always safe because a token is at most 16 bytes. Smaller S is safe exactly when the
+// column's largest batch fits, which the host checks against the offset sidecar --
+// chunk_offsets[c+1] - chunk_offsets[c] IS that batch's decoded size, so the bound is known at
+// compression time and needs no runtime search and no overflow path.
+//
+// What S buys is indirect. Shared memory and L1 are one array split by a QUANTIZED carveout,
+// so shrinking the buffer only helps when it moves blocks*shared_per_block across a carveout
+// step. And the freed space becomes extra resident blocks by default, not L1 -- banking it as
+// cache requires cudaFuncAttributePreferredSharedMemoryCarveout on the host. S changes which
+// carveouts are reachable; the carveout is the actual lever.
+#ifndef ONPAIR_STAGE_BYTES
+#define ONPAIR_STAGE_BYTES 16u
+#endif
+#if ONPAIR_STAGE_BYTES < 1u || ONPAIR_STAGE_BYTES > 16u
+#error "ONPAIR_STAGE_BYTES must be in [1, 16]"
+#endif
+
 #define WARPS_PER_BLOCK_MAX (ONPAIR_BLOCK_THREADS / 32u)
 #define TOKENS_PER_WARP     (TOKENS_PER_THREAD * 32u)
-#define WARP_BUF_BYTES      (TOKENS_PER_WARP * 16u + 32u)
+#define WARP_BUF_BYTES      (TOKENS_PER_WARP * ONPAIR_STAGE_BYTES + 32u)
 #define REQUESTS_PER_WARP   TOKENS_PER_WARP
 
 __device__ inline uint64_t warp_scan_four_u16_prefixes(uint64_t x, int lane) {
