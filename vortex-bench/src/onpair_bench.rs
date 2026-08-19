@@ -5639,36 +5639,33 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
     let expanded: Vec<&str> = if requested == ["tpt-matched"] {
         TPT_MATCHED_KERNELS.to_vec()
     } else if requested == ["packed-s"] {
-        // The staging arm plus its W=8/H=1 baselines at the same K, so S is compared against
-        // the configuration it varies from rather than across the whole grid.
+        // The staging arm plus its W=8/H=1 baselines, and EVERY production kernel: the
+        // selector's pick must be among the timed set or the run aborts, and which kernel it
+        // picks depends on the column (frac_le8, dict_max_len) and the chip. Selecting by role
+        // rather than by name ends the whack-a-mole that cost two overnight waves.
         GPU_KERNELS
             .iter()
-            .map(|variant| variant.name)
-            .filter(|name| {
-                name.starts_with("onpair_ds_k")
-                    || name.starts_with("onpair_dg_k")
-                    // the shipped packed family, so the selector's choice is always timed
-                    || name.starts_with("onpair_decompress")
-                    || *name == "onpair"
+            .filter(|v| {
+                matches!(v.role, KernelRole::Production)
+                    || v.name.starts_with("onpair_ds_k")
+                    || v.name.starts_with("onpair_dg_k")
             })
+            .map(|variant| variant.name)
             .collect()
     } else if requested == ["packed-grid"] {
         // The coarsening x launch-configuration sweep: every generated grid point, plus the
         // reference the byte-exact check compares against. Named rather than enumerated so a
         // regenerated grid does not need the launcher edited.
+        // Every production kernel plus the whole parameter grid. The selector's choice varies
+        // by column and chip -- packed at frac_le8 >= 0.50, shmem_4tpt_b128o12 below it, the
+        // small-dictionary specials by dict_max_len -- and omitting any of them aborts the cell
+        // with "auto kernel ... was not timed".
         GPU_KERNELS
             .iter()
-            .map(|variant| variant.name)
-            .filter(|name| {
-                name.starts_with("onpair_dg_k")
-                    || name.starts_with("onpair_dw_k")
-                    || name.starts_with("onpair_dh_k")
-                    || name.starts_with("onpair_ds_k")
-                    // the shipped packed family: the selector's pick must be among the timed
-                    // kernels or the run fails with "auto kernel ... was not timed"
-                    || name.starts_with("onpair_decompress")
-                    || *name == "onpair"
+            .filter(|v| {
+                matches!(v.role, KernelRole::Production) || v.name.starts_with("onpair_d")
             })
+            .map(|variant| variant.name)
             .collect()
     } else {
         anyhow::ensure!(
