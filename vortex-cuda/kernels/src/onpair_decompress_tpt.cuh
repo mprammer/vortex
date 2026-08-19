@@ -62,6 +62,20 @@
 #error "ONPAIR_HIGH_READ_CAP must be in [1, TOKENS_PER_THREAD]"
 #endif
 
+// K <= 8 is a HARD limit of the request encoding, not a preference. pack_high_request puts the
+// staging destination in bits 27:16, twelve bits, max 4095. For N = 32K tokens the largest
+// destination is 16(N-1)+8 = 16N-8, so K=8 gives 4088 and fits; K=9 reaches 4600, overlaps the
+// high-length field, and silently corrupts requests. Widening the destination to thirteen bits
+// (bits 28:16, moving the three-bit high length to 31:29 and using the currently unused bit 31)
+// would raise the limit to K<=16.
+#if TOKENS_PER_THREAD > 8u
+#error "TOKENS_PER_THREAD > 8 overflows the 12-bit destination in pack_high_request"
+#endif
+// The kernel indexes shared state by warp and assumes whole warps.
+#if (ONPAIR_BLOCK_THREADS % 32u) != 0u
+#error "ONPAIR_BLOCK_THREADS must be a multiple of 32"
+#endif
+
 #if ONPAIR_LOW_PLANE_BYTES == 16u
 #define ONPAIR_LO_VEC uint4
 #else
