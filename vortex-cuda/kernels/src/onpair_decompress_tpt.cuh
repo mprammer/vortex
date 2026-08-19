@@ -51,15 +51,22 @@
 #error "ONPAIR_LOW_PLANE_BYTES must be 8 or 16"
 #endif
 
-// C, how many rounds of high-plane loads are issued BEFORE the low-byte emit and consumed
-// after it. This is the hoist that already exists in the shipped decoder at C=1: it is what
-// leaves independent work behind the LDG. C>1 keeps more loads live across the emit, which
-// costs registers. Meaningless when W=16, because there is no high plane.
-#ifndef ONPAIR_HIGH_READ_CAP
-#define ONPAIR_HIGH_READ_CAP 1u
+// H, how many rounds of high-plane tokens are HELD -- issued before the low-byte emit and
+// resolved after it. This is the hoist already in the shipped decoder at H=1: it is what leaves
+// independent work behind the LDG. H>1 keeps more loads live across the emit, costing registers.
+// Meaningless at W=16, where there is no high plane.
+//
+// Named H, not C: the paper already uses C1/C2/C3 for the three design challenges.
+//
+// H only does anything when the warp's queue is deeper than 32*(H-1). On a column where almost
+// every token is short -- wikipedia at OnPair-12 has frac_le8 = 0.981, about 3.6 long tokens per
+// K=6 warp -- round 2 can never fire, so H>1 there measures extra live registers and predicates
+// rather than extra early loads. Sweep H on deep-queue columns (low frac_le8), not shallow ones.
+#ifndef ONPAIR_HELD_HIGH
+#define ONPAIR_HELD_HIGH 1u
 #endif
-#if ONPAIR_HIGH_READ_CAP < 1u || ONPAIR_HIGH_READ_CAP > TOKENS_PER_THREAD
-#error "ONPAIR_HIGH_READ_CAP must be in [1, TOKENS_PER_THREAD]"
+#if ONPAIR_HELD_HIGH < 1u || ONPAIR_HELD_HIGH > TOKENS_PER_THREAD
+#error "ONPAIR_HELD_HIGH must be in [1, TOKENS_PER_THREAD]"
 #endif
 
 // K <= 8 is a HARD limit of the request encoding, not a preference. pack_high_request puts the
@@ -232,25 +239,25 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     }
     __syncwarp();
 
-    // Issue the first C rounds of high-plane loads now and consume them after the low-byte
-    // emit. C=1 is the shipped decoder; larger C keeps more loads live across the emit.
-    uint32_t hoist_destination[ONPAIR_HIGH_READ_CAP];
-    uint32_t hoist_length[ONPAIR_HIGH_READ_CAP];
-    uint2 hoist_high[ONPAIR_HIGH_READ_CAP];
-    bool hoist_active[ONPAIR_HIGH_READ_CAP];
+    // Hold the first H rounds of high-plane loads now and resolve them after the low-byte
+    // emit. H=1 is the shipped decoder; larger H keeps more loads live across the emit.
+    uint32_t hoist_destination[ONPAIR_HELD_HIGH];
+    uint32_t hoist_length[ONPAIR_HELD_HIGH];
+    uint2 hoist_high[ONPAIR_HELD_HIGH];
+    bool hoist_active[ONPAIR_HELD_HIGH];
 #pragma unroll
-    for (uint32_t c = 0u; c < ONPAIR_HIGH_READ_CAP; ++c) {
-        const uint32_t idx = (uint32_t)lane + c * 32u;
-        hoist_active[c] = idx < high_count;
-        hoist_destination[c] = 0u;
-        hoist_length[c] = 0u;
-        hoist_high[c] = make_uint2(0u, 0u);
-        if (hoist_active[c]) {
+    for (uint32_t h = 0u; h < ONPAIR_HELD_HIGH; ++h) {
+        const uint32_t idx = (uint32_t)lane + h * 32u;
+        hoist_active[h] = idx < high_count;
+        hoist_destination[h] = 0u;
+        hoist_length[h] = 0u;
+        hoist_high[h] = make_uint2(0u, 0u);
+        if (hoist_active[h]) {
             const uint32_t request = requests[idx];
             const uint32_t selected_code = request & 0xffffu;
-            hoist_destination[c] = (request >> 16u) & 0xfffu;
-            hoist_length[c] = (request >> 28u) + 1u;
-            hoist_high[c] = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)selected_code * 8u);
+            hoist_destination[h] = (request >> 16u) & 0xfffu;
+            hoist_length[h] = (request >> 28u) + 1u;
+            hoist_high[h] = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)selected_code * 8u);
         }
     }
 #endif
@@ -274,15 +281,15 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
 
 #if ONPAIR_LOW_PLANE_BYTES == 8u
 #pragma unroll
-    for (uint32_t c = 0u; c < ONPAIR_HIGH_READ_CAP; ++c) {
-        if (hoist_active[c]) {
-            emit_high_bytes(s_buf, hoist_destination[c], hoist_length[c], hoist_high[c]);
+    for (uint32_t h = 0u; h < ONPAIR_HELD_HIGH; ++h) {
+        if (hoist_active[h]) {
+            emit_high_bytes(s_buf, hoist_destination[h], hoist_length[h], hoist_high[h]);
         }
     }
 
     // The remaining rounds retain the baseline's dense queue drain.
 #pragma unroll
-    for (uint32_t round = ONPAIR_HIGH_READ_CAP; round < TOKENS_PER_THREAD; ++round) {
+    for (uint32_t round = ONPAIR_HELD_HIGH; round < TOKENS_PER_THREAD; ++round) {
         const uint32_t request_idx = (uint32_t)lane + round * 32u;
         if (request_idx < high_count) {
             const uint32_t request = requests[request_idx];
