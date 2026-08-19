@@ -5223,6 +5223,11 @@ const GPU_KERNELS: &[KernelVariant] = &[
     // END generated packed grid
 ];
 
+/// Preset names accepted by `--gpu-kernels`. A preset selects a family; individual kernel
+/// names remain an exact contract.
+#[cfg(feature = "cuda")]
+const PRESET_NAMES: &[&str] = &["tpt-matched", "packed-grid", "packed-s"];
+
 #[cfg(feature = "cuda")]
 const TPT_MATCHED_KERNELS: &[&str] = &[
     "onpair_decompress_1tpt",
@@ -5345,7 +5350,15 @@ async fn run_gpu_kernel_bench(
     let h2d_gib_s = measure_h2d_gib_s(&mut setup_ctx).await.unwrap_or(0.0);
 
     let variants = select_gpu_kernels(config.kernels.as_deref())?;
-    let explicit_selection = config.kernels.is_some();
+    // A preset names a FAMILY, so a member that does not apply to this column is data, not a
+    // user error. Naming individual kernels is still a typo-catching contract: asking for one
+    // by name and silently getting an inapplicable row would hide the mistake. S variants are
+    // inapplicable exactly when the column's largest batch does not fit, which is expected and
+    // must not abort the cell.
+    let explicit_selection = config
+        .kernels
+        .as_deref()
+        .is_some_and(|k| !matches!(k, [one] if PRESET_NAMES.contains(&one.as_str())));
     let is_matched_tpt_comparison = variants.len() == TPT_MATCHED_KERNELS.len()
         && variants
             .iter()
@@ -5374,6 +5387,31 @@ async fn run_gpu_kernel_bench(
     // bundled nvCOMP comparison so kernel-tuning sweeps iterate quickly. These are
     // the dominant wall-time costs and are irrelevant when comparing OnPair kernels.
     let fast = std::env::var("ONPAIR_FAST").is_ok_and(|v| v != "0");
+
+    // Variants otherwise run in a fixed family order -- reference, then W=8, then W=16, then
+    // H, then S -- so any thermal or boost drift over the cell is confounded WITH the
+    // experimental family. Shuffling decouples the two. The order is derived from a caller
+    // -supplied seed so a run stays reproducible; unset leaves the declaration order.
+    let mut variants = variants;
+    if let Ok(seed_raw) = std::env::var("ONPAIR_SHUFFLE_SEED") {
+        let seed: u64 = seed_raw
+            .trim()
+            .parse()
+            .with_context(|| format!("ONPAIR_SHUFFLE_SEED must be an integer, got {seed_raw:?}"))?;
+        // SplitMix64, so the permutation depends only on the seed and needs no rng crate.
+        let mut state = seed;
+        let mut next = || {
+            state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = state;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        };
+        for i in (1..variants.len()).rev() {
+            let j = (next() % (i as u64 + 1)) as usize;
+            variants.swap(i, j);
+        }
+    }
 
     for variant in &variants {
         if !explicit_selection && fast && matches!(variant.layout, KernelLayout::Ref) {
