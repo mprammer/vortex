@@ -5513,8 +5513,21 @@ async fn run_gpu_kernel_bench(
                 && r.role == "production"
                 && (!config.validate || r.verified == Some(true))
         })
-        .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
-        .context("no applicable shipped (non-ablate, non-directstore) CUDA OnPair kernels")?;
+        .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms));
+    // Restricting `best` to production kernels means an explicit allowlist of experimental
+    // variants legitimately has no production member -- an NCU capture profiles ONE grid
+    // kernel, for instance. That is not an error: fall back to the fastest byte-exact kernel
+    // that WAS requested, so a single-kernel run still reports a rate. With no allowlist the
+    // production family is always present, so this cannot silently promote an experimental
+    // kernel in a normal sweep.
+    let best = match best {
+        Some(b) => b,
+        None => kernels
+            .iter()
+            .filter(|r| r.applicable && (!config.validate || r.verified == Some(true)))
+            .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
+            .context("no applicable byte-exact CUDA OnPair kernels")?,
+    };
 
     // Whole-decompress end-to-end: time to copy the compressed payload H2D plus
     // the auto kernel's decode time, expressed as an output (decoded) GiB/s.
