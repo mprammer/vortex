@@ -99,9 +99,17 @@ enum Command {
         /// OnPair training thresholds.
         #[arg(long, value_delimiter = ',', default_value = "0.2")]
         threshold: Vec<f64>,
-        /// OnPair training-shuffle seed. 0 preserves the historical random-device behavior;
-        /// a nonzero seed makes the trained dictionary reproducible.
-        #[arg(long, default_value_t = 0)]
+        /// OnPair training-shuffle seed. 0 selects the trainer's NON-DETERMINISTIC path: upstream
+        /// `TrainingConfig::seed` is a `std::optional` ("nullopt -> non-deterministic") and the
+        /// shim only forwards a nonzero value, so 0 leaves it unset and every run trains a
+        /// different dictionary.
+        ///
+        /// Defaulted to a fixed seed on 2026-08-19, because that non-determinism had already split
+        /// two campaigns: NCU captures materialized 08-18 and coarsening sweeps materialized 08-19
+        /// disagreed on the best K for 4 of 8 OnPair-16 cells while agreeing 8/8 at OnPair-12, with
+        /// compressed sizes 1.8-2.6% apart for the same column and preset. Same code, different
+        /// dictionaries. Pass 0 explicitly only to reproduce a pre-2026-08-19 unseeded measurement.
+        #[arg(long, default_value_t = 20260819)]
         training_seed: u64,
         /// Raw-payload sample cap (default ~1GB).
         #[arg(long, default_value_t = 1_000_000_000)]

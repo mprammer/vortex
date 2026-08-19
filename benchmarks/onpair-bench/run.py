@@ -43,7 +43,7 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-from columns import AMAZON_URL, COLUMNS, DATA_DIR, REPO_ROOT, SRC_DIR, Column
+from columns import AMAZON_URL, COLUMNS, DATA_DIR, PBI_SCHEMA_BASE, REPO_ROOT, SRC_DIR, Column
 
 # Columns whose bench process exited non-zero. Consulted by the final exit status so an
 # all-failed run cannot look like a clean run with an empty matrix.
@@ -690,9 +690,298 @@ def jsonl_to_parquet(col: Column, identity: dict | None = None) -> Path:
     return dest
 
 
+def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
+    """Stream a Loghub system-log archive and take each log line as one column value.
+
+    A log file IS a single string column, and one line is one value -- which is how a columnar
+    store would hold it, so no reshaping is invented here.
+
+    Two container formats, handled differently on purpose:
+
+    * `.tar.gz` -- streamed. gzip is a stream, so we stop reading as soon as `cap_bytes` of text
+      has accumulated and never fetch the rest. This matters: Windows.log is 26 GB uncompressed
+      but a 1.15 GB sample consumes only ~66 MB of the compressed stream (measured), which is
+      cheaper than fetching HDFS_v1.zip (187 MB) whole. The tar header chain is parsed rather
+      than assumed, so the member is located by name instead of by position.
+    * `.zip` -- fetched whole, then read. Zip keeps its directory at the END of the file, so it
+      cannot be streamed from the front by `zipfile`. Only used where the archive is small enough
+      that this is cheaper than the alternative (HDFS_v1 is 187 MB).
+
+    A truncated or short archive is NOT silently accepted: the byte total is checked against the
+    cap and a shortfall is reported, because a half-downloaded log would otherwise look like a
+    legitimately smaller column.
+    """
+    import gzip
+    import io
+    import tarfile
+    import zipfile
+
+    import pyarrow as pa
+
+    dest = col.cache_path()
+    identity = identity or _stream_cache_identity(col)
+    cap = col.cap_bytes or STREAM_CAP_BYTES
+    member = col.member
+    if not member:
+        raise ValueError(f"{col.dataset_id}: loghub columns must name `member` (the .log inside)")
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    hdr = {"User-Agent": "vortex-bench/onpair"}
+    urls = list(col.urls) or ([col.url] if col.url else [])
+    print(f"==> streaming loghub {member} (cap {cap} B)\n        {urls[0]}\n        -> {dest}",
+          file=sys.stderr)
+
+    values: list[str] = []
+    nbytes = 0
+    sources = []
+    stop_reason = "all_sources_exhausted"
+
+    def take_lines(stream) -> bool:
+        """Accumulate whole lines from a binary stream until the cap. Partial trailing content is
+        discarded rather than emitted as a truncated value. Returns True if it stopped because the
+        cap was reached -- the caller needs that, because a line-aligned reader can never land on
+        the cap exactly (it stops when the NEXT line would exceed it), so `nbytes >= cap` is the
+        wrong completion test and made the short-cell warning fire on every successful run."""
+        nonlocal nbytes
+        buf = b""
+        while True:
+            chunk = stream.read(8 * 1024 * 1024)
+            if not chunk:
+                return False
+            buf += chunk
+            lines = buf.split(b"\n")
+            buf = lines.pop()
+            for ln in lines:
+                ln = ln.rstrip(b"\r").lstrip(b"\xef\xbb\xbf")   # Windows.log carries a BOM
+                if nbytes + len(ln) > cap:
+                    return True
+                values.append(ln.decode("utf-8", "replace"))
+                nbytes += len(ln)
+
+    for url in urls:
+        req = urllib.request.Request(url, headers=hdr)
+
+        def read_archive(response, url=url):
+            info = {"url": url, "etag": response.headers.get("ETag"),
+                    "last_modified": response.headers.get("Last-Modified"),
+                    "content_length": response.headers.get("Content-Length")}
+            # Match on the URL PATH, not the whole URL: Zenodo download links carry
+            # `?download=1`, so `url.endswith(".tar.gz")` is false for every real link.
+            path = urllib.parse.urlsplit(url).path
+            if path.endswith((".tar.gz", ".tgz")):
+                # Walk the tar header chain inside the gzip stream and read only our member.
+                with tarfile.open(fileobj=gzip.GzipFile(fileobj=response), mode="r|") as tf:
+                    for ti in tf:
+                        if ti.isfile() and os.path.basename(ti.name) == member:
+                            f = tf.extractfile(ti)
+                            if f is not None:
+                                info["cap_reached"] = take_lines(f)
+                            break
+            elif path.endswith(".zip"):
+                blob = io.BytesIO(response.read())          # zip needs the trailing directory
+                with zipfile.ZipFile(blob) as zf:
+                    name = next((n for n in zf.namelist()
+                                 if os.path.basename(n) == member), None)
+                    if name is None:
+                        raise KeyError(f"{member} not in {url}")
+                    with zf.open(name) as f:
+                        info["cap_reached"] = take_lines(f)
+            else:
+                raise ValueError(f"unsupported loghub archive: {url}")
+            return info
+
+        try:
+            sources.append(_request_with_retry(req, read_archive))
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"    {url}: HTTP 404, source sequence exhausted", file=sys.stderr)
+                stop_reason = "terminal_404"
+                break
+            raise
+        except EOFError:
+            # A truncated .gz raises here. Keep what decompressed but do not call it complete.
+            print(f"    {url}: archive ended early (truncated download?)", file=sys.stderr)
+            stop_reason = "truncated_archive"
+        print(f"    {url}: {nbytes} B of {member}", file=sys.stderr)
+        if sources and sources[-1].get("cap_reached"):
+            stop_reason = "cap_reached"
+            break
+
+    if not values:
+        raise OSError(f"no lines read for {col.dataset_id}/{member}")
+    if stop_reason != "cap_reached":
+        print(f"==> WARNING: {col.dataset_id} reached only {nbytes} B against a {cap} B cap "
+              f"({stop_reason}). This is a SHORT cell, not a smaller column.", file=sys.stderr)
+    table = pa.table({col.column: pa.array(values, type=pa.large_string())})
+    _publish_stream_cache(
+        table, dest, identity,
+        {"sources": sources, "utf8_bytes": {col.column: nbytes},
+         "stop_reason": stop_reason, "shards_read": len(sources), "member": member},
+    )
+    print(f"==> wrote {table.num_rows} lines ~{nbytes} B -> {dest}", file=sys.stderr)
+    return dest
+
+
+def pbi_to_parquet(col: Column, identity: dict | None = None) -> Path:
+    """Stream Public BI `.csv.bz2` tables in order and extract one or more columns.
+
+    Public BI splits a logical table into numbered parts that share a schema, and no single part
+    fills the 1 GB the sweep samples, so parts are concatenated. Two things this does differently
+    from `jsonl_to_parquet`, both deliberate:
+
+    1. The stop condition is MIN over the wanted columns, not MAX. These parts carry columns of
+       very different widths -- in CommonGovernment, psc_code_description yields 0.52 GB per part
+       against co_name's 0.29 GB -- so stopping when the widest column filled the cap would leave
+       the narrow ones as short cells while reporting success.
+    2. The column index comes from the part's own `.table.sql`, fetched alongside it, and every
+       later part must present the SAME column list as the first. Public BI part schemas are not
+       always alike (TableroSistemaPenal's are 27, 13 and 22 columns wide), and reading a fixed
+       index across mismatched parts silently extracts a different column.
+
+    Values are right-trimmed. Public BI space-pads inconsistently, and on cg_vend_vendorname the
+    padding moves frac_le8 by eleven points, so the padded form would misplace a column on the
+    very axis the selector keys off.
+    """
+    import bz2
+    import re as _re
+
+    import pyarrow as pa
+
+    dest = col.cache_path()
+    identity = identity or _stream_cache_identity(col)
+    cap = col.cap_bytes or STREAM_CAP_BYTES
+    wanted = list(col.siblings or (col.column,))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    hdr = {"User-Agent": "vortex-bench/onpair"}
+    print(f"==> streaming {len(col.urls)} Public BI parts for columns {wanted} "
+          f"(cap {cap} B each)\n        {col.urls[0]} ...\n        -> {dest}", file=sys.stderr)
+
+    def schema_url_for(data_url: str) -> str:
+        # .../<Workbook>/<Table>.csv.bz2 -> <base>/<Workbook>/tables/<Table>.table.sql
+        parts = data_url.rstrip("/").split("/")
+        table = parts[-1][: -len(".csv.bz2")]
+        return f"{PBI_SCHEMA_BASE}/{parts[-2]}/tables/{table}.table.sql"
+
+    def schema_columns(data_url: str) -> list[str]:
+        req = urllib.request.Request(schema_url_for(data_url), headers=hdr)
+        text = _request_with_retry(req, lambda r: r.read().decode("utf-8", "replace"))
+        return [m.group(1) for m in
+                (_re.match(r'\s*"(.+?)"\s+(.+?)[,\s]*$', ln) for ln in text.splitlines()) if m]
+
+    out: dict[str, list[str]] = {c: [] for c in wanted}
+    per_col = {c: 0 for c in wanted}
+    ref_schema: list[str] | None = None
+    parts_read, sources = 0, []
+    stop_reason = "all_sources_exhausted"
+
+    for url in col.urls:
+        names = schema_columns(url)
+        if ref_schema is None:
+            ref_schema = names
+            missing = [c for c in wanted if c not in names]
+            if missing:
+                raise KeyError(f"{url}: columns {missing} not in schema ({len(names)} cols)")
+        elif names != ref_schema:
+            print(f"    {url}: schema differs from the first part "
+                  f"({len(names)} vs {len(ref_schema)} cols) — stopping", file=sys.stderr)
+            stop_reason = "schema_mismatch"
+            break
+        idx = {c: names.index(c) for c in wanted}
+        if min(per_col.values()) >= cap:
+            stop_reason = "cap_reached"
+            break
+
+        def read_part(response, idx=idx):
+            got: dict[str, list[str]] = {c: [] for c in wanted}
+            nbytes = {c: 0 for c in wanted}
+            dec = bz2.BZ2Decompressor()
+            buf = b""
+            while True:
+                raw = response.read(8 * 1024 * 1024)
+                if not raw:
+                    break
+                chunk = dec.decompress(raw)
+                # Multi-stream .bz2 (what pbzip2 emits) ends the first stream early and leaves the
+                # rest in unused_data. A single decompressor would stop there and silently yield a
+                # short column rather than failing, so drain every concatenated stream. The current
+                # Public BI files are single-stream -- CommonGovernment_1 decompresses to 8.87 GB
+                # with unused_data empty -- so this is insurance, not a live fix.
+                while dec.eof and dec.unused_data:
+                    tail = dec.unused_data
+                    dec = bz2.BZ2Decompressor()
+                    chunk += dec.decompress(tail)
+                if not chunk:
+                    continue
+                buf += chunk
+                lines = buf.split(b"\n")
+                buf = lines.pop()
+                for ln in lines:
+                    fields = ln.split(b"|")
+                    for c in wanted:
+                        i = idx[c]
+                        v = fields[i].rstrip() if i < len(fields) else b""
+                        got[c].append(v.decode("utf-8", "replace"))
+                        nbytes[c] += len(v)
+                if min(per_col[c] + nbytes[c] for c in wanted) >= cap:
+                    break
+            return got, nbytes, {
+                "url": url,
+                "etag": response.headers.get("ETag"),
+                "last_modified": response.headers.get("Last-Modified"),
+                "content_length": response.headers.get("Content-Length"),
+            }
+
+        req = urllib.request.Request(url, headers=hdr)
+        try:
+            got, nbytes, source = _request_with_retry(req, read_part)
+        except urllib.error.HTTPError as e:
+            if e.code == 404:
+                print(f"    {url}: HTTP 404, source sequence exhausted", file=sys.stderr)
+                stop_reason = "terminal_404"
+                break
+            raise
+        parts_read += 1
+        sources.append(source)
+        for c in wanted:
+            out[c].extend(got[c])
+            per_col[c] += nbytes[c]
+        print(f"    part {parts_read}/{len(col.urls)}: " +
+              " ".join(f"{c}={per_col[c]}B" for c in wanted), file=sys.stderr)
+        # MIN, not MAX: every wanted column has to reach the cap.
+        if min(per_col.values()) >= cap:
+            stop_reason = "cap_reached"
+            break
+
+    if parts_read == 0:
+        raise OSError(f"no Public BI parts were read for {col.dataset_id}")
+    short = {c: per_col[c] for c in wanted if per_col[c] < cap}
+    if short:
+        print(f"==> WARNING: below the {cap} B cap after {parts_read} part(s): {short}. "
+              f"These are SHORT cells -- add parts or lower the cap.", file=sys.stderr)
+    # Every column is appended once per parsed line, so the arrays must be equal length.
+    # Assert rather than let pyarrow write a ragged table.
+    lens = {c: len(out[c]) for c in wanted}
+    if len(set(lens.values())) != 1:
+        raise ValueError(f"ragged extraction for {col.dataset_id}: {lens}")
+    table = pa.table({c: pa.array(out[c], type=pa.large_string()) for c in wanted})
+    _publish_stream_cache(
+        table,
+        dest,
+        identity,
+        {
+            "sources": sources,
+            "utf8_bytes": per_col,
+            "stop_reason": stop_reason,
+            "shards_read": parts_read,
+            "schema_columns": len(ref_schema or []),
+        },
+    )
+    print(f"==> wrote {table.num_rows} rows from {parts_read} part(s) -> {dest}", file=sys.stderr)
+    return dest
+
+
 def ensure_parquet(binary: Path, col: Column) -> Path:
     path = col.parquet_path()
-    if col.kind in {"parquet_stream", "jsonl"} and path == col.cache_path():
+    if col.kind in {"parquet_stream", "jsonl", "pbi", "loghub"} and path == col.cache_path():
         identity = _stream_cache_identity(col)
         with _stream_cache_lock(path):
             valid, reason = _stream_cache_status(path, identity)
@@ -703,6 +992,10 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
                 print(f"==> rebuilding streamed cache {path}: {reason}", file=sys.stderr)
             if col.kind == "parquet_stream":
                 return parquet_stream_to_parquet(col, identity)
+            if col.kind == "pbi":
+                return pbi_to_parquet(col, identity)
+            if col.kind == "loghub":
+                return loghub_to_parquet(col, identity)
             return jsonl_to_parquet(col, identity)
     if path.exists():
         return path
@@ -789,7 +1082,7 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
             "--bits", bits,
             "--chunk-bytes", chunk_bytes,
             "--threshold", thresholds,
-            "--training-seed", str(col.synth_training_seed),
+            "--training-seed", str(col.training_seed),
             "--codec", args.codec,
             "--sample-bytes", str(args.sample_bytes),
             "--file-target-bytes", str(int(args.file_target_mb * MB)),
@@ -818,7 +1111,7 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
         COLUMN_FAILURES.append(f"{col.dataset_id}/{col.column}: exit {proc.returncode}")
         return []
     rows = json.loads(proc.stdout)
-    if col.kind in {"parquet_stream", "jsonl"} and col.parquet_path() == col.cache_path():
+    if col.kind in {"parquet_stream", "jsonl", "pbi", "loghub"} and col.parquet_path() == col.cache_path():
         try:
             source_cache = json.loads(_cache_manifest_path(col.cache_path()).read_text())
         except (OSError, json.JSONDecodeError) as error:

@@ -49,7 +49,58 @@ FINEWEB_URL = ("https://huggingface.co/datasets/HuggingFaceFW/fineweb/"
 # One ~420 MB parquet shard; columns id/url/title/text.
 WIKIPEDIA_URL = ("https://huggingface.co/datasets/wikimedia/wikipedia/"
                  "resolve/main/20231101.en/train-00000-of-00041.parquet")
+# Shard 0 alone yields only 0.70 GB of `text`. Measured, not estimated: the completed locked
+# sweeps recorded sample_bytes=703,062,420 against the 1e9 they asked for, so wikipedia was
+# quietly a 0.70 GB cell while clickbench/URL and l_comment both filled 1e9. Three shards clear
+# 1.15 GB with margin (0.70 + ~0.58 + ~0.55 GB at shard sizes 420/351/329 MB).
+#
+# This CHANGES wikipedia's sampled volume, so wikipedia numbers from the 2026-08-19 screening
+# runs (0.70 GB) are NOT comparable with anything measured through WIKIPEDIA_URLS.
+WIKIPEDIA_URLS = [("https://huggingface.co/datasets/wikimedia/wikipedia/"
+                   f"resolve/main/20231101.en/train-{i:05d}-of-00041.parquet")
+                  for i in (0, 1, 2)]
 #   landing page: https://huggingface.co/datasets/wikimedia/wikipedia
+# Public BI benchmark. Data and schemas both come from the same fork that
+# `vortex-bench/scripts/fetch_public_bi_schemas_and_queries.sh` already pins, so the GPU bench
+# and the Rust benches read one source of truth. The data URLs are the ones listed in each
+# workbook's `data-urls.txt`; the upstream CWI mirror is gone (404) and the
+# `public-bi-benchmark` S3 bucket refuses anonymous reads (403), so this R2 bucket is the only
+# fetchable copy. Verified 2026-08-19: HTTP 200, `BZh9` magic, sizes matching local copies.
+# OnPair's training-shuffle seed, pinned 2026-08-19. See `Column.training_seed` for why, and for
+# what pinning invalidates. Kept distinct from ONPAIR_SHUFFLE_SEED (kernel variant ORDER, set by
+# the launchers) -- these are different knobs and conflating them would hide one behind the other.
+ONPAIR_TRAINING_SEED = 20260819
+
+# Loghub (Zhu et al., "Loghub: A Large Collection of System Log Datasets", arXiv:2008.06448) --
+# real system logs, the one regime at multi-GB scale that reaches the long-token end of the axis.
+# Profiled 2026-08-19: application logs cluster at 55-63% short tokens because timestamps, thread
+# names, IPs and IDs carry per-line entropy, while Windows CBS reaches 38% / 21% because its lines
+# are dominated by long, exactly-repeated servicing-component paths. Windows is the corpus's
+# OnPair-12 low anchor and nothing else measured at >=1 GB comes near it.
+#
+# `.tar.gz` members stream, so a 1.15 GB sample of the 26 GB Windows.log costs ~66 MB of
+# transfer (measured) -- cheaper than fetching HDFS_v1.zip whole.
+LOGHUB_BASE = "https://zenodo.org/records/8196385/files"
+#   landing page: https://github.com/logpai/loghub
+
+# CodeParrot clean (Tunstall et al. / HF `codeparrot/codeparrot-clean`) -- deduplicated GitHub
+# Python source. A distinct content domain from prose, URLs, logs and relational text, and the
+# most training-stable column in the corpus (frac_le8 sigma 0.08 over ten draws). 54 jsonl.gz
+# shards of ~0.25 GB; the `codeparrot-clean-valid` split people usually cite is shard 54 of this
+# same series, and is too small on its own for a 1 GB sample.
+# NOTE on cost: `jsonl_to_parquet` checks its byte cap BETWEEN shards, not within one, and each
+# shard yields ~1.02 GB of `content`. So a 1.15 GB cap reads two shards (~2.04 GB extracted,
+# ~0.5 GB transferred) rather than stopping mid-shard. Three URLs are listed so a shard that
+# 404s does not sink the column. Dropping the cap to 1.0e9 would read exactly one shard, but
+# leaves only a 1.9% margin over the 1 GB the bench samples -- not worth 0.25 GB of transfer.
+CODEPARROT_URLS = [("https://huggingface.co/datasets/codeparrot/codeparrot-clean/"
+                    f"resolve/main/file-{i:012d}.json.gz") for i in (1, 2, 3)]
+#   landing page: https://huggingface.co/datasets/codeparrot/codeparrot-clean
+
+PBI_DATA_BASE = "https://pub-334c2a12c9bf46f3b8464a8718df8cae.r2.dev"
+PBI_SCHEMA_BASE = ("https://raw.githubusercontent.com/vortex-data/"
+                   "public_bi_benchmark/master/benchmark")
+#   landing page: https://github.com/vortex-data/public_bi_benchmark
 DBTEXT_URL_BASE = "https://raw.githubusercontent.com/cwida/fsst/master/paper/dbtext"
 #   landing page: https://github.com/cwida/fsst  (the FSST paper's dbtext corpus)
 # Amazon-Reviews-2023 (McAuley Lab, UCSD): per-category raw review JSONL; run.py streams
@@ -124,9 +175,24 @@ class Column:
     # synthetic: distinct filler path segments, widening the OnPair dictionary. 0 keeps the
     # original seed-123 corpus byte-for-byte; positive values are the selector ladder.
     synth_vocab: int = 0
-    # synthetic ladder only: 0 preserves the harness's historical random-device training;
-    # a nonzero value pins OnPair's row shuffle so rung comparisons are reproducible.
-    synth_training_seed: int = 0
+    # OnPair's training-shuffle seed, for EVERY column -- not the synthetic ladder only, which is
+    # what this field used to be. Upstream `TrainingConfig::seed` is a std::optional and its
+    # comment is explicit: "nullopt -> non-deterministic. Set for reproducible compression (same
+    # dictionary across runs)." The shim only forwards a nonzero value, so the old default of 0
+    # left it nullopt and every materialization trained a DIFFERENT dictionary.
+    #
+    # That was not theoretical. On 2026-08-19 an NCU capture set (materialized 08-18) and a
+    # coarsening sweep (materialized 08-19) disagreed about the best K on 4 of 8 OnPair-16 cells
+    # while agreeing 8/8 at OnPair-12, and the two runs' compressed sizes for the same column and
+    # preset differed by 1.8-2.6% -- different dictionaries, same code. OnPair-16 is hit harder
+    # because 65,536 entries leave far more room for training to diverge than 4,096 do.
+    #
+    # CONSEQUENCE OF PINNING: `training_seed != 0` adds `_seed<N>` to the cell directory name, so
+    # this bypasses every existing materialization and re-creates it. That is the point -- the seed
+    # becomes visible provenance in the path -- but it means numbers measured before this landed
+    # were taken on dictionaries that cannot be reproduced, and must be re-measured to be citable
+    # as reproducible.
+    training_seed: int = ONPAIR_TRAINING_SEED
     # amazon
     category: str | None = None  # HF Amazon-Reviews-2023 category, e.g. "Books"
     # parquet_stream / jsonl: every column of the dataset shares one cache file, so the
@@ -143,6 +209,9 @@ class Column:
     # Immutable source revision when the remote registry supports one. This is repeated
     # in the cache manifest even when it is also embedded in the resolve URL.
     source_revision: str | None = None
+    # loghub: the log file's name inside the archive. Explicit rather than derived from the URL,
+    # because the two do not correspond -- HDFS_v1.zip contains HDFS.log, not HDFS_v1.log.
+    member: str | None = None
 
     def tpch_dir(self) -> Path:
         return SRC_DIR / f"tpch_sf{int(self.scale_factor)}"
@@ -161,7 +230,7 @@ class Column:
             return self.tpch_dir() / "parquet" / f"{self.table}_0.parquet"
         if self.kind == "tpcds":
             return self.tpcds_dir() / "parquet" / f"{self.table}.parquet"
-        if self.kind in ("parquet", "parquet_stream", "text", "amazon", "jsonl"):
+        if self.kind in ("parquet", "parquet_stream", "text", "amazon", "jsonl", "pbi", "loghub"):
             for p in self.local:
                 if Path(p).exists():
                     return Path(p)
@@ -191,6 +260,31 @@ def _stream_cols(dataset_id, columns, *, urls, cache, cap_bytes=0, source_revisi
                source_revision=source_revision, local=_local(dataset_id))
         for c in columns
     ]
+
+
+def _pbi_cols(dataset_id, columns, *, workbook, tables, cache, cap_bytes=0):
+    """Public BI columns, concatenated across a workbook's numbered parts until every column
+    reaches `cap_bytes`. `tables` is the part order; only parts whose `.table.sql` column list
+    matches the first part's are read, so a workbook whose parts are actually different tables
+    stops rather than extracting the wrong column position."""
+    sib = tuple(columns)
+    us = tuple(f"{PBI_DATA_BASE}/{workbook}/{t}.csv.bz2" for t in tables)
+    return [
+        Column(dataset_id=dataset_id, column=c, kind="pbi", url=us[0], urls=us,
+               cache=cache, siblings=sib, cap_bytes=cap_bytes, local=_local(dataset_id))
+        for c in columns
+    ]
+
+
+def _loghub_cols(dataset_id, column, *, archive, member, cap_bytes=0):
+    """One Loghub log file as a single string column, one log line per value. `member` is the
+    `.log` inside the archive and is named explicitly because it does not follow the archive
+    name (HDFS_v1.zip contains HDFS.log)."""
+    return [Column(dataset_id=dataset_id, column=column, kind="loghub",
+                   url=f"{LOGHUB_BASE}/{archive}?download=1",
+                   urls=(f"{LOGHUB_BASE}/{archive}?download=1",),
+                   member=member, cache=f"{dataset_id}.parquet",
+                   cap_bytes=cap_bytes, local=_local(dataset_id))]
 
 
 def _jsonl_cols(dataset_id, paths, *, urls, cache, cap_bytes=0):
@@ -269,9 +363,55 @@ COLUMNS: list[Column] = [
     # FineWeb 10BT sample — long free text + URLs + low-cardinality categoricals.
     *_parquet_cols("fineweb", ["text", "url", "file_path", "dump", "language"],
                    url=FINEWEB_URL, cache="fineweb_10BT_000.parquet"),
-    # Wikipedia (en, 2023-11-01) — long encyclopaedic free text, titles, URLs.
-    *_parquet_cols("wikipedia", ["text", "title", "url"],
-                   url=WIKIPEDIA_URL, cache="wikipedia_20231101_en_000.parquet"),
+    # Wikipedia (en, 2023-11-01) — long encyclopaedic free text, titles, URLs. Spans three
+    # shards via parquet_stream because one shard is 0.70 GB, short of the 1 GB the sweep samples.
+    *_stream_cols("wikipedia", ["text", "title", "url"],
+                  urls=WIKIPEDIA_URLS, cache="wikipedia_20231101_en_000.parquet",
+                  cap_bytes=1_150_000_000),
+    # Public BI: the long-token end of the corpus, which real data had to cover because the
+    # spread previously came from dbgen output. Part counts are sized from measured per-part
+    # yield per SINGLE table: psc_code_description 0.52 GB, naics_name 0.37, co_name 0.29,
+    # Subsector 0.60, "Transaction ID" 0.75.
+    #
+    # ONE TABLE EACH, DELIBERATELY. The numbered files in a Public BI workbook are NOT
+    # partitions -- they are re-extractions of the same workbook in different row order.
+    # Measured 2026-08-19 on CommonGovernment_1 vs _2 over 400k-row windows: rows are 99.8%
+    # unique, mutual containment is 97.7% / 97.6%, and only 0.6% align row-for-row. Decisive
+    # confirmation on the 2-file case via raincloud's merged copy of RealEstate1, where row
+    # 19,531,359 (exactly N/2 of 39,062,718) is byte-identical to row 0.
+    #
+    # So concatenating them duplicates the data and doubles every value's frequency, which
+    # inflates compression ratio -- and deduplicating is not neutral either, because it flattens
+    # the true frequency distribution. Either way the statistics stop describing the source
+    # column. Consequence: no Public BI column here can reach 1 GB, which is why NONE of them is
+    # in the paper's ten-column corpus. They are kept registered as valid single-table columns.
+    #
+    # (Upstream note: raincloud's `public_bi_merge` handler treats these files as partitions and
+    # concatenates them without dedup, so its `bi-*` tables are duplicated by their file count --
+    # CommonGovernment ~13x. Worth reporting; it distorts exactly the ratios that corpus exists
+    # to measure.)
+    *_pbi_cols("publicbi-commongovernment",
+               ["psc_code_description", "naics_name", "co_name"],
+               workbook="CommonGovernment", tables=["CommonGovernment_3"],
+               cache="pbi_commongovernment.parquet", cap_bytes=1_150_000_000),
+    *_pbi_cols("publicbi-generico", ["Subsector"],
+               workbook="Generico", tables=["Generico_5"],
+               cache="pbi_generico.parquet", cap_bytes=1_150_000_000),
+    *_pbi_cols("publicbi-realestate1", ["Transaction ID"],
+               workbook="RealEstate1", tables=["RealEstate1_2"],
+               cache="pbi_realestate1.parquet", cap_bytes=1_150_000_000),
+    # Loghub: three different logging systems, deliberately not four -- Spark (55%) sits on
+    # l_comment's rung and earned no place. Windows is the OnPair-12 low anchor at 38% / 21%.
+    *_loghub_cols("loghub-windows", "line", archive="Windows.tar.gz",
+                  member="Windows.log", cap_bytes=1_150_000_000),
+    *_loghub_cols("loghub-thunderbird", "line", archive="Thunderbird.tar.gz",
+                  member="Thunderbird.log", cap_bytes=1_150_000_000),
+    *_loghub_cols("loghub-hdfs", "line", archive="HDFS_v1.zip",
+                  member="HDFS.log", cap_bytes=1_150_000_000),
+    # CodeParrot: source code as its own domain. Uses the existing jsonl loader.
+    *_jsonl_cols("codeparrot", {"content": "content"},
+                 urls=CODEPARROT_URLS, cache="codeparrot_clean.parquet",
+                 cap_bytes=1_150_000_000),
     # FSST paper's dbtext corpus: 23 raw text columns under cwida/fsst.
     *_dbtext_cols(_DBTEXT_COLS),
     # OnPair paper's book-reviews corpus (single `text` column). Reproduced on-box
@@ -323,8 +463,12 @@ COLUMNS: list[Column] = [
     # Cache names include the generator revision so corpora from the earlier
     # variable-width/single-RNG design cannot be silently reused.
     *(
+        # training_seed=1 is retained deliberately, NOT updated to ONPAIR_TRAINING_SEED: the
+        # selector-ladder rungs were measured at seed 1 and are only comparable to each other.
+        # These three synthetic columns were cut from the corpus on 2026-08-19 in favour of real
+        # columns covering the same regimes, so this is a frozen record rather than live config.
         Column(dataset_id=f"synthdict-{v}", column="url", kind="synthetic",
-               synth_vocab=v, synth_training_seed=1,
+               synth_vocab=v, training_seed=1,
                cache=f"synthetic_urls_fixed3_sparse8_v2_vocab{v}.parquet")
         for v in (512, 1024, 2048, 3072, 6144, 16384)
     ),
