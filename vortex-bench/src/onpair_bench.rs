@@ -338,6 +338,14 @@ pub struct GpuVortexDecodeResult {
 pub struct GpuKernelResult {
     /// CUDA function name.
     pub kernel: String,
+    /// What this kernel is for. Structured rather than parsed from the name, so downstream
+    /// code and `best_kernel` never have to guess whether a row is a shipped configuration.
+    pub role: String,
+    /// Staging bytes per token, when this variant sets one.
+    pub stage_bytes: Option<u8>,
+    /// Codes per warp-chunk, so a summary carries its own coordinates instead of requiring
+    /// the kernel name to be parsed.
+    pub chunk_size: usize,
     /// Min full-pass time over the timed iterations, in ms (derived from
     /// `decode_ns_iters`; the convenience scalar used for best-kernel selection).
     pub decode_ms: f64,
@@ -1367,6 +1375,22 @@ struct KernelVariant {
     /// default 16, the always-safe worst case. `Some(s)` is checked against the column's
     /// largest batch before the kernel is allowed to run.
     stage_bytes: Option<u8>,
+    /// What this kernel is FOR. `best_kernel` reports only `Production`, so a sensitivity
+    /// variant cannot be labelled the fastest shipped decoder and leak into a headline table.
+    /// Previously inferred from substrings of the name, which covered `ablate` and
+    /// `directstore` but not the generated parameter grid.
+    role: KernelRole,
+}
+
+#[cfg(feature = "cuda")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+enum KernelRole {
+    /// A kernel the selector may ship.
+    Production,
+    /// A parameter-sweep variant. Byte-exact, but not a shipped configuration.
+    Experimental,
+    /// Not byte-exact by construction: skips a decode stage.
+    Ablation,
 }
 
 #[cfg(feature = "cuda")]
@@ -1389,6 +1413,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 0,
         block_warps: 0,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_2tpt",
@@ -1396,6 +1421,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt",
@@ -1403,6 +1429,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     // Track B: block-granularity + forced-occupancy sweep on the 4tpt body.
     KernelVariant {
@@ -1411,6 +1438,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_b128o12",
@@ -1418,6 +1446,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_1tpt",
@@ -1425,6 +1454,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_2tpt",
@@ -1432,6 +1462,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_3tpt",
@@ -1439,6 +1470,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress",
@@ -1446,6 +1478,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_5tpt",
@@ -1453,6 +1486,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_6tpt",
@@ -1460,6 +1494,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_7tpt",
@@ -1467,6 +1502,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_decompress_8tpt",
@@ -1474,6 +1510,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_4tpt_split8read",
@@ -1481,6 +1518,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     // 8tpt reuses the Stride16 launch path (identical kernel signature); only
     // chunk_size differs (256 tokens/warp-chunk vs 128), which is parameterized.
@@ -1490,6 +1528,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_8tpt_b128",
@@ -1497,6 +1536,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_s8_4tpt",
@@ -1504,6 +1544,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_s4l1_16tpt",
@@ -1511,6 +1552,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 512,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_const1",
@@ -1518,6 +1560,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 512,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
     KernelVariant {
         name: "onpair_shmem_const2",
@@ -1525,6 +1568,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 16,
         stage_bytes: None,
+        role: KernelRole::Production,
     },
 
     // BEGIN generated packed grid (gen_packed_grid.py) — do not edit by hand
@@ -1534,6 +1578,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t64_b2",
@@ -1541,6 +1586,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t64_b4",
@@ -1548,6 +1594,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t64_b6",
@@ -1555,6 +1602,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t64_b8",
@@ -1562,6 +1610,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t128_b1",
@@ -1569,6 +1618,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t128_b2",
@@ -1576,6 +1626,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t128_b4",
@@ -1583,6 +1634,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t128_b6",
@@ -1590,6 +1642,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t128_b8",
@@ -1597,6 +1650,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t256_b1",
@@ -1604,6 +1658,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t256_b2",
@@ -1611,6 +1666,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t256_b4",
@@ -1618,6 +1674,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t256_b6",
@@ -1625,6 +1682,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k1_t256_b8",
@@ -1632,6 +1690,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t64_b1",
@@ -1639,6 +1698,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t64_b2",
@@ -1646,6 +1706,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t64_b4",
@@ -1653,6 +1714,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t64_b6",
@@ -1660,6 +1722,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t64_b8",
@@ -1667,6 +1730,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t128_b1",
@@ -1674,6 +1738,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t128_b2",
@@ -1681,6 +1746,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t128_b4",
@@ -1688,6 +1754,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t128_b6",
@@ -1695,6 +1762,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t128_b8",
@@ -1702,6 +1770,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t256_b1",
@@ -1709,6 +1778,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t256_b2",
@@ -1716,6 +1786,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t256_b4",
@@ -1723,6 +1794,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t256_b6",
@@ -1730,6 +1802,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k2_t256_b8",
@@ -1737,6 +1810,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t64_b1",
@@ -1744,6 +1818,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t64_b2",
@@ -1751,6 +1826,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t64_b4",
@@ -1758,6 +1834,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t64_b6",
@@ -1765,6 +1842,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t64_b8",
@@ -1772,6 +1850,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t128_b1",
@@ -1779,6 +1858,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t128_b2",
@@ -1786,6 +1866,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t128_b4",
@@ -1793,6 +1874,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t128_b6",
@@ -1800,6 +1882,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t128_b8",
@@ -1807,6 +1890,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t256_b1",
@@ -1814,6 +1898,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t256_b2",
@@ -1821,6 +1906,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t256_b4",
@@ -1828,6 +1914,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t256_b6",
@@ -1835,6 +1922,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k3_t256_b8",
@@ -1842,6 +1930,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t64_b1",
@@ -1849,6 +1938,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t64_b2",
@@ -1856,6 +1946,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t64_b4",
@@ -1863,6 +1954,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t64_b6",
@@ -1870,6 +1962,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t64_b8",
@@ -1877,6 +1970,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t128_b1",
@@ -1884,6 +1978,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t128_b2",
@@ -1891,6 +1986,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t128_b4",
@@ -1898,6 +1994,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t128_b6",
@@ -1905,6 +2002,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t128_b8",
@@ -1912,6 +2010,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t256_b1",
@@ -1919,6 +2018,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t256_b2",
@@ -1926,6 +2026,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t256_b4",
@@ -1933,6 +2034,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t256_b6",
@@ -1940,6 +2042,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k4_t256_b8",
@@ -1947,6 +2050,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t64_b1",
@@ -1954,6 +2058,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t64_b2",
@@ -1961,6 +2066,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t64_b4",
@@ -1968,6 +2074,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t64_b6",
@@ -1975,6 +2082,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t64_b8",
@@ -1982,6 +2090,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t128_b1",
@@ -1989,6 +2098,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t128_b2",
@@ -1996,6 +2106,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t128_b4",
@@ -2003,6 +2114,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t128_b6",
@@ -2010,6 +2122,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t128_b8",
@@ -2017,6 +2130,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t256_b1",
@@ -2024,6 +2138,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t256_b2",
@@ -2031,6 +2146,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t256_b4",
@@ -2038,6 +2154,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t256_b6",
@@ -2045,6 +2162,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k5_t256_b8",
@@ -2052,6 +2170,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t64_b1",
@@ -2059,6 +2178,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t64_b2",
@@ -2066,6 +2186,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t64_b4",
@@ -2073,6 +2194,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t64_b6",
@@ -2080,6 +2202,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t64_b8",
@@ -2087,6 +2210,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t128_b1",
@@ -2094,6 +2218,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t128_b2",
@@ -2101,6 +2226,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t128_b4",
@@ -2108,6 +2234,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t128_b6",
@@ -2115,6 +2242,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t128_b8",
@@ -2122,6 +2250,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t256_b1",
@@ -2129,6 +2258,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t256_b2",
@@ -2136,6 +2266,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t256_b4",
@@ -2143,6 +2274,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t256_b6",
@@ -2150,6 +2282,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k6_t256_b8",
@@ -2157,6 +2290,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t64_b1",
@@ -2164,6 +2298,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t64_b2",
@@ -2171,6 +2306,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t64_b4",
@@ -2178,6 +2314,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t64_b6",
@@ -2185,6 +2322,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t64_b8",
@@ -2192,6 +2330,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t128_b1",
@@ -2199,6 +2338,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t128_b2",
@@ -2206,6 +2346,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t128_b4",
@@ -2213,6 +2354,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t128_b6",
@@ -2220,6 +2362,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t128_b8",
@@ -2227,6 +2370,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t256_b1",
@@ -2234,6 +2378,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t256_b2",
@@ -2241,6 +2386,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t256_b4",
@@ -2248,6 +2394,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t256_b6",
@@ -2255,6 +2402,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k7_t256_b8",
@@ -2262,6 +2410,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t64_b1",
@@ -2269,6 +2418,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t64_b2",
@@ -2276,6 +2426,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t64_b4",
@@ -2283,6 +2434,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t64_b6",
@@ -2290,6 +2442,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t64_b8",
@@ -2297,6 +2450,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t128_b1",
@@ -2304,6 +2458,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t128_b2",
@@ -2311,6 +2466,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t128_b4",
@@ -2318,6 +2474,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t128_b6",
@@ -2325,6 +2482,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t128_b8",
@@ -2332,6 +2490,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t256_b1",
@@ -2339,6 +2498,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t256_b2",
@@ -2346,6 +2506,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t256_b4",
@@ -2353,6 +2514,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t256_b6",
@@ -2360,6 +2522,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dg_k8_t256_b8",
@@ -2367,6 +2530,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t64_b1",
@@ -2374,6 +2538,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t64_b2",
@@ -2381,6 +2546,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t64_b4",
@@ -2388,6 +2554,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t64_b6",
@@ -2395,6 +2562,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t64_b8",
@@ -2402,6 +2570,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t128_b1",
@@ -2409,6 +2578,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t128_b2",
@@ -2416,6 +2586,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t128_b4",
@@ -2423,6 +2594,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t128_b6",
@@ -2430,6 +2602,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t128_b8",
@@ -2437,6 +2610,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t256_b1",
@@ -2444,6 +2618,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t256_b2",
@@ -2451,6 +2626,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t256_b4",
@@ -2458,6 +2634,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t256_b6",
@@ -2465,6 +2642,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k1_t256_b8",
@@ -2472,6 +2650,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 32,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t64_b1",
@@ -2479,6 +2658,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t64_b2",
@@ -2486,6 +2666,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t64_b4",
@@ -2493,6 +2674,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t64_b6",
@@ -2500,6 +2682,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t64_b8",
@@ -2507,6 +2690,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t128_b1",
@@ -2514,6 +2698,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t128_b2",
@@ -2521,6 +2706,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t128_b4",
@@ -2528,6 +2714,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t128_b6",
@@ -2535,6 +2722,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t128_b8",
@@ -2542,6 +2730,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t256_b1",
@@ -2549,6 +2738,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t256_b2",
@@ -2556,6 +2746,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t256_b4",
@@ -2563,6 +2754,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t256_b6",
@@ -2570,6 +2762,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k2_t256_b8",
@@ -2577,6 +2770,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t64_b1",
@@ -2584,6 +2778,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t64_b2",
@@ -2591,6 +2786,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t64_b4",
@@ -2598,6 +2794,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t64_b6",
@@ -2605,6 +2802,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t64_b8",
@@ -2612,6 +2810,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t128_b1",
@@ -2619,6 +2818,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t128_b2",
@@ -2626,6 +2826,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t128_b4",
@@ -2633,6 +2834,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t128_b6",
@@ -2640,6 +2842,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t128_b8",
@@ -2647,6 +2850,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t256_b1",
@@ -2654,6 +2858,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t256_b2",
@@ -2661,6 +2866,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t256_b4",
@@ -2668,6 +2874,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t256_b6",
@@ -2675,6 +2882,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k3_t256_b8",
@@ -2682,6 +2890,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t64_b1",
@@ -2689,6 +2898,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t64_b2",
@@ -2696,6 +2906,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t64_b4",
@@ -2703,6 +2914,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t64_b6",
@@ -2710,6 +2922,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t64_b8",
@@ -2717,6 +2930,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t128_b1",
@@ -2724,6 +2938,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t128_b2",
@@ -2731,6 +2946,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t128_b4",
@@ -2738,6 +2954,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t128_b6",
@@ -2745,6 +2962,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t128_b8",
@@ -2752,6 +2970,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t256_b1",
@@ -2759,6 +2978,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t256_b2",
@@ -2766,6 +2986,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t256_b4",
@@ -2773,6 +2994,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t256_b6",
@@ -2780,6 +3002,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k4_t256_b8",
@@ -2787,6 +3010,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t64_b1",
@@ -2794,6 +3018,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t64_b2",
@@ -2801,6 +3026,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t64_b4",
@@ -2808,6 +3034,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t64_b6",
@@ -2815,6 +3042,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t64_b8",
@@ -2822,6 +3050,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t128_b1",
@@ -2829,6 +3058,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t128_b2",
@@ -2836,6 +3066,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t128_b4",
@@ -2843,6 +3074,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t128_b6",
@@ -2850,6 +3082,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t128_b8",
@@ -2857,6 +3090,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t256_b1",
@@ -2864,6 +3098,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t256_b2",
@@ -2871,6 +3106,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t256_b4",
@@ -2878,6 +3114,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t256_b6",
@@ -2885,6 +3122,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k5_t256_b8",
@@ -2892,6 +3130,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t64_b1",
@@ -2899,6 +3138,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t64_b2",
@@ -2906,6 +3146,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t64_b4",
@@ -2913,6 +3154,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t64_b6",
@@ -2920,6 +3162,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t64_b8",
@@ -2927,6 +3170,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t128_b1",
@@ -2934,6 +3178,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t128_b2",
@@ -2941,6 +3186,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t128_b4",
@@ -2948,6 +3194,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t128_b6",
@@ -2955,6 +3202,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t128_b8",
@@ -2962,6 +3210,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t256_b1",
@@ -2969,6 +3218,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t256_b2",
@@ -2976,6 +3226,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t256_b4",
@@ -2983,6 +3234,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t256_b6",
@@ -2990,6 +3242,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k6_t256_b8",
@@ -2997,6 +3250,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t64_b1",
@@ -3004,6 +3258,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t64_b2",
@@ -3011,6 +3266,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t64_b4",
@@ -3018,6 +3274,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t64_b6",
@@ -3025,6 +3282,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t64_b8",
@@ -3032,6 +3290,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t128_b1",
@@ -3039,6 +3298,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t128_b2",
@@ -3046,6 +3306,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t128_b4",
@@ -3053,6 +3314,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t128_b6",
@@ -3060,6 +3322,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t128_b8",
@@ -3067,6 +3330,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t256_b1",
@@ -3074,6 +3338,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t256_b2",
@@ -3081,6 +3346,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t256_b4",
@@ -3088,6 +3354,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t256_b6",
@@ -3095,6 +3362,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k7_t256_b8",
@@ -3102,6 +3370,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t64_b1",
@@ -3109,6 +3378,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t64_b2",
@@ -3116,6 +3386,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t64_b4",
@@ -3123,6 +3394,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t64_b6",
@@ -3130,6 +3402,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t64_b8",
@@ -3137,6 +3410,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t128_b1",
@@ -3144,6 +3418,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t128_b2",
@@ -3151,6 +3426,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t128_b4",
@@ -3158,6 +3434,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t128_b6",
@@ -3165,6 +3442,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t128_b8",
@@ -3172,6 +3450,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t256_b1",
@@ -3179,6 +3458,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t256_b2",
@@ -3186,6 +3466,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t256_b4",
@@ -3193,6 +3474,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t256_b6",
@@ -3200,6 +3482,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dw_k8_t256_b8",
@@ -3207,6 +3490,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t64_b2_h2",
@@ -3214,6 +3498,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t64_b4_h2",
@@ -3221,6 +3506,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t64_b8_h2",
@@ -3228,6 +3514,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t128_b2_h2",
@@ -3235,6 +3522,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t128_b4_h2",
@@ -3242,6 +3530,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t128_b8_h2",
@@ -3249,6 +3538,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t256_b2_h2",
@@ -3256,6 +3546,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t256_b4_h2",
@@ -3263,6 +3554,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k2_t256_b8_h2",
@@ -3270,6 +3562,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 64,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b2_h2",
@@ -3277,6 +3570,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b2_h3",
@@ -3284,6 +3578,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b4_h2",
@@ -3291,6 +3586,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b4_h3",
@@ -3298,6 +3594,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b8_h2",
@@ -3305,6 +3602,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t64_b8_h3",
@@ -3312,6 +3610,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b2_h2",
@@ -3319,6 +3618,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b2_h3",
@@ -3326,6 +3626,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b4_h2",
@@ -3333,6 +3634,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b4_h3",
@@ -3340,6 +3642,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b8_h2",
@@ -3347,6 +3650,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t128_b8_h3",
@@ -3354,6 +3658,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b2_h2",
@@ -3361,6 +3666,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b2_h3",
@@ -3368,6 +3674,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b4_h2",
@@ -3375,6 +3682,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b4_h3",
@@ -3382,6 +3690,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b8_h2",
@@ -3389,6 +3698,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k3_t256_b8_h3",
@@ -3396,6 +3706,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 96,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b2_h2",
@@ -3403,6 +3714,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b2_h3",
@@ -3410,6 +3722,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b2_h4",
@@ -3417,6 +3730,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b4_h2",
@@ -3424,6 +3738,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b4_h3",
@@ -3431,6 +3746,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b4_h4",
@@ -3438,6 +3754,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b8_h2",
@@ -3445,6 +3762,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b8_h3",
@@ -3452,6 +3770,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t64_b8_h4",
@@ -3459,6 +3778,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b2_h2",
@@ -3466,6 +3786,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b2_h3",
@@ -3473,6 +3794,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b2_h4",
@@ -3480,6 +3802,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b4_h2",
@@ -3487,6 +3810,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b4_h3",
@@ -3494,6 +3818,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b4_h4",
@@ -3501,6 +3826,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b8_h2",
@@ -3508,6 +3834,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b8_h3",
@@ -3515,6 +3842,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t128_b8_h4",
@@ -3522,6 +3850,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b2_h2",
@@ -3529,6 +3858,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b2_h3",
@@ -3536,6 +3866,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b2_h4",
@@ -3543,6 +3874,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b4_h2",
@@ -3550,6 +3882,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b4_h3",
@@ -3557,6 +3890,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b4_h4",
@@ -3564,6 +3898,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b8_h2",
@@ -3571,6 +3906,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b8_h3",
@@ -3578,6 +3914,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k4_t256_b8_h4",
@@ -3585,6 +3922,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b2_h2",
@@ -3592,6 +3930,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b2_h3",
@@ -3599,6 +3938,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b2_h4",
@@ -3606,6 +3946,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b4_h2",
@@ -3613,6 +3954,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b4_h3",
@@ -3620,6 +3962,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b4_h4",
@@ -3627,6 +3970,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b8_h2",
@@ -3634,6 +3978,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b8_h3",
@@ -3641,6 +3986,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t64_b8_h4",
@@ -3648,6 +3994,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b2_h2",
@@ -3655,6 +4002,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b2_h3",
@@ -3662,6 +4010,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b2_h4",
@@ -3669,6 +4018,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b4_h2",
@@ -3676,6 +4026,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b4_h3",
@@ -3683,6 +4034,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b4_h4",
@@ -3690,6 +4042,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b8_h2",
@@ -3697,6 +4050,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b8_h3",
@@ -3704,6 +4058,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t128_b8_h4",
@@ -3711,6 +4066,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b2_h2",
@@ -3718,6 +4074,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b2_h3",
@@ -3725,6 +4082,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b2_h4",
@@ -3732,6 +4090,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b4_h2",
@@ -3739,6 +4098,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b4_h3",
@@ -3746,6 +4106,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b4_h4",
@@ -3753,6 +4114,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b8_h2",
@@ -3760,6 +4122,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b8_h3",
@@ -3767,6 +4130,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k5_t256_b8_h4",
@@ -3774,6 +4138,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 160,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b2_h2",
@@ -3781,6 +4146,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b2_h3",
@@ -3788,6 +4154,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b2_h4",
@@ -3795,6 +4162,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b4_h2",
@@ -3802,6 +4170,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b4_h3",
@@ -3809,6 +4178,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b4_h4",
@@ -3816,6 +4186,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b8_h2",
@@ -3823,6 +4194,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b8_h3",
@@ -3830,6 +4202,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t64_b8_h4",
@@ -3837,6 +4210,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b2_h2",
@@ -3844,6 +4218,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b2_h3",
@@ -3851,6 +4226,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b2_h4",
@@ -3858,6 +4234,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b4_h2",
@@ -3865,6 +4242,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b4_h3",
@@ -3872,6 +4250,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b4_h4",
@@ -3879,6 +4258,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b8_h2",
@@ -3886,6 +4266,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b8_h3",
@@ -3893,6 +4274,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t128_b8_h4",
@@ -3900,6 +4282,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b2_h2",
@@ -3907,6 +4290,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b2_h3",
@@ -3914,6 +4298,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b2_h4",
@@ -3921,6 +4306,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b4_h2",
@@ -3928,6 +4314,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b4_h3",
@@ -3935,6 +4322,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b4_h4",
@@ -3942,6 +4330,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b8_h2",
@@ -3949,6 +4338,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b8_h3",
@@ -3956,6 +4346,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k6_t256_b8_h4",
@@ -3963,6 +4354,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b2_h2",
@@ -3970,6 +4362,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b2_h3",
@@ -3977,6 +4370,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b2_h4",
@@ -3984,6 +4378,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b4_h2",
@@ -3991,6 +4386,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b4_h3",
@@ -3998,6 +4394,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b4_h4",
@@ -4005,6 +4402,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b8_h2",
@@ -4012,6 +4410,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b8_h3",
@@ -4019,6 +4418,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t64_b8_h4",
@@ -4026,6 +4426,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b2_h2",
@@ -4033,6 +4434,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b2_h3",
@@ -4040,6 +4442,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b2_h4",
@@ -4047,6 +4450,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b4_h2",
@@ -4054,6 +4458,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b4_h3",
@@ -4061,6 +4466,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b4_h4",
@@ -4068,6 +4474,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b8_h2",
@@ -4075,6 +4482,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b8_h3",
@@ -4082,6 +4490,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t128_b8_h4",
@@ -4089,6 +4498,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b2_h2",
@@ -4096,6 +4506,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b2_h3",
@@ -4103,6 +4514,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b2_h4",
@@ -4110,6 +4522,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b4_h2",
@@ -4117,6 +4530,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b4_h3",
@@ -4124,6 +4538,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b4_h4",
@@ -4131,6 +4546,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b8_h2",
@@ -4138,6 +4554,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b8_h3",
@@ -4145,6 +4562,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k7_t256_b8_h4",
@@ -4152,6 +4570,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 224,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b2_h2",
@@ -4159,6 +4578,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b2_h3",
@@ -4166,6 +4586,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b2_h4",
@@ -4173,6 +4594,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b4_h2",
@@ -4180,6 +4602,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b4_h3",
@@ -4187,6 +4610,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b4_h4",
@@ -4194,6 +4618,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b8_h2",
@@ -4201,6 +4626,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b8_h3",
@@ -4208,6 +4634,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t64_b8_h4",
@@ -4215,6 +4642,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 2,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b2_h2",
@@ -4222,6 +4650,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b2_h3",
@@ -4229,6 +4658,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b2_h4",
@@ -4236,6 +4666,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b4_h2",
@@ -4243,6 +4674,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b4_h3",
@@ -4250,6 +4682,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b4_h4",
@@ -4257,6 +4690,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b8_h2",
@@ -4264,6 +4698,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b8_h3",
@@ -4271,6 +4706,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t128_b8_h4",
@@ -4278,6 +4714,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b2_h2",
@@ -4285,6 +4722,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b2_h3",
@@ -4292,6 +4730,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b2_h4",
@@ -4299,6 +4738,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b4_h2",
@@ -4306,6 +4746,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b4_h3",
@@ -4313,6 +4754,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b4_h4",
@@ -4320,6 +4762,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b8_h2",
@@ -4327,6 +4770,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b8_h3",
@@ -4334,6 +4778,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_dh_k8_t256_b8_h4",
@@ -4341,6 +4786,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: None,
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b2_s10",
@@ -4348,6 +4794,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b2_s12",
@@ -4355,6 +4802,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b2_s14",
@@ -4362,6 +4810,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b4_s10",
@@ -4369,6 +4818,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b4_s12",
@@ -4376,6 +4826,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b4_s14",
@@ -4383,6 +4834,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b8_s10",
@@ -4390,6 +4842,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b8_s12",
@@ -4397,6 +4850,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t128_b8_s14",
@@ -4404,6 +4858,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b2_s10",
@@ -4411,6 +4866,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b2_s12",
@@ -4418,6 +4874,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b2_s14",
@@ -4425,6 +4882,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b4_s10",
@@ -4432,6 +4890,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b4_s12",
@@ -4439,6 +4898,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b4_s14",
@@ -4446,6 +4906,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b8_s10",
@@ -4453,6 +4914,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b8_s12",
@@ -4460,6 +4922,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k4_t256_b8_s14",
@@ -4467,6 +4930,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 128,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b2_s10",
@@ -4474,6 +4938,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b2_s12",
@@ -4481,6 +4946,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b2_s14",
@@ -4488,6 +4954,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b4_s10",
@@ -4495,6 +4962,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b4_s12",
@@ -4502,6 +4970,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b4_s14",
@@ -4509,6 +4978,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b8_s10",
@@ -4516,6 +4986,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b8_s12",
@@ -4523,6 +4994,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t128_b8_s14",
@@ -4530,6 +5002,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b2_s10",
@@ -4537,6 +5010,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b2_s12",
@@ -4544,6 +5018,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b2_s14",
@@ -4551,6 +5026,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b4_s10",
@@ -4558,6 +5034,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b4_s12",
@@ -4565,6 +5042,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b4_s14",
@@ -4572,6 +5050,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b8_s10",
@@ -4579,6 +5058,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b8_s12",
@@ -4586,6 +5066,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k6_t256_b8_s14",
@@ -4593,6 +5074,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 192,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b2_s10",
@@ -4600,6 +5082,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b2_s12",
@@ -4607,6 +5090,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b2_s14",
@@ -4614,6 +5098,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b4_s10",
@@ -4621,6 +5106,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b4_s12",
@@ -4628,6 +5114,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b4_s14",
@@ -4635,6 +5122,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b8_s10",
@@ -4642,6 +5130,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b8_s12",
@@ -4649,6 +5138,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t128_b8_s14",
@@ -4656,6 +5146,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 4,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b2_s10",
@@ -4663,6 +5154,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b2_s12",
@@ -4670,6 +5162,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b2_s14",
@@ -4677,6 +5170,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b4_s10",
@@ -4684,6 +5178,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b4_s12",
@@ -4691,6 +5186,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b4_s14",
@@ -4698,6 +5194,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b8_s10",
@@ -4705,6 +5202,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(10),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b8_s12",
@@ -4712,6 +5210,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(12),
+        role: KernelRole::Experimental,
     },
     KernelVariant {
         name: "onpair_ds_k8_t256_b8_s14",
@@ -4719,6 +5218,7 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
         stage_bytes: Some(14),
+        role: KernelRole::Experimental,
     },
     // END generated packed grid
 ];
@@ -4895,6 +5395,9 @@ async fn run_gpu_kernel_bench(
             let metadata = kernel_result_metadata(*variant, &chunks)?;
             kernels.push(GpuKernelResult {
                 kernel: variant.name.to_string(),
+                role: format!("{:?}", variant.role).to_lowercase(),
+                stage_bytes: variant.stage_bytes,
+                chunk_size: variant.chunk_size,
                 decode_ms: 0.0,
                 decode_gib_s: 0.0,
                 decode_ns_iters: Vec::new(),
@@ -4929,6 +5432,9 @@ async fn run_gpu_kernel_bench(
         let decode_ms = min_ns as f64 / 1_000_000.0;
         kernels.push(GpuKernelResult {
             kernel: variant.name.to_string(),
+            role: format!("{:?}", variant.role).to_lowercase(),
+            stage_bytes: variant.stage_bytes,
+            chunk_size: variant.chunk_size,
             decode_ms,
             decode_gib_s: gib_s(decoded_bytes, decode_ms),
             decode_ns_iters,
@@ -4966,8 +5472,7 @@ async fn run_gpu_kernel_bench(
         // generic `best` would leak an experimental baseline into the paper's shipped cells.
         .filter(|r| {
             r.applicable
-                && !r.kernel.contains("ablate")
-                && !r.kernel.contains("directstore")
+                && r.role == "production"
                 && (!config.validate || r.verified == Some(true))
         })
         .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms))
@@ -6912,6 +7417,21 @@ async fn validate_kernel_variant(variant: KernelVariant, chunks: &[GpuOnPairChun
 
     for (idx, chunk) in chunks.iter().enumerate() {
         let host = chunk.output.clone().into_host().await;
+        // The buffer is allocated with a 16-byte tail beyond the decoded length and poisoned
+        // with 0xA5. Comparing only the expected prefix let a kernel that ran off the end
+        // report "verified" -- exactly the failure a staging-capacity or destination-field bug
+        // produces. Check the guard before the payload, because an overrun is a worse defect
+        // than a wrong byte and should not be masked by a prefix mismatch.
+        let guard = &host.as_ref()[chunk.expected_bytes.len()..];
+        if let Some(pos) = guard.iter().position(|&b| b != 0xA5) {
+            anyhow::bail!(
+                "GPU output overran its buffer for {} on chunk {idx}: guard byte {pos} of {} \
+                 past the decoded length is 0x{:02X}, expected the 0xA5 poison",
+                variant.name,
+                guard.len(),
+                guard[pos]
+            );
+        }
         let actual = &host.as_ref()[..chunk.expected_bytes.len()];
         if actual != chunk.expected_bytes.as_slice() {
             let mismatch = actual

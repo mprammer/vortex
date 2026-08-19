@@ -107,6 +107,7 @@ VARIANT = """    KernelVariant {{
         chunk_size: {chunk},
         block_warps: {warps},
         stage_bytes: {stage},
+        role: KernelRole::Experimental,
     }},
 """
 
