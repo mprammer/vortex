@@ -743,6 +743,7 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
         wrong completion test and made the short-cell warning fire on every successful run."""
         nonlocal nbytes
         buf = b""
+        first = True
         while True:
             chunk = stream.read(8 * 1024 * 1024)
             if not chunk:
@@ -751,7 +752,16 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
             lines = buf.split(b"\n")
             buf = lines.pop()
             for ln in lines:
-                ln = ln.rstrip(b"\r").lstrip(b"\xef\xbb\xbf")   # Windows.log carries a BOM
+                ln = ln.rstrip(b"\r")
+                # Windows.log opens with a UTF-8 BOM. Strip it ONCE, as a prefix -- `lstrip` takes
+                # a character SET, so lstrip(b"\xef\xbb\xbf") would also eat a legitimate leading
+                # 0xEF/0xBB/0xBF on any line (the start of a multi-byte codepoint), silently
+                # altering values. No line in the three corpus logs begins that way, so this is
+                # latent rather than live, but it is the wrong tool for a prefix.
+                if first:
+                    if ln.startswith(b"\xef\xbb\xbf"):
+                        ln = ln[3:]
+                    first = False
                 if nbytes + len(ln) > cap:
                     return True
                 values.append(ln.decode("utf-8", "replace"))
