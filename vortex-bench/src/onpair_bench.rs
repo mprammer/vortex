@@ -5095,6 +5095,16 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
 
     let expanded: Vec<&str> = if requested == ["tpt-matched"] {
         TPT_MATCHED_KERNELS.to_vec()
+    } else if requested == ["packed-s"] {
+        // The staging arm plus its W=8/H=1 baselines at the same K, so S is compared against
+        // the configuration it varies from rather than across the whole grid.
+        GPU_KERNELS
+            .iter()
+            .map(|variant| variant.name)
+            .filter(|name| {
+                name.starts_with("onpair_ds_k") || name.starts_with("onpair_dg_k") || *name == "onpair"
+            })
+            .collect()
     } else if requested == ["packed-grid"] {
         // The coarsening x launch-configuration sweep: every generated grid point, plus the
         // reference the byte-exact check compares against. Named rather than enumerated so a
@@ -5106,6 +5116,7 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
                 name.starts_with("onpair_dg_k")
                     || name.starts_with("onpair_dw_k")
                     || name.starts_with("onpair_dh_k")
+                    || name.starts_with("onpair_ds_k")
                     || *name == "onpair"
             })
             .collect()
@@ -6088,6 +6099,12 @@ async fn stage_gpu_chunk(
     let chunk_offsets_64 = chunk_offsets(&codes_u16, &lens_table, 64, decoded_bytes);
     let chunk_offsets_128 = chunk_offsets(&codes_u16, &lens_table, 128, decoded_bytes);
     let chunk_offsets_96 = chunk_offsets(&codes_u16, &lens_table, 96, decoded_bytes);
+    let chunk_offsets_160 = chunk_offsets(&codes_u16, &lens_table, 160, decoded_bytes);
+    let chunk_offsets_192 = chunk_offsets(&codes_u16, &lens_table, 192, decoded_bytes);
+    let chunk_offsets_224 = chunk_offsets(&codes_u16, &lens_table, 224, decoded_bytes);
+    let chunk_offsets_256 = chunk_offsets(&codes_u16, &lens_table, 256, decoded_bytes);
+    let chunk_offsets_512 = chunk_offsets(&codes_u16, &lens_table, 512, decoded_bytes);
+    let chunk_offsets_1024 = chunk_offsets(&codes_u16, &lens_table, 1024, decoded_bytes);
     let widest = |offs: &[u64]| offs.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
     let max_batch_bytes: Vec<(usize, u64)> = [
         (32, &chunk_offsets_32), (64, &chunk_offsets_64), (96, &chunk_offsets_96),
@@ -6098,12 +6115,6 @@ async fn stage_gpu_chunk(
     .iter()
     .map(|(n, offs)| (*n, widest(offs)))
     .collect();
-    let chunk_offsets_160 = chunk_offsets(&codes_u16, &lens_table, 160, decoded_bytes);
-    let chunk_offsets_192 = chunk_offsets(&codes_u16, &lens_table, 192, decoded_bytes);
-    let chunk_offsets_224 = chunk_offsets(&codes_u16, &lens_table, 224, decoded_bytes);
-    let chunk_offsets_256 = chunk_offsets(&codes_u16, &lens_table, 256, decoded_bytes);
-    let chunk_offsets_512 = chunk_offsets(&codes_u16, &lens_table, 512, decoded_bytes);
-    let chunk_offsets_1024 = chunk_offsets(&codes_u16, &lens_table, 1024, decoded_bytes);
 
     Ok(GpuOnPairChunk {
         rows,
@@ -6385,7 +6396,7 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
 /// `ONPAIR_CARVEOUT=maxl1` (0%), `maxshared` (100%), `default` (driver's choice), or a
 /// percentage. Applied per launch; unset leaves behaviour exactly as it was.
 #[cfg(feature = "cuda")]
-fn apply_carveout_policy(function: &CudaFunction) -> Result<Option<i32>> {
+fn apply_carveout_policy(function: &cudarc::driver::CudaFunction) -> Result<Option<i32>> {
     let Ok(raw) = std::env::var("ONPAIR_CARVEOUT") else {
         return Ok(None);
     };
@@ -7109,6 +7120,9 @@ fn launch_variant(
             let dict_padded_hi = chunk.dict_padded.cuda_view::<u8>()?;
             let packed_lens = chunk.packed_lens.cuda_view::<u8>()?;
             let chunk_offsets = chunk_offsets_for_variant(chunk, variant.chunk_size)?;
+            // Both packed arms take the same carveout policy, or a W comparison silently
+            // becomes W=8-with-policy against W=16-default.
+            apply_carveout_policy(function)?;
             let cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
             ctx.launch_kernel_config(function, cfg, chunk.total_tokens, |args| {
                 args.arg(&codes)

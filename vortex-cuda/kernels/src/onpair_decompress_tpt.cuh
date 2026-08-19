@@ -75,8 +75,14 @@
 // high-length field, and silently corrupts requests. Widening the destination to thirteen bits
 // (bits 28:16, moving the three-bit high length to 31:29 and using the currently unused bit 31)
 // would raise the limit to K<=16.
-#if (TOKENS_PER_THREAD * 32u * ONPAIR_STAGE_BYTES) > 4096u
-#error "32*K*S exceeds the 12-bit destination field in pack_high_request"
+// The destination is an offset into the batch's DECODED bytes, so it is bounded by the token
+// length of 16, not by the staging capacity S: destination_max = 16*(32*K - 1) + 8 = 512*K - 8.
+// K=8 gives 4088 and fits the 12-bit field; K=9 reaches 4600 and would corrupt the high-length
+// bits. Stating it in S was wrong twice over -- S does not bound it, and this sat above the
+// ONPAIR_STAGE_BYTES default, so every unit that did not set S preprocessed it as zero and the
+// assertion was inert.
+#if (512u * TOKENS_PER_THREAD - 8u) > 4095u
+#error "512*K-8 exceeds the 12-bit destination field in pack_high_request; K must be <= 8"
 #endif
 // The kernel indexes shared state by warp and assumes whole warps.
 #if (ONPAIR_BLOCK_THREADS % 32u) != 0u
