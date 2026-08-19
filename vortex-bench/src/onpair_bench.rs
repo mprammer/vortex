@@ -1294,6 +1294,11 @@ enum KernelLayout {
     /// Dense low/high 8-byte planes plus two four-bit `(length - 1)` values
     /// per byte. This is Joe's packed dictionary ABI.
     PackedSplit8,
+    /// The packed ABI at W=16: one padded stride-16 entry covers the whole token, so there is
+    /// no high plane, no request queue and no hoist. Same kernel signature as `PackedSplit8`
+    /// -- the padded table is bound to the low pointer and the high pointer is never read --
+    /// which is what makes W a one-variable alteration rather than a different decoder.
+    PackedWide16,
     /// Standard grid; variable-stride length-bucket dict (stride 4/8/12/16).
     /// Requires the entries to be bucket-sorted, i.e. only valid under
     /// `ONPAIR_DICT_REORDER=lenbucket`.
@@ -2214,6 +2219,1212 @@ const GPU_KERNELS: &[KernelVariant] = &[
         chunk_size: 256,
         block_warps: 8,
     },
+    KernelVariant {
+        name: "onpair_dw_k1_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k1_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 32,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k2_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 64,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k3_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 96,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k4_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k5_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 160,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k6_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k7_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 224,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t64_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t64_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t64_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t64_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t64_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t128_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t128_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t128_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t128_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t128_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t256_b1",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t256_b2",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t256_b4",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t256_b6",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dw_k8_t256_b8",
+        layout: KernelLayout::PackedWide16,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t64_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t128_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k4_t256_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 128,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t64_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t128_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k6_t256_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 192,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t64_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 2,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t128_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 4,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b2_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b2_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b2_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b4_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b4_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b4_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b8_c2",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b8_c3",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
+    KernelVariant {
+        name: "onpair_dc_k8_t256_b8_c4",
+        layout: KernelLayout::PackedSplit8,
+        chunk_size: 256,
+        block_warps: 8,
+    },
     // END generated packed grid
 ];
 
@@ -2351,7 +3562,12 @@ async fn run_gpu_kernel_bench(
     if std::env::var("ONPAIR_L2_PERSIST").is_ok()
         && variants
             .iter()
-            .any(|variant| matches!(variant.layout, KernelLayout::PackedSplit8))
+            .any(|variant| {
+                matches!(
+                    variant.layout,
+                    KernelLayout::PackedSplit8 | KernelLayout::PackedWide16
+                )
+            })
     {
         anyhow::bail!(
             "ONPAIR_L2_PERSIST has no fair packed-ABI treatment; disable it for this comparison"
@@ -2591,7 +3807,12 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
         GPU_KERNELS
             .iter()
             .map(|variant| variant.name)
-            .filter(|name| name.starts_with("onpair_dg_k") || *name == "onpair")
+            .filter(|name| {
+                name.starts_with("onpair_dg_k")
+                    || name.starts_with("onpair_dw_k")
+                    || name.starts_with("onpair_dc_k")
+                    || *name == "onpair"
+            })
             .collect()
     } else {
         anyhow::ensure!(
@@ -2691,6 +3912,12 @@ fn kernel_result_metadata(
                     + chunk.dict_s8_hi.len()
                     + chunk.packed_lens.len()
             }
+            KernelLayout::PackedWide16 => {
+                chunk.codes.len()
+                    + chunk_offsets_len(chunk, variant.chunk_size)?
+                    + chunk.dict_padded.len()
+                    + chunk.packed_lens.len()
+            }
             KernelLayout::LenBucket => {
                 chunk.codes.len()
                     + chunk_offsets_len(chunk, variant.chunk_size)?
@@ -2724,6 +3951,7 @@ fn kernel_result_metadata(
     let abi_family = in_comparison.then(|| match variant.layout {
         KernelLayout::SplitRead8 => "split8read".to_string(),
         KernelLayout::PackedSplit8 => "packed".to_string(),
+        KernelLayout::PackedWide16 => "packed-wide16".to_string(),
         _ => unreachable!("TPT comparison contains only split layouts"),
     });
     Ok(KernelResultMetadata {
@@ -3851,6 +5079,7 @@ fn inapplicable_reason(
         | KernelLayout::Stride16
         | KernelLayout::SplitRead8
         | KernelLayout::PackedSplit8
+        | KernelLayout::PackedWide16
         | KernelLayout::SplitRead4
         | KernelLayout::RegCache => None,
         KernelLayout::Stride8 => chunks
@@ -4247,7 +5476,10 @@ fn time_kernel_variant(
     // dicts. Single-chunk benchmarks only (window covers chunks[0]'s dict).
     if std::env::var("ONPAIR_L2_PERSIST").is_ok() {
         anyhow::ensure!(
-            !matches!(variant.layout, KernelLayout::PackedSplit8),
+            !matches!(
+                variant.layout,
+                KernelLayout::PackedSplit8 | KernelLayout::PackedWide16
+            ),
             "ONPAIR_L2_PERSIST has no defined packed-ABI treatment"
         );
         if let Some(c) = chunks.first() {
@@ -4496,6 +5728,25 @@ fn launch_variant(
                     .arg(&dict_s8)
                     .arg(&dict_padded)
                     .arg(&lens)
+                    .arg(&output)
+                    .arg(&total_tokens);
+            })?;
+        }
+        KernelLayout::PackedWide16 => {
+            // The padded table goes to the low pointer; the kernel reads 16 B from it and
+            // never touches the high pointer, which is bound to the same buffer so the
+            // signature is unchanged.
+            let dict_padded = chunk.dict_padded.cuda_view::<u8>()?;
+            let dict_padded_hi = chunk.dict_padded.cuda_view::<u8>()?;
+            let packed_lens = chunk.packed_lens.cuda_view::<u8>()?;
+            let chunk_offsets = chunk_offsets_for_variant(chunk, variant.chunk_size)?;
+            let cfg = launch_config(chunk.total_tokens, variant.chunk_size, variant.block_warps);
+            ctx.launch_kernel_config(function, cfg, chunk.total_tokens, |args| {
+                args.arg(&codes)
+                    .arg(&chunk_offsets)
+                    .arg(&dict_padded)
+                    .arg(&dict_padded_hi)
+                    .arg(&packed_lens)
                     .arg(&output)
                     .arg(&total_tokens);
             })?;

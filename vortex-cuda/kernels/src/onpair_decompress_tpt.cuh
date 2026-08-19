@@ -30,6 +30,44 @@
 #ifndef ONPAIR_LAUNCH_BOUNDS
 #define ONPAIR_LAUNCH_BOUNDS __launch_bounds__(ONPAIR_BLOCK_THREADS, ONPAIR_MIN_BLOCKS)
 #endif
+// W, the low-plane width in bytes. 8 reads a dense 8-byte plane and sends the tail of long
+// tokens through the request queue; 16 reads one padded 16-byte entry and has no high path at
+// all, so the queue, the hoist and the second gather disappear together.
+//
+// The two arms carry the SAME dictionary footprint, which is what makes this a clean control:
+// at 4096 entries W=8 is 32768 (lo) + 32768 (hi) + 2048 (nibble lengths) = 67584 B, and W=16
+// is 65536 (padded) + 2048 = 67584 B. Cache residency is therefore held fixed by construction
+// rather than argued away, which the superseded split8read-vs-stride16 comparison could not do
+// (100 KB against 68 KB). What is left varying is one wide access against one narrow access
+// plus a conditional second.
+//
+// Only 8 and 16 are meaningful: the load must be a native vector width, and at 4 bytes almost
+// every token takes the long path (measured mean token length is 7.8 to 11.8 B), which is the
+// superseded split4read and never beat baseline.
+#ifndef ONPAIR_LOW_PLANE_BYTES
+#define ONPAIR_LOW_PLANE_BYTES 8u
+#endif
+#if ONPAIR_LOW_PLANE_BYTES != 8u && ONPAIR_LOW_PLANE_BYTES != 16u
+#error "ONPAIR_LOW_PLANE_BYTES must be 8 or 16"
+#endif
+
+// C, how many rounds of high-plane loads are issued BEFORE the low-byte emit and consumed
+// after it. This is the hoist that already exists in the shipped decoder at C=1: it is what
+// leaves independent work behind the LDG. C>1 keeps more loads live across the emit, which
+// costs registers. Meaningless when W=16, because there is no high plane.
+#ifndef ONPAIR_HIGH_READ_CAP
+#define ONPAIR_HIGH_READ_CAP 1u
+#endif
+#if ONPAIR_HIGH_READ_CAP < 1u || ONPAIR_HIGH_READ_CAP > TOKENS_PER_THREAD
+#error "ONPAIR_HIGH_READ_CAP must be in [1, TOKENS_PER_THREAD]"
+#endif
+
+#if ONPAIR_LOW_PLANE_BYTES == 16u
+#define ONPAIR_LO_VEC uint4
+#else
+#define ONPAIR_LO_VEC uint2
+#endif
+
 #define WARPS_PER_BLOCK_MAX (ONPAIR_BLOCK_THREADS / 32u)
 #define TOKENS_PER_WARP     (TOKENS_PER_THREAD * 32u)
 #define WARP_BUF_BYTES      (TOKENS_PER_WARP * 16u + 32u)
@@ -95,12 +133,17 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     }
 
     __shared__ __align__(16) uint8_t s_buf_all[WARPS_PER_BLOCK_MAX * WARP_BUF_BYTES];
+#if ONPAIR_LOW_PLANE_BYTES == 8u
+    // At W=16 there is no high plane, so the request queue does not exist and its shared
+    // memory is not allocated. That keeps the W comparison honest on occupancy as well as on
+    // dictionary footprint.
     __shared__ __align__(16) uint32_t s_requests[WARPS_PER_BLOCK_MAX][REQUESTS_PER_WARP];
-    uint8_t *s_buf_base = &s_buf_all[warp_id * WARP_BUF_BYTES];
     uint32_t *requests = s_requests[warp_id];
+#endif
+    uint8_t *s_buf_base = &s_buf_all[warp_id * WARP_BUF_BYTES];
 
     const uint64_t base_i = chunk * TOKENS_PER_WARP + (uint64_t)lane;
-    uint2 lo[TOKENS_PER_THREAD];
+    ONPAIR_LO_VEC lo[TOKENS_PER_THREAD];
     uint32_t code[TOKENS_PER_THREAD];
     uint32_t len[TOKENS_PER_THREAD];
 #pragma unroll
@@ -108,11 +151,18 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
         const uint64_t i = base_i + (uint64_t)(k * 32);
         if (i < total_tokens) {
             code[k] = (uint32_t)codes[i];
-            lo[k] = *reinterpret_cast<const uint2 *>(dict_s8_lo + (size_t)code[k] * 8u);
+            // At W=16 the host binds the padded stride-16 table to this pointer, so one wide
+            // load covers the whole token and no second gather is ever needed.
+            lo[k] = *reinterpret_cast<const ONPAIR_LO_VEC *>(
+                dict_s8_lo + (size_t)code[k] * (size_t)ONPAIR_LOW_PLANE_BYTES);
             len[k] = unpack_length(packed_lens, code[k]);
         } else {
             code[k] = 0u;
+#if ONPAIR_LOW_PLANE_BYTES == 16u
+            lo[k] = make_uint4(0u, 0u, 0u, 0u);
+#else
             lo[k] = make_uint2(0u, 0u);
+#endif
             len[k] = 0u;
         }
     }
@@ -151,6 +201,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     const uint32_t head_pre = (16u - (uint32_t)(out_start & 15u)) & 15u;
     uint8_t *s_buf = s_buf_base + ((16u - head_pre) & 15u);
 
+#if ONPAIR_LOW_PLANE_BYTES == 8u
     // Build the identical plane-major request stream first, so dense lane N
     // still owns request N and the first high gather can be issued early.
     uint32_t high_count = 0u;
@@ -167,39 +218,57 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
     }
     __syncwarp();
 
-    const bool first_active = (uint32_t)lane < high_count;
-    uint32_t first_destination = 0u;
-    uint32_t first_high_length = 0u;
-    uint2 first_high = make_uint2(0u, 0u);
-    if (first_active) {
-        const uint32_t request = requests[lane];
-        const uint32_t selected_code = request & 0xffffu;
-        first_destination = (request >> 16u) & 0xfffu;
-        first_high_length = (request >> 28u) + 1u;
-        first_high = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)selected_code * 8u);
+    // Issue the first C rounds of high-plane loads now and consume them after the low-byte
+    // emit. C=1 is the shipped decoder; larger C keeps more loads live across the emit.
+    uint32_t hoist_destination[ONPAIR_HIGH_READ_CAP];
+    uint32_t hoist_length[ONPAIR_HIGH_READ_CAP];
+    uint2 hoist_high[ONPAIR_HIGH_READ_CAP];
+    bool hoist_active[ONPAIR_HIGH_READ_CAP];
+#pragma unroll
+    for (uint32_t c = 0u; c < ONPAIR_HIGH_READ_CAP; ++c) {
+        const uint32_t idx = (uint32_t)lane + c * 32u;
+        hoist_active[c] = idx < high_count;
+        hoist_destination[c] = 0u;
+        hoist_length[c] = 0u;
+        hoist_high[c] = make_uint2(0u, 0u);
+        if (hoist_active[c]) {
+            const uint32_t request = requests[idx];
+            const uint32_t selected_code = request & 0xffffu;
+            hoist_destination[c] = (request >> 16u) & 0xfffu;
+            hoist_length[c] = (request >> 28u) + 1u;
+            hoist_high[c] = *reinterpret_cast<const uint2 *>(dict_s8_hi + (size_t)selected_code * 8u);
+        }
     }
+#endif
 
     // The first high value is deliberately not consumed until all owners have
     // emitted their low bytes, creating independent instructions after LDG.
 #pragma unroll
     for (int k = 0; k < (int)TOKENS_PER_THREAD; ++k) {
-        const uint32_t low_length = len[k] < 8u ? len[k] : 8u;
+        // At W=16 the single wide load already holds the whole token, so this writes all of
+        // it and nothing is left for a high path.
+        const uint32_t low_length =
+            len[k] < ONPAIR_LOW_PLANE_BYTES ? len[k] : (uint32_t)ONPAIR_LOW_PLANE_BYTES;
         const uint8_t *bytes = reinterpret_cast<const uint8_t *>(&lo[k]);
 #pragma unroll
-        for (int byte = 0; byte < 8; ++byte) {
+        for (int byte = 0; byte < (int)ONPAIR_LOW_PLANE_BYTES; ++byte) {
             if (byte < (int)low_length) {
                 s_buf[excl[k] + (uint32_t)byte] = bytes[byte];
             }
         }
     }
 
-    if (first_active) {
-        emit_high_bytes(s_buf, first_destination, first_high_length, first_high);
+#if ONPAIR_LOW_PLANE_BYTES == 8u
+#pragma unroll
+    for (uint32_t c = 0u; c < ONPAIR_HIGH_READ_CAP; ++c) {
+        if (hoist_active[c]) {
+            emit_high_bytes(s_buf, hoist_destination[c], hoist_length[c], hoist_high[c]);
+        }
     }
 
     // The remaining rounds retain the baseline's dense queue drain.
 #pragma unroll
-    for (uint32_t round = 1u; round < TOKENS_PER_THREAD; ++round) {
+    for (uint32_t round = ONPAIR_HIGH_READ_CAP; round < TOKENS_PER_THREAD; ++round) {
         const uint32_t request_idx = (uint32_t)lane + round * 32u;
         if (request_idx < high_count) {
             const uint32_t request = requests[request_idx];
@@ -210,6 +279,7 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
             emit_high_bytes(s_buf, destination, high_length, high);
         }
     }
+#endif
     __syncwarp();
 
     const uint32_t head = head_pre < warp_total ? head_pre : warp_total;
