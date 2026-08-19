@@ -5645,7 +5645,11 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
             .iter()
             .map(|variant| variant.name)
             .filter(|name| {
-                name.starts_with("onpair_ds_k") || name.starts_with("onpair_dg_k") || *name == "onpair"
+                name.starts_with("onpair_ds_k")
+                    || name.starts_with("onpair_dg_k")
+                    // the shipped packed family, so the selector's choice is always timed
+                    || name.starts_with("onpair_decompress")
+                    || *name == "onpair"
             })
             .collect()
     } else if requested == ["packed-grid"] {
@@ -5660,6 +5664,9 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
                     || name.starts_with("onpair_dw_k")
                     || name.starts_with("onpair_dh_k")
                     || name.starts_with("onpair_ds_k")
+                    // the shipped packed family: the selector's pick must be among the timed
+                    // kernels or the run fails with "auto kernel ... was not timed"
+                    || name.starts_with("onpair_decompress")
                     || *name == "onpair"
             })
             .collect()
