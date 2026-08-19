@@ -6374,7 +6374,6 @@ fn chunk_offsets(codes: &[u16], lens: &[u8], chunk_size: usize, expected_total: 
     offsets
 }
 
-#[cfg(feature = "cuda")]
 /// Bank freed shared memory as L1 instead of as extra resident blocks.
 ///
 /// Shared memory and L1 are one array split by a quantized carveout. By default the driver
@@ -6412,6 +6411,7 @@ fn apply_carveout_policy(function: &CudaFunction) -> Result<Option<i32>> {
     Ok(Some(pct))
 }
 
+#[cfg(feature = "cuda")]
 fn inapplicable_reason(
     variant: KernelVariant,
     chunks: &[GpuOnPairChunk],
