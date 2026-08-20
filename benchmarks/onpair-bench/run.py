@@ -428,6 +428,10 @@ def _stream_cache_identity(col: Column) -> dict:
         "json_paths": [list(item) for item in col.json_paths],
         "cap_bytes": col.cap_bytes or STREAM_CAP_BYTES,
         "source_revision": col.source_revision,
+        # loghub: without the member, changing which .log is extracted from the same archive
+        # leaves URL and cache name identical, so the previous member's parquet is accepted as a
+        # cache hit and benchmarked under the new configuration.
+        "member": col.member,
         "urls": urls,
     }
 
@@ -769,8 +773,20 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
 
     for url in urls:
         req = urllib.request.Request(url, headers=hdr)
+        # `_request_with_retry` may invoke read_archive MORE THAN ONCE for this URL, and a retry
+        # restarts the archive from byte zero. `values`/`nbytes` are closed over, so without a
+        # rewind the prefix already appended by the failed attempt stays and gets appended AGAIN:
+        # the column reaches the cap on duplicated data and publishes with a perfectly normal
+        # `stop_reason: cap_reached`, with only the successful attempt in `sources`. Throughput and
+        # dictionary statistics would then be measured on a repeated-prefix corpus while every
+        # acceptance gate passed. Snapshot per URL (not globally) so accumulation ACROSS urls still
+        # works while retries WITHIN a url are idempotent.
+        base_len, base_bytes = len(values), nbytes
 
-        def read_archive(response, url=url):
+        def read_archive(response, url=url, base_len=base_len, base_bytes=base_bytes):
+            nonlocal nbytes
+            del values[base_len:]
+            nbytes = base_bytes
             info = {"url": url, "etag": response.headers.get("ETag"),
                     "last_modified": response.headers.get("Last-Modified"),
                     "content_length": response.headers.get("Content-Length")}
@@ -807,10 +823,20 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
                 stop_reason = "terminal_404"
                 break
             raise
-        except EOFError:
-            # A truncated .gz raises here. Keep what decompressed but do not call it complete.
-            print(f"    {url}: archive ended early (truncated download?)", file=sys.stderr)
-            stop_reason = "truncated_archive"
+        except EOFError as e:
+            # A truncated .gz raises here. Publishing the prefix would make an undersized sample
+            # into a successful benchmark AND a reusable cache, which is the failure this harness
+            # exists to avoid -- `_stream_cache_status` does not reject a short stop_reason. If the
+            # cap was already satisfied the truncation is irrelevant; otherwise fail loudly.
+            if nbytes >= cap:
+                print(f"    {url}: archive ended early after the cap was met — fine",
+                      file=sys.stderr)
+                stop_reason = "cap_reached"
+            else:
+                raise OSError(
+                    f"{col.dataset_id}: {url} ended early with {nbytes} B of {cap} B "
+                    f"(truncated download). Refusing to publish a short cell as a cache."
+                ) from e
         print(f"    {url}: {nbytes} B of {member}", file=sys.stderr)
         if sources and sources[-1].get("cap_reached"):
             stop_reason = "cap_reached"
