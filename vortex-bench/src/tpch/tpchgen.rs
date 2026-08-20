@@ -58,6 +58,13 @@ pub struct TpchGenOptions {
     pub batch_size: usize,
     /// The max size of uncompressed file .tbl that we should generate
     pub max_file_size_mb: Option<u64>,
+    /// Tables to generate, by name. `None` generates all eight.
+    ///
+    /// Added so a caller needing ONE column at a high scale factor does not pay for the rest.
+    /// `customer.c_address` carries 3.8 MB of payload per scale factor, so it needs sf263 to
+    /// reach 1 GB -- while `lineitem` at that factor is 1.6 billion rows, and is precisely the
+    /// table that column does not need.
+    pub tables: Option<Vec<String>>,
 }
 
 impl Default for TpchGenOptions {
@@ -68,6 +75,7 @@ impl Default for TpchGenOptions {
             format: Format::Parquet,
             batch_size: 8192 * 64,
             max_file_size_mb: None,
+            tables: None,
         }
     }
 }
@@ -95,9 +103,21 @@ impl TpchGenOptions {
         self.max_file_size_mb = max_file_size_mb;
         self
     }
+
+    /// Restrict generation to these tables. Unknown names are an error rather than a silent
+    /// no-op: a typo would otherwise produce an empty directory that reads as "already
+    /// generated" to every idempotent caller downstream.
+    pub fn with_tables<I, S>(mut self, tables: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        self.tables = Some(tables.into_iter().map(Into::into).collect());
+        self
+    }
 }
 
-/// Generate all TPC-H tables for a single scale factor
+/// Generate the selected TPC-H tables for a single scale factor, or all tables by default.
 pub async fn generate_tpch_tables(options: TpchGenOptions) -> Result<()> {
     fs::create_dir_all(&options.output_dir)?;
 
@@ -114,7 +134,29 @@ pub async fn generate_tpch_tables(options: TpchGenOptions) -> Result<()> {
 
     const MAX_CONCURRENT_FILES: usize = 32;
 
-    let all_futures = tables
+    // Filter BEFORE generating, and fail on an unknown name. A typo that silently generated
+    // nothing would leave an empty scale-factor directory, which every idempotent caller
+    // downstream reads as "already generated" -- the failure would surface as a missing parquet
+    // hours later on a GPU box rather than here.
+    let selected: Vec<_> = match &options.tables {
+        None => tables.to_vec(),
+        Some(want) => {
+            for name in want {
+                anyhow::ensure!(
+                    tables.iter().any(|(t, _)| t == name),
+                    "unknown TPC-H table {name:?}; known tables are {:?}",
+                    tables.iter().map(|(t, _)| *t).collect::<Vec<_>>()
+                );
+            }
+            tables
+                .iter()
+                .filter(|(t, _)| want.iter().any(|w| w == t))
+                .copied()
+                .collect()
+        }
+    };
+
+    let all_futures = selected
         .iter()
         .map(|(table_name, generator)| {
             info!(

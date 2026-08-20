@@ -421,7 +421,10 @@ class _HttpRangeFile(io.RawIOBase):
 def _stream_cache_identity(col: Column) -> dict:
     urls = list(col.urls) or ([col.url] if col.url else [])
     return {
-        "loader_version": 2,
+        # 4 (2026-08-20): multi-member Loghub archives became strict-cap inputs. Version 3 could
+        # publish an all-sources-exhausted prefix and then accept it forever; a truncated corpus
+        # would therefore pass every later cache check while measuring fewer bytes than planned.
+        "loader_version": 4,
         "dataset_id": col.dataset_id,
         "kind": col.kind,
         "columns": list(col.siblings) or [col.column],
@@ -430,8 +433,12 @@ def _stream_cache_identity(col: Column) -> dict:
         "source_revision": col.source_revision,
         # loghub: without the member, changing which .log is extracted from the same archive
         # leaves URL and cache name identical, so the previous member's parquet is accepted as a
-        # cache hit and benchmarked under the new configuration.
+        # cache hit and benchmarked under the new configuration. `members` is the same hazard for
+        # multi-member archives: Spark holds 3,852 container logs, and two different patterns over
+        # it produce different columns from one URL.
         "member": col.member,
+        "members": col.members,
+        "require_cap": col.kind == "loghub" and col.cap_bytes > 0,
         "urls": urls,
     }
 
@@ -480,6 +487,8 @@ def _stream_cache_status(dest: Path, identity: dict) -> tuple[bool, str]:
         return False, "manifest UTF-8 byte totals do not cover the selected columns"
     if any(not isinstance(utf8_bytes[name], int) or utf8_bytes[name] < 0 for name in expected_columns):
         return False, "manifest has an invalid UTF-8 byte total"
+    if identity.get("require_cap") and manifest.get("stop_reason") != "cap_reached":
+        return False, "manifest records a short strict-cap source"
     return True, "identity and parquet metadata match"
 
 
@@ -715,6 +724,7 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
     cap and a shortfall is reported, because a half-downloaded log would otherwise look like a
     legitimately smaller column.
     """
+    import fnmatch
     import gzip
     import io
     import tarfile
@@ -726,12 +736,18 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
     identity = identity or _stream_cache_identity(col)
     cap = col.cap_bytes or STREAM_CAP_BYTES
     member = col.member
-    if not member:
-        raise ValueError(f"{col.dataset_id}: loghub columns must name `member` (the .log inside)")
+    members = col.members
+    if bool(member) == bool(members):
+        raise ValueError(
+            f"{col.dataset_id}: loghub columns need exactly one of `member` (a single .log) "
+            f"or `members` (an fnmatch pattern over many); got member={member!r} "
+            f"members={members!r}"
+        )
     dest.parent.mkdir(parents=True, exist_ok=True)
     hdr = {"User-Agent": "vortex-bench/onpair"}
     urls = list(col.urls) or ([col.url] if col.url else [])
-    print(f"==> streaming loghub {member} (cap {cap} B)\n        {urls[0]}\n        -> {dest}",
+    what = member or f"members matching {members!r}"
+    print(f"==> streaming loghub {what} (cap {cap} B)\n        {urls[0]}\n        -> {dest}",
           file=sys.stderr)
 
     values: list[str] = []
@@ -740,36 +756,44 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
     stop_reason = "all_sources_exhausted"
 
     def take_lines(stream) -> bool:
-        """Accumulate whole lines from a binary stream until the cap. Partial trailing content is
-        discarded rather than emitted as a truncated value. Returns True if it stopped because the
-        cap was reached -- the caller needs that, because a line-aligned reader can never land on
-        the cap exactly (it stops when the NEXT line would exceed it), so `nbytes >= cap` is the
-        wrong completion test and made the short-cell warning fire on every successful run."""
+        """Accumulate whole lines from a binary stream until the cap.
+
+        Returns True if the next whole line would cross the cap. A clean EOF terminates its final
+        line even without ``\\n``; treating that value as a truncated fragment silently dropped
+        one record from every such member, which compounds across Spark's 3,852 files.
+        """
         nonlocal nbytes
         buf = b""
         first = True
+
+        def take_line(line: bytes) -> bool:
+            nonlocal first, nbytes
+            line = line.rstrip(b"\r")
+            # Windows.log opens with a UTF-8 BOM. Strip it ONCE, as a prefix -- `lstrip` takes
+            # a character SET, so lstrip(b"\xef\xbb\xbf") would also eat a legitimate leading
+            # 0xEF/0xBB/0xBF on any line (the start of a multi-byte codepoint), silently
+            # altering values. No line in the corpus logs begins that way, so this is latent
+            # rather than live, but it is the wrong tool for a prefix.
+            if first:
+                if line.startswith(b"\xef\xbb\xbf"):
+                    line = line[3:]
+                first = False
+            if nbytes + len(line) > cap:
+                return True
+            values.append(line.decode("utf-8", "replace"))
+            nbytes += len(line)
+            return False
+
         while True:
             chunk = stream.read(8 * 1024 * 1024)
             if not chunk:
-                return False
+                return bool(buf) and take_line(buf)
             buf += chunk
             lines = buf.split(b"\n")
             buf = lines.pop()
             for ln in lines:
-                ln = ln.rstrip(b"\r")
-                # Windows.log opens with a UTF-8 BOM. Strip it ONCE, as a prefix -- `lstrip` takes
-                # a character SET, so lstrip(b"\xef\xbb\xbf") would also eat a legitimate leading
-                # 0xEF/0xBB/0xBF on any line (the start of a multi-byte codepoint), silently
-                # altering values. No line in the three corpus logs begins that way, so this is
-                # latent rather than live, but it is the wrong tool for a prefix.
-                if first:
-                    if ln.startswith(b"\xef\xbb\xbf"):
-                        ln = ln[3:]
-                    first = False
-                if nbytes + len(ln) > cap:
+                if take_line(ln):
                     return True
-                values.append(ln.decode("utf-8", "replace"))
-                nbytes += len(ln)
 
     for url in urls:
         req = urllib.request.Request(url, headers=hdr)
@@ -794,23 +818,60 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
             # `?download=1`, so `url.endswith(".tar.gz")` is false for every real link.
             path = urllib.parse.urlsplit(url).path
             if path.endswith((".tar.gz", ".tgz")):
-                # Walk the tar header chain inside the gzip stream and read only our member.
+                # Walk the tar header chain inside the gzip stream and read our member(s).
                 with tarfile.open(fileobj=gzip.GzipFile(fileobj=response), mode="r|") as tf:
+                    n_members = 0
                     for ti in tf:
-                        if ti.isfile() and os.path.basename(ti.name) == member:
+                        if not ti.isfile():
+                            continue
+                        if members:
+                            # ARCHIVE ORDER, not sorted: `r|` is a forward-only stream, so the
+                            # members arrive in the order they were written and seeking back to
+                            # take them alphabetically would mean buffering the whole 2.9 GB.
+                            # Archive order is fixed for a fixed archive, so the sample is
+                            # reproducible -- which is the property that matters here.
+                            if not (fnmatch.fnmatch(ti.name, members)
+                                    or fnmatch.fnmatch(os.path.basename(ti.name), members)):
+                                continue
+                            f = tf.extractfile(ti)
+                            if f is None:
+                                continue
+                            n_members += 1
+                            if take_lines(f):
+                                info["cap_reached"] = True
+                                break
+                        elif os.path.basename(ti.name) == member:
                             f = tf.extractfile(ti)
                             if f is not None:
                                 info["cap_reached"] = take_lines(f)
+                            n_members += 1
                             break
+                    if n_members == 0:
+                        raise KeyError(f"{members or member} matched nothing in {url}")
+                    info["members_read"] = n_members
             elif path.endswith(".zip"):
                 blob = io.BytesIO(response.read())          # zip needs the trailing directory
                 with zipfile.ZipFile(blob) as zf:
-                    name = next((n for n in zf.namelist()
-                                 if os.path.basename(n) == member), None)
-                    if name is None:
-                        raise KeyError(f"{member} not in {url}")
-                    with zf.open(name) as f:
-                        info["cap_reached"] = take_lines(f)
+                    if members:
+                        # SORTED here, unlike tar: the whole archive is already in memory, so a
+                        # deterministic order is free and `namelist()` order is only as stable as
+                        # whoever built the zip.
+                        names = sorted(n for n in zf.namelist()
+                                       if fnmatch.fnmatch(n, members)
+                                       or fnmatch.fnmatch(os.path.basename(n), members))
+                    else:
+                        names = [n for n in zf.namelist()
+                                 if os.path.basename(n) == member][:1]
+                    if not names:
+                        raise KeyError(f"{members or member} matched nothing in {url}")
+                    n_members = 0
+                    for name in names:
+                        with zf.open(name) as f:
+                            n_members += 1
+                            if take_lines(f):
+                                info["cap_reached"] = True
+                                break
+                    info["members_read"] = n_members
             else:
                 raise ValueError(f"unsupported loghub archive: {url}")
             return info
@@ -837,13 +898,25 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
                     f"{col.dataset_id}: {url} ended early with {nbytes} B of {cap} B "
                     f"(truncated download). Refusing to publish a short cell as a cache."
                 ) from e
-        print(f"    {url}: {nbytes} B of {member}", file=sys.stderr)
+        n_read = sources[-1].get("members_read") if sources else None
+        detail = f" across {n_read} members" if members and n_read else ""
+        print(f"    {url}: {nbytes} B of {what}{detail}", file=sys.stderr)
         if sources and sources[-1].get("cap_reached"):
             stop_reason = "cap_reached"
             break
 
     if not values:
-        raise OSError(f"no lines read for {col.dataset_id}/{member}")
+        raise OSError(f"no lines read for {col.dataset_id}/{members or member}")
+    if nbytes >= cap:
+        stop_reason = "cap_reached"
+    if identity.get("require_cap") and stop_reason != "cap_reached":
+        # Every campaign Loghub column has a measured payload above its explicit cap. Accepting
+        # all_sources_exhausted here would turn a truncated/mutated archive into a reusable short
+        # cache whose row count, schema, and manifest all agree -- the silent failure mode.
+        raise OSError(
+            f"{col.dataset_id}: read only {nbytes} B of the required {cap} B from {what} "
+            f"({stop_reason}); refusing to publish a short streamed cache"
+        )
     if stop_reason != "cap_reached":
         print(f"==> WARNING: {col.dataset_id} reached only {nbytes} B against a {cap} B cap "
               f"({stop_reason}). This is a SHORT cell, not a smaller column.", file=sys.stderr)
@@ -851,7 +924,8 @@ def loghub_to_parquet(col: Column, identity: dict | None = None) -> Path:
     _publish_stream_cache(
         table, dest, identity,
         {"sources": sources, "utf8_bytes": {col.column: nbytes},
-         "stop_reason": stop_reason, "shards_read": len(sources), "member": member},
+         "stop_reason": stop_reason, "shards_read": len(sources),
+         "member": member, "members": members},
     )
     print(f"==> wrote {table.num_rows} lines ~{nbytes} B -> {dest}", file=sys.stderr)
     return dest
@@ -1036,13 +1110,17 @@ def ensure_parquet(binary: Path, col: Column) -> Path:
     if path.exists():
         return path
     if col.kind == "tpch":
-        # Generates *all* TPC-H tables (one file each) into the sf dir; the Rust
-        # side is idempotent so repeated calls for sibling columns are no-ops.
+        # ONE table, not all eight. Corpus columns sit on tables that need very different scale
+        # factors -- c_address reaches 1 GB only at sf263, lineitem columns at sf15 -- so
+        # generating the whole schema at the highest factor would spend hours on a 1.6-billion-row
+        # lineitem nobody reads. The Rust side is per-file idempotent, so sibling columns of the
+        # same table at the same factor are no-ops.
         out_dir = col.tpch_dir()
         out_dir.mkdir(parents=True, exist_ok=True)
-        print(f"==> generating TPC-H sf={col.scale_factor} tables", file=sys.stderr)
+        print(f"==> generating TPC-H sf={col.scale_factor} table {col.table}", file=sys.stderr)
         subprocess.run(
-            [str(binary), "gen-tpch", "--sf", str(col.scale_factor), "--out-dir", str(out_dir)],
+            [str(binary), "gen-tpch", "--sf", str(col.scale_factor),
+             "--out-dir", str(out_dir), "--tables", str(col.table)],
             cwd=REPO_ROOT,
             check=True,
         )
@@ -1154,7 +1232,139 @@ def run_column(binary: Path, col: Column, args) -> list[dict]:
             raise OSError(f"validated source-cache manifest disappeared for {col.dataset_id}") from error
         for row in rows:
             row["source_cache"] = source_cache
+    if args.gpu_decode and args.codec == "onpair":
+        for row in rows:
+            files = sorted(str(path) for path in Path(row["out_dir"]).glob("*.vortex"))
+            if len(files) != row["n_files"]:
+                raise OSError(
+                    f"{col.dataset_id}/{col.column}: expected {row['n_files']} Vortex files in "
+                    f"{row['out_dir']}, found {len(files)}"
+                )
+            # The Rust path reopens these files before GPU timing. Record that boundary in every
+            # row so a future refactor cannot silently compare pre-write boost input with reopened
+            # locked input while both summaries retain the same shape.
+            row["gpu_input"] = {"mode": "written_vortex", "files": files}
     return rows
+
+
+def rerun_gpu_from_vortex(
+    binary: Path, base_summary: Path, args, columns: list[Column]
+) -> list[dict]:
+    """Re-time GPU decode from an earlier run's exact Vortex files."""
+    try:
+        rows = json.loads(base_summary.read_text())
+    except (OSError, json.JSONDecodeError) as error:
+        raise OSError(f"cannot read reuse summary {base_summary}: {error}") from error
+    if not isinstance(rows, list) or not rows:
+        raise ValueError(f"reuse summary {base_summary} is not a non-empty cell list")
+
+    expected = {
+        (col.dataset_id, col.column, bits, int(chunk_mb * MB), threshold, col.training_seed)
+        for col in columns
+        for bits in args.bits
+        for chunk_mb in args.chunk_mb
+        for threshold in args.threshold
+    }
+    observed = {
+        (
+            row.get("dataset_id"),
+            row.get("column"),
+            row.get("bits"),
+            row.get("chunk_bytes"),
+            row.get("threshold"),
+            row.get("training_seed", 0),
+        )
+        for row in rows
+    }
+    if (
+        len(rows) != len(expected)
+        or observed != expected
+        or any(row.get("codec", "onpair") != "onpair" for row in rows)
+        or any((row.get("gpu_input") or {}).get("mode") != "written_vortex" for row in rows)
+    ):
+        # A stale summary can point at valid Vortex files for a different column/cell. Reusing it
+        # would produce internally valid GPU timings under the requested label, so identity must
+        # be exact before any kernel launches occur.
+        raise ValueError(
+            f"reuse summary cell identity differs: expected {expected!r}, observed {observed!r}"
+        )
+
+    root = OUT_ROOT.resolve()
+    rerun = []
+    for base_row in rows:
+        row = dict(base_row)
+        cell_dir = Path(row["out_dir"]).resolve()
+        try:
+            cell_dir.relative_to(root)
+        except ValueError as error:
+            raise ValueError(f"reuse cell is outside {root}: {cell_dir}") from error
+        named_files = sorted(
+            Path(path).resolve() for path in (row.get("gpu_input") or {}).get("files", [])
+        )
+        current_files = sorted(path.resolve() for path in cell_dir.glob("*.vortex"))
+        if (
+            len(named_files) != row.get("n_files")
+            or named_files != current_files
+            or any(not path.is_file() for path in named_files)
+        ):
+            # Passing the directory lets the Rust CLI discover every part. Require that discovery
+            # to equal the boost summary's inventory first; otherwise a stale extra part can join
+            # only the locked pass while both passes still point at the same directory.
+            raise ValueError(
+                f"reuse Vortex inventory changed for {cell_dir}: "
+                f"summary={named_files!r}, current={current_files!r}, "
+                f"n_files={row.get('n_files')!r}"
+            )
+        command = [
+            str(binary),
+            "gpu-decode-vortex",
+            "--vortex", str(cell_dir),
+            "--column", row["column"],
+            "--gpu-iters", str(args.gpu_iters),
+            *(["--gpu-validate"] if args.gpu_validate else []),
+            *(["--gpu-kernels", args.gpu_kernels] if args.gpu_kernels else []),
+        ]
+        proc = subprocess.run(command, cwd=REPO_ROOT, capture_output=True, text=True)
+        if proc.returncode != 0:
+            tail = "\n".join(proc.stderr.strip().splitlines()[-12:])
+            raise RuntimeError(f"GPU reuse failed for {cell_dir}:\n{tail}")
+        try:
+            decoded = json.loads(proc.stdout)
+        except json.JSONDecodeError as error:
+            raise ValueError(f"GPU reuse returned invalid JSON for {cell_dir}") from error
+
+        decoded_files = sorted(Path(path).resolve() for path in decoded.get("files", []))
+
+        checks = {
+            "column": (decoded.get("column"), row["column"]),
+            "rows": (decoded.get("rows"), row["rows"]),
+            "in_memory_bytes": (decoded.get("in_memory_bytes"), row["in_memory_bytes"]),
+            "dict_bytes": (decoded.get("dict_bytes"), row["dict_bytes"]),
+            "files": (decoded_files, named_files),
+            "chunks": ((decoded.get("gpu") or {}).get("chunks"), row["n_chunks"]),
+            "decoded_bytes": (
+                (decoded.get("gpu") or {}).get("decoded_bytes"), row["sample_bytes"]
+            ),
+        }
+        mismatches = {name: pair for name, pair in checks.items() if pair[0] != pair[1]}
+        gpu = decoded.get("gpu") or {}
+        if mismatches or not gpu.get("validated") or gpu.get("verified") is not True:
+            # The locked pass exists to change only the clock. If reading the stored input changes
+            # any cell cardinality/size or fails byte validation, accepting its timing would break
+            # the matched comparison even though both JSON files look complete.
+            raise ValueError(
+                f"GPU reuse did not reproduce the stored cell {cell_dir}: "
+                f"mismatches={mismatches}, validated={gpu.get('validated')!r}, "
+                f"verified={gpu.get('verified')!r}"
+            )
+        row["gpu"] = gpu
+        row["gpu_input"] = {
+            "mode": "existing_vortex",
+            "source_summary": str(base_summary),
+            "files": decoded["files"],
+        }
+        rerun.append(row)
+    return rerun
 
 
 def fmt_bytes(n: int) -> str:
@@ -1306,6 +1516,13 @@ def main() -> int:
                    help="copy GPU output back and compare every applicable kernel against CPU bytes")
     p.add_argument("--gpu-kernels", default=None,
                    help="exact comma-separated kernel allowlist; use tpt-matched for the ten-way control")
+    reuse_default = os.environ.get("ONPAIR_REUSE_VORTEX_SUMMARY") or None
+    p.add_argument(
+        "--reuse-vortex-summary",
+        type=Path,
+        default=Path(reuse_default) if reuse_default else None,
+        help="re-time GPU decode from the exact Vortex files named by this prior summary",
+    )
     p.add_argument("--jobs", type=int, default=0,
                    help="columns to run concurrently (default: all available CPU cores)")
     p.add_argument("--codec", choices=["onpair", "fsst12"], default="onpair",
@@ -1344,6 +1561,14 @@ def main() -> int:
     if args.gpu_validate and not args.gpu_decode:
         print("--gpu-validate requires --gpu-decode", file=sys.stderr)
         return 1
+    if args.reuse_vortex_summary and (
+        not args.gpu_decode or not args.gpu_validate or args.codec != "onpair"
+    ):
+        print(
+            "--reuse-vortex-summary requires --codec onpair --gpu-decode --gpu-validate",
+            file=sys.stderr,
+        )
+        return 1
 
     if args.list:
         for c in COLUMNS:
@@ -1373,49 +1598,55 @@ def main() -> int:
     binary = build_binary(release=not args.dev, cuda=args.gpu_decode)
     OUT_ROOT.mkdir(parents=True, exist_ok=True)
 
-    results: list[dict] = []
-    # Ensure each source parquet exists up front (sequentially) so concurrent
-    # columns never race on generation, then keep only columns that are present
-    # and string-typed.
-    selected: list[Column] = []
-    unavailable: list[str] = []
-    for col in columns:
-        try:
-            parquet = ensure_parquet(binary, col)
-        except FileNotFoundError as e:
-            # External datasets (ClickBench/FineWeb/book-reviews) aren't
-            # auto-downloaded; skip any whose source parquet is absent so the
-            # run still completes on whatever data is present (TPC-H always
-            # generates locally).
-            print(f"-- skip {col.dataset_id}/{col.column}: {e}", file=sys.stderr)
-            unavailable.append(f"{col.dataset_id}/{col.column}: {e}")
-            continue
-        if column_is_string(parquet, col.column):
-            selected.append(col)
-        else:
-            print(f"-- skip {col.dataset_id}/{col.column} (missing or non-string)",
-                  file=sys.stderr)
-            unavailable.append(f"{col.dataset_id}/{col.column}: missing or non-string")
-    if unavailable and not args.allow_missing_inputs:
-        print("requested benchmark inputs are unavailable; refusing a partial campaign:",
-              file=sys.stderr)
-        for item in unavailable:
-            print(f"   - {item}", file=sys.stderr)
-        print("pass --allow-missing-inputs to opt into a partial campaign", file=sys.stderr)
-        return 1
-    print(f"==> {len(selected)}/{len(columns)} columns selected", file=sys.stderr)
-
-    jobs = args.jobs if args.jobs > 0 else available_cores()
-    print(f"==> running with {jobs} column worker(s)", file=sys.stderr)
-
-    if jobs > 1:
-        with ThreadPoolExecutor(max_workers=jobs) as pool:
-            futs = {pool.submit(run_column, binary, c, args): c for c in selected}
-            for fut in as_completed(futs):
-                results.extend(fut.result())
+    if args.reuse_vortex_summary:
+        # Do not even open the source parquet on the second clock pass. The base summary points at
+        # the files timed by the first pass; rebuilding from the same seed is reproducible in
+        # intent, but only reading those files makes byte-identical input true by construction.
+        results = rerun_gpu_from_vortex(binary, args.reuse_vortex_summary, args, columns)
     else:
-        for col in selected:
-            results.extend(run_column(binary, col, args))
+        results: list[dict] = []
+        # Ensure each source parquet exists up front (sequentially) so concurrent
+        # columns never race on generation, then keep only columns that are present
+        # and string-typed.
+        selected: list[Column] = []
+        unavailable: list[str] = []
+        for col in columns:
+            try:
+                parquet = ensure_parquet(binary, col)
+            except FileNotFoundError as e:
+                # External datasets (ClickBench/FineWeb/book-reviews) aren't
+                # auto-downloaded; skip any whose source parquet is absent so the
+                # run still completes on whatever data is present (TPC-H always
+                # generates locally).
+                print(f"-- skip {col.dataset_id}/{col.column}: {e}", file=sys.stderr)
+                unavailable.append(f"{col.dataset_id}/{col.column}: {e}")
+                continue
+            if column_is_string(parquet, col.column):
+                selected.append(col)
+            else:
+                print(f"-- skip {col.dataset_id}/{col.column} (missing or non-string)",
+                      file=sys.stderr)
+                unavailable.append(f"{col.dataset_id}/{col.column}: missing or non-string")
+        if unavailable and not args.allow_missing_inputs:
+            print("requested benchmark inputs are unavailable; refusing a partial campaign:",
+                  file=sys.stderr)
+            for item in unavailable:
+                print(f"   - {item}", file=sys.stderr)
+            print("pass --allow-missing-inputs to opt into a partial campaign", file=sys.stderr)
+            return 1
+        print(f"==> {len(selected)}/{len(columns)} columns selected", file=sys.stderr)
+
+        jobs = args.jobs if args.jobs > 0 else available_cores()
+        print(f"==> running with {jobs} column worker(s)", file=sys.stderr)
+
+        if jobs > 1:
+            with ThreadPoolExecutor(max_workers=jobs) as pool:
+                futs = {pool.submit(run_column, binary, c, args): c for c in selected}
+                for fut in as_completed(futs):
+                    results.extend(fut.result())
+        else:
+            for col in selected:
+                results.extend(run_column(binary, col, args))
 
     results.sort(key=lambda r: (r["dataset_id"], r["column"], r["bits"],
                                 r["threshold"], r["chunk_bytes"]))

@@ -6,8 +6,8 @@ Adding a new column is a one-line append to ``COLUMNS``.
 
 Source kinds:
 
-* ``tpch``    — generated locally via the Rust ``gen-tpch`` subcommand (all
-                tables, one parquet file each).
+* ``tpch``    — generated locally via the Rust ``gen-tpch`` subcommand (requested
+                table only, one parquet file).
 * ``parquet`` — an external parquet. Give a download ``url`` (fetched into a
                 repo-relative cache on first use) and/or ``local`` paths to
                 reuse if already present. Nothing is hard-required: a column
@@ -25,6 +25,7 @@ location with no absolute paths required.
 
 from __future__ import annotations
 
+import math
 import os
 from dataclasses import dataclass, field
 from datetime import date, timedelta
@@ -212,13 +213,24 @@ class Column:
     # loghub: the log file's name inside the archive. Explicit rather than derived from the URL,
     # because the two do not correspond -- HDFS_v1.zip contains HDFS.log, not HDFS_v1.log.
     member: str | None = None
+    # loghub: an fnmatch pattern selecting MANY members, concatenated in archive order (tar, a
+    # forward-only stream) or sorted order (zip) until the cap. Mutually exclusive with `member`.
+    #
+    # Two Loghub systems are not shipped as a single log file: Spark is 3,852 per-container logs
+    # across 194 applications, Android_v2 is 78 logcat captures. Concatenating those is
+    # PARTITIONING, not the re-extraction duplication that disqualified Public BI -- verified
+    # 2026-08-20 by line-set intersection over Android's four largest members, which share 0.0%
+    # of their lines. Public BI's numbered files were the same rows in a different order (97.7%
+    # mutual containment), so concatenating them doubled every value's frequency and inflated
+    # exactly the ratios this corpus exists to measure.
+    members: str | None = None
 
     def tpch_dir(self) -> Path:
-        return SRC_DIR / f"tpch_sf{int(self.scale_factor)}"
+        return SRC_DIR / f"tpch_sf{_scale_factor_tag(self.scale_factor)}"
 
     def tpcds_dir(self) -> Path:
         # Matches the path TpcDsBenchmark/generate_tpcds use.
-        return DATA_DIR / "tpcds" / f"{int(self.scale_factor)}"
+        return DATA_DIR / "tpcds" / _scale_factor_tag(self.scale_factor)
 
     def cache_path(self) -> Path:
         return SRC_DIR / self.dataset_id / (self.cache or f"{self.column}.parquet")
@@ -238,6 +250,16 @@ class Column:
         if self.kind == "synthetic":
             return self.cache_path()
         raise ValueError(f"unknown source kind {self.kind!r}")
+
+
+def _scale_factor_tag(scale_factor: float) -> str:
+    """Round-trip-safe path component for a TPC scale factor."""
+    if not math.isfinite(scale_factor) or scale_factor <= 0:
+        raise ValueError(f"scale factor must be finite and positive, got {scale_factor!r}")
+    text = str(scale_factor)
+    # Keep the established `tpch_sf10` paths, but never truncate a fractional factor: int(26.3)
+    # used to alias sf26 and could silently reuse a parquet generated for the wrong row count.
+    return text[:-2] if text.endswith(".0") else text
 
 
 def _parquet_cols(dataset_id, columns, *, url, cache):
@@ -276,14 +298,16 @@ def _pbi_cols(dataset_id, columns, *, workbook, tables, cache, cap_bytes=0):
     ]
 
 
-def _loghub_cols(dataset_id, column, *, archive, member, cap_bytes=0):
-    """One Loghub log file as a single string column, one log line per value. `member` is the
-    `.log` inside the archive and is named explicitly because it does not follow the archive
-    name (HDFS_v1.zip contains HDFS.log)."""
+def _loghub_cols(dataset_id, column, *, archive, member=None, members=None, cap_bytes=0):
+    """A Loghub system's logs as a single string column, one log line per value.
+
+    `member` names one `.log` inside the archive -- explicitly, because it does not follow the
+    archive name (HDFS_v1.zip contains HDFS.log). `members` is an fnmatch pattern for the systems
+    shipped as many files (Spark, Android), concatenated until the cap. Exactly one of the two."""
     return [Column(dataset_id=dataset_id, column=column, kind="loghub",
                    url=f"{LOGHUB_BASE}/{archive}?download=1",
                    urls=(f"{LOGHUB_BASE}/{archive}?download=1",),
-                   member=member, cache=f"{dataset_id}.parquet",
+                   member=member, members=members, cache=f"{dataset_id}.parquet",
                    cap_bytes=cap_bytes, local=_local(dataset_id))]
 
 
@@ -338,11 +362,42 @@ _DBTEXT_COLS = [
     "c_name", "l_comment", "ps_comment",
 ]
 
+# Per-column scale factors for the generated arm of the corpus, measured 2026-08-20 at sf1 and
+# confirmed at sf30. Every corpus column must supply the 1 GB the methodology samples, and TPC-H's
+# string columns differ by ~40x in payload per scale factor, so one shared factor cannot do it:
+#
+#   column           payload/SF   SF for ~1 GB   what it contributes
+#   l_comment          159 MB          15        pseudo-text (FSST dbtext lineage)
+#   l_shipinstruct      72 MB          15        enum, 4 values (scale-invariant)
+#   ps_comment          74 MB          15        pseudo-text at 124 ch -- the length endpoint
+#   o_clerk           22.5 MB          45        templated identifier, capacity-bound
+#   c_address          3.8 MB         263        random characters; OnPair EXPANDS it (0.95x)
+#
+# lineitem and partsupp share sf15, so three generations cover five columns. Generating all eight
+# tables at sf263 would mean a 1.6-billion-row lineitem that nothing reads -- hence the per-table
+# selection in `gen-tpch`.
+_TPCH_CORPUS_SF: dict[float, dict[str, list[str]]] = {
+    15.0: {"lineitem": ["l_comment", "l_shipinstruct"], "partsupp": ["ps_comment"]},
+    45.0: {"orders": ["o_clerk"]},
+    263.0: {"customer": ["c_address"]},
+}
+
 # The benchmark registry. Append a one-line `Column(...)` to grow the suite.
 COLUMNS: list[Column] = [
     *(
         Column(dataset_id="tpch-sf10", column=c, kind="tpch", scale_factor=10.0, table=t)
         for t, cols in _TPCH_STR_COLS.items()
+        for c in cols
+    ),
+    # The generated corpus arm, each at the factor its column needs. Kept ALONGSIDE the sf10 set
+    # rather than replacing it: sf10 entries carry every committed measurement (including the
+    # l_comment cells the 2026-08-19 locked legs hold), and changing their identity would silently
+    # orphan that data.
+    *(
+        Column(dataset_id=f"tpch-sf{_scale_factor_tag(sf)}", column=c, kind="tpch",
+               scale_factor=sf, table=t)
+        for sf, tables in _TPCH_CORPUS_SF.items()
+        for t, cols in tables.items()
         for c in cols
     ),
     *(
@@ -400,14 +455,29 @@ COLUMNS: list[Column] = [
     *_pbi_cols("publicbi-realestate1", ["Transaction ID"],
                workbook="RealEstate1", tables=["RealEstate1_2"],
                cache="pbi_realestate1.parquet", cap_bytes=1_150_000_000),
-    # Loghub: three different logging systems, deliberately not four -- Spark (55%) sits on
-    # l_comment's rung and earned no place. Windows is the OnPair-12 low anchor at 38% / 21%.
+    # Loghub: five logging systems, spanning the short-token axis from 38% to 89% at OnPair-12.
+    # Windows is the low anchor (38% / 21%).
     *_loghub_cols("loghub-windows", "line", archive="Windows.tar.gz",
                   member="Windows.log", cap_bytes=1_150_000_000),
     *_loghub_cols("loghub-thunderbird", "line", archive="Thunderbird.tar.gz",
                   member="Thunderbird.log", cap_bytes=1_150_000_000),
     *_loghub_cols("loghub-hdfs", "line", archive="HDFS_v1.zip",
                   member="HDFS.log", cap_bytes=1_150_000_000),
+    # Spark: 55% / 44%, measured 2026-08-20 on a 64 MiB sample accumulated across containers.
+    # It takes the rung `l_comment` used to hold, and takes it with REAL data -- l_comment sits
+    # at 57% because dbgen draws from a 3,775-word list with 1,060x reuse per word, against
+    # 66,898 words at 60x reuse for real relational text. Spark was previously excluded for
+    # "sitting on l_comment's rung", which was the wrong reason: that rung is a grammar artifact.
+    # 3,852 container logs over 194 applications, 2.94 GB uncompressed, so `members`.
+    *_loghub_cols("loghub-spark", "line", archive="Spark.tar.gz",
+                  members="*.log", cap_bytes=1_150_000_000),
+    # Android: 89% / 46%, the largest preset gap of any real column, and a domain nothing else in
+    # the corpus covers (mobile logcat). 78 members, 3.62 GB uncompressed. The `duplicate_type1/`
+    # directory names refer to duplicate BUG REPORTS -- it is a duplicate-detection dataset -- not
+    # duplicated log content: the four largest members share 0.0% of their lines (measured).
+    # Fetched whole (445 MB) because zip keeps its directory at the end and cannot be streamed.
+    *_loghub_cols("loghub-android", "line", archive="Android_v2.zip",
+                  members="*.log", cap_bytes=1_150_000_000),
     # CodeParrot: source code as its own domain. Uses the existing jsonl loader.
     *_jsonl_cols("codeparrot", {"content": "content"},
                  urls=CODEPARROT_URLS, cache="codeparrot_clean.parquet",

@@ -4,7 +4,7 @@
 //! OnPair chunked-array compression benchmark CLI.
 //!
 //! Two subcommands:
-//! * `gen-tpch` — generate every TPC-H table parquet for a scale factor.
+//! * `gen-tpch` — generate selected (or every) TPC-H table parquet for a scale factor.
 //! * `run` — sample a column, OnPair-compress it across a `bits × chunk ×
 //!   threshold` matrix into Vortex files, verify the string round-trip, and
 //!   print the per-cell results as JSON to stdout.
@@ -23,7 +23,7 @@ use anyhow::Result;
 use clap::Parser;
 use clap::Subcommand;
 use vortex_bench::onpair_bench::GpuBenchmarkConfig;
-use vortex_bench::onpair_bench::ensure_tpch_all_parquet;
+use vortex_bench::onpair_bench::ensure_tpch_parquet;
 use vortex_bench::onpair_bench::run_column;
 use vortex_bench::onpair_bench::run_vortex_gpu_decode;
 use vortex_bench::setup_logging_and_tracing;
@@ -44,7 +44,7 @@ struct Args {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Generate every TPC-H table parquet for a scale factor (idempotent).
+    /// Generate TPC-H table parquet for a scale factor (idempotent).
     GenTpch {
         /// Scale factor (e.g. 10).
         #[arg(long, default_value_t = 10.0)]
@@ -52,6 +52,13 @@ enum Command {
         /// Output directory; tables land in `<out-dir>/parquet/<table>_0.parquet`.
         #[arg(long)]
         out_dir: PathBuf,
+        /// Tables to generate (repeatable, or comma-separated). Omit for all eight.
+        ///
+        /// The corpus draws single columns from tables needing very different scale factors --
+        /// `c_address` reaches 1 GB only at sf263, `lineitem` columns at sf15 -- so generating
+        /// all eight at the highest factor would spend hours on tables nobody reads.
+        #[arg(long, value_delimiter = ',')]
+        tables: Vec<String>,
     },
     /// Generate every TPC-DS table parquet for a scale factor via DuckDB
     /// `dsdgen` (idempotent). Requires the `duckdb` CLI on PATH.
@@ -165,9 +172,21 @@ async fn main() -> Result<()> {
     setup_logging_and_tracing(args.verbose, false)?;
 
     match args.command {
-        Command::GenTpch { sf, out_dir } => {
-            ensure_tpch_all_parquet(sf, &out_dir).await?;
-            eprintln!("TPC-H (sf={sf}) ready under {}/parquet", out_dir.display());
+        Command::GenTpch {
+            sf,
+            out_dir,
+            tables,
+        } => {
+            ensure_tpch_parquet(sf, &out_dir, &tables).await?;
+            let what = if tables.is_empty() {
+                "all tables".to_string()
+            } else {
+                tables.join(",")
+            };
+            eprintln!(
+                "TPC-H (sf={sf}, {what}) ready under {}/parquet",
+                out_dir.display()
+            );
         }
         Command::GenTpcds { sf, out_dir } => {
             vortex_bench::tpcds::duckdb::generate_tpcds(out_dir.clone(), format!("{sf}"))?;

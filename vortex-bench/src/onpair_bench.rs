@@ -17,7 +17,7 @@
 //! The matrix swept by [`run_column`] is `bits × chunk_bytes × threshold`.
 //! New datasets/columns are added by the caller (the Python orchestrator)
 //! simply by pointing [`run_column`] at a different parquet file + column;
-//! TPC-H generation is provided by [`ensure_tpch_all_parquet`].
+//! TPC-H generation is provided by [`ensure_tpch_parquet`].
 
 use std::hash::DefaultHasher;
 use std::hash::Hash;
@@ -1120,7 +1120,14 @@ async fn run_cell(
     let (verified, onpair_only) = verify_roundtrip(&files, column, &sample.array).await?;
     let decode_secs = t1.elapsed().as_secs_f64();
     let gpu = match gpu_config {
-        Some(config) => Some(run_gpu_kernel_bench(DecodeSource::OnPair(&onpairs), config).await?),
+        Some(config) => {
+            // Time the representation read from the persisted Vortex files. The campaign's locked
+            // pass reopens these same files; timing boost from the pre-write arrays instead would
+            // make the two policies differ at the serialization boundary while calling them a
+            // byte-identical matched comparison.
+            let stored_onpairs = read_onpair_chunks(&files, column).await?;
+            Some(run_gpu_kernel_bench(DecodeSource::OnPair(&stored_onpairs), config).await?)
+        }
         None => None,
     };
 
@@ -8159,25 +8166,73 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
-/// Generate every TPC-H table at `sf` as a single Parquet file per table under
+/// Generate TPC-H tables at `sf` as a single Parquet file per table under
 /// `out_dir/parquet/<table>_0.parquet` (idempotent — existing files are kept).
 ///
-/// Delegates to the shared [`generate_tpch_tables`](crate::tpch::tpchgen::generate_tpch_tables)
-/// generator, which writes one file per table at the default (unbounded) file size.
-pub async fn ensure_tpch_all_parquet(sf: f64, out_dir: &Path) -> Result<()> {
+/// `tables` empty means all eight. Delegates to the shared
+/// [`generate_tpch_tables`](crate::tpch::tpchgen::generate_tpch_tables) generator, which writes
+/// one file per table at the default (unbounded) file size.
+///
+/// THE SKIP MARKER IS PER-REQUEST, not `lineitem`. The old fast path returned early whenever
+/// `lineitem_0.parquet` existed, which is correct only when every call wants the same eight
+/// tables. Once a caller can ask for `customer` alone, a directory holding just `lineitem` would
+/// satisfy that probe and the requested table would never be generated -- the parquet would then
+/// be missing at read time, hours later, on a GPU box.
+pub async fn ensure_tpch_parquet(sf: f64, out_dir: &Path, tables: &[String]) -> Result<()> {
     use crate::Format;
     use crate::tpch::tpchgen::TpchGenOptions;
     use crate::tpch::tpchgen::generate_tpch_tables;
 
-    // `generate_tpch_tables` is itself per-file idempotent; the lineitem marker
-    // lets us skip the (cheap) probe entirely once a full set exists.
-    if out_dir.join("parquet").join("lineitem_0.parquet").exists() {
+    const ALL: [&str; 8] = [
+        "nation", "region", "part", "supplier", "customer", "partsupp", "orders", "lineitem",
+    ];
+    let want: Vec<String> = if tables.is_empty() {
+        ALL.iter().map(|s| s.to_string()).collect()
+    } else {
+        tables.to_vec()
+    };
+    for table in &want {
+        anyhow::ensure!(
+            ALL.contains(&table.as_str()),
+            "unknown TPC-H table {table:?}; known tables are {ALL:?}"
+        );
+    }
+    let parquet_dir = out_dir.join("parquet");
+    let missing: Vec<String> = want
+        .iter()
+        .filter(|t| {
+            let path = parquet_dir.join(format!("{t}_0.parquet"));
+            !matches!(std::fs::metadata(path), Ok(metadata) if metadata.is_file() && metadata.len() > 0)
+        })
+        .cloned()
+        .collect();
+    if missing.is_empty() {
         return Ok(());
     }
     std::fs::create_dir_all(out_dir)?;
-    let options = TpchGenOptions::new(format!("{sf}"), out_dir).with_format(Format::Parquet);
+    let options = TpchGenOptions::new(format!("{sf}"), out_dir)
+        .with_format(Format::Parquet)
+        .with_tables(missing);
     generate_tpch_tables(options).await?;
+    for table in &want {
+        let path = parquet_dir.join(format!("{table}_0.parquet"));
+        // The generator runs table writers in spawned tasks. Checking the requested artifacts here
+        // prevents a dropped/panicked task from returning success and surfacing as a missing input
+        // only after the expensive GPU setup has begun.
+        let metadata = std::fs::metadata(&path)
+            .with_context(|| format!("TPC-H generator did not produce {}", path.display()))?;
+        anyhow::ensure!(
+            metadata.is_file() && metadata.len() > 0,
+            "TPC-H generator produced an empty/non-file artifact at {}",
+            path.display()
+        );
+    }
     Ok(())
+}
+
+/// Back-compatible shim: every TPC-H table at `sf`.
+pub async fn ensure_tpch_all_parquet(sf: f64, out_dir: &Path) -> Result<()> {
+    ensure_tpch_parquet(sf, out_dir, &[]).await
 }
 
 #[cfg(test)]
@@ -8394,6 +8449,73 @@ mod tests {
         assert!(
             build_packed_split8_dictionary(&[5], &padded_with_untrained, &lens_with_untrained)
                 .is_err()
+        );
+        Ok(())
+    }
+
+    /// The campaign's locked pass re-times GPU decode from the boost pass's `.vortex` files and
+    /// refuses a cell unless `rows`, `in_memory_bytes` and `dict_bytes` reproduce the boost
+    /// summary exactly. Boost records those three from the PRE-WRITE arrays, while the locked pass
+    /// recomputes them from arrays reopened through `scan()`, so their equality is a property of
+    /// the write/read round-trip that neither side enforces. If it does not hold, every locked
+    /// cell fails after the boost pass has already paid the download, the materialization and the
+    /// timing -- the most expensive possible place to learn it.
+    #[tokio::test]
+    async fn stored_and_prewrite_onpair_report_identical_cell_identity() -> Result<()> {
+        let dir = std::env::temp_dir().join("onpair_roundtrip_cell_identity");
+        drop(std::fs::remove_dir_all(&dir));
+        std::fs::create_dir_all(&dir)?;
+        let path = dir.join("part_0000.vortex");
+
+        // Repetition with real variety, so the dictionary is non-trivial and the children are
+        // worth compressing: a uniform array can round-trip byte-stable for reasons that would
+        // not generalize to a corpus column.
+        let values: Vec<String> = (0..20_000)
+            .map(|i| format!("session-{}-{}", i % 977, "payload".repeat(1 + (i % 5))))
+            .collect();
+        let array = VarBinViewArray::from_iter_str(values.iter().map(String::as_str)).into_array();
+
+        let op = onpair_compress_array_default(&array, config_with_bits(12))?;
+        let mut ctx = SESSION.create_execution_ctx();
+        let pre_write = compress_onpair_children(&op, &mut ctx)?;
+
+        let pre_rows = pre_write.len() as u64;
+        let pre_in_memory = pre_write.clone().into_array().nbytes();
+        let pre_dict = pre_write.dict_bytes().len() as u64;
+
+        // Mirrors the production write in `run_cell` exactly.
+        let len = pre_write.len();
+        let chunk = StructArray::new(
+            FieldNames::from(["line"]),
+            vec![pre_write.into_array()],
+            len,
+            Validity::NonNullable,
+        )
+        .into_array();
+        write_group(vec![chunk], &path).await?;
+
+        let stored = read_onpair_chunks(std::slice::from_ref(&path), "line").await?;
+        let stored_rows: u64 = stored.iter().map(|a| a.len() as u64).sum();
+        let stored_in_memory: u64 = stored
+            .iter()
+            .map(|a| a.clone().into_array().nbytes())
+            .sum();
+        let stored_dict: u64 = stored.iter().map(|a| a.dict_bytes().len() as u64).sum();
+
+        drop(std::fs::remove_dir_all(&dir));
+
+        assert_eq!(
+            stored_rows, pre_rows,
+            "row count changed across the round-trip"
+        );
+        assert_eq!(
+            stored_dict, pre_dict,
+            "dict_bytes changed across the round-trip"
+        );
+        assert_eq!(
+            stored_in_memory, pre_in_memory,
+            "in_memory_bytes changed across the round-trip: the locked pass compares the reopened \
+             figure against the boost summary's pre-write figure and would reject every cell"
         );
         Ok(())
     }
