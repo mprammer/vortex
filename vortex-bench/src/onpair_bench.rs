@@ -1577,7 +1577,6 @@ const GPU_KERNELS: &[KernelVariant] = &[
         stage_bytes: None,
         role: KernelRole::Production,
     },
-
     // BEGIN generated packed grid (gen_packed_grid.py) — do not edit by hand
     KernelVariant {
         name: "onpair_dg_k1_t64_b1",
@@ -6239,14 +6238,12 @@ async fn run_gpu_kernel_bench(
         "the ten-variant TPT comparison requires --gpu-validate"
     );
     if std::env::var("ONPAIR_L2_PERSIST").is_ok()
-        && variants
-            .iter()
-            .any(|variant| {
-                matches!(
-                    variant.layout,
-                    KernelLayout::PackedSplit8 | KernelLayout::PackedWide16
-                )
-            })
+        && variants.iter().any(|variant| {
+            matches!(
+                variant.layout,
+                KernelLayout::PackedSplit8 | KernelLayout::PackedWide16
+            )
+        })
     {
         anyhow::bail!(
             "ONPAIR_L2_PERSIST has no fair packed-ABI treatment; disable it for this comparison"
@@ -6380,9 +6377,7 @@ async fn run_gpu_kernel_bench(
         // shipped kernel. It is consumed only via its own named row; letting it into the
         // generic `best` would leak an experimental baseline into the paper's shipped cells.
         .filter(|r| {
-            r.applicable
-                && r.role == "production"
-                && (!config.validate || r.verified == Some(true))
+            r.applicable && r.role == "production" && (!config.validate || r.verified == Some(true))
         })
         .min_by(|a, b| a.decode_ms.total_cmp(&b.decode_ms));
     // Restricting `best` to production kernels means an explicit allowlist of experimental
@@ -6559,9 +6554,7 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
         // with "auto kernel ... was not timed".
         GPU_KERNELS
             .iter()
-            .filter(|v| {
-                matches!(v.role, KernelRole::Production) || v.name.starts_with("onpair_d")
-            })
+            .filter(|v| matches!(v.role, KernelRole::Production) || v.name.starts_with("onpair_d"))
             .map(|variant| variant.name)
             .collect()
     } else {
@@ -7551,9 +7544,15 @@ async fn stage_gpu_chunk(
     let chunk_offsets_1024 = chunk_offsets(&codes_u16, &lens_table, 1024, decoded_bytes);
     let widest = |offs: &[u64]| offs.windows(2).map(|w| w[1] - w[0]).max().unwrap_or(0);
     let max_batch_bytes: Vec<(usize, u64)> = [
-        (32, &chunk_offsets_32), (64, &chunk_offsets_64), (96, &chunk_offsets_96),
-        (128, &chunk_offsets_128), (160, &chunk_offsets_160), (192, &chunk_offsets_192),
-        (224, &chunk_offsets_224), (256, &chunk_offsets_256), (512, &chunk_offsets_512),
+        (32, &chunk_offsets_32),
+        (64, &chunk_offsets_64),
+        (96, &chunk_offsets_96),
+        (128, &chunk_offsets_128),
+        (160, &chunk_offsets_160),
+        (192, &chunk_offsets_192),
+        (224, &chunk_offsets_224),
+        (256, &chunk_offsets_256),
+        (512, &chunk_offsets_512),
         (1024, &chunk_offsets_1024),
     ]
     .iter()
@@ -7848,9 +7847,9 @@ fn apply_carveout_policy(function: &cudarc::driver::CudaFunction) -> Result<Opti
         "" | "default" => -1,
         "maxl1" => 0,
         "maxshared" => 100,
-        other => other
-            .parse()
-            .with_context(|| format!("ONPAIR_CARVEOUT must be maxl1|maxshared|default|0-100, got {other:?}"))?,
+        other => other.parse().with_context(|| {
+            format!("ONPAIR_CARVEOUT must be maxl1|maxshared|default|0-100, got {other:?}")
+        })?,
     };
     anyhow::ensure!(
         (-1..=100).contains(&pct),
@@ -8027,7 +8026,9 @@ fn device_max_dynamic_shared(ctx: &CudaExecutionCtx) -> usize {
     use cudarc::driver::sys;
     ctx.stream()
         .context()
-        .attribute(sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)
+        .attribute(
+            sys::CUdevice_attribute_enum::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
+        )
         .unwrap_or(0)
         .max(0) as usize
 }
@@ -9373,10 +9374,7 @@ mod tests {
 
         let stored = read_onpair_chunks(std::slice::from_ref(&path), "line").await?;
         let stored_rows: u64 = stored.iter().map(|a| a.len() as u64).sum();
-        let stored_in_memory: u64 = stored
-            .iter()
-            .map(|a| a.clone().into_array().nbytes())
-            .sum();
+        let stored_in_memory: u64 = stored.iter().map(|a| a.clone().into_array().nbytes()).sum();
         let stored_dict: u64 = stored.iter().map(|a| a.dict_bytes().len() as u64).sum();
 
         drop(std::fs::remove_dir_all(&dir));
