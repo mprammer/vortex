@@ -25,7 +25,23 @@ K_VALUES = (1, 2, 3, 4, 5, 6, 7, 8)
 # arm, so only H>=2 needs its own kernel.
 H_MAX = 4
 H_THREADS = (64, 128, 256)
-H_MIN_BLOCKS = (2, 4, 8)
+# FULL PARITY WITH THE MAIN GRID as of 2026-08-21. B=1 and B=6 were missing, and the reason to add
+# them is that the __launch_bounds__ minimum does not itself dictate a register target there: at
+# B in {2,4,8} ptxas must fit B blocks per SM, so raising H trades registers against residency by
+# construction and H's latency-covering benefit cannot be read apart from the occupancy it costs.
+#
+# DO NOT restate this as "occupancy cannot move at B=1 and B=6". An earlier version of this comment
+# did, claiming a 256-register ceiling at B=1 and a 5-block shared-memory pin at B=6; the committed
+# H=1 probe (results/resource-probe-20260818, probe_k6_t256_b{1,6}) refutes both. At B=1 shared
+# memory already caps residency at 4 blocks (3 on L40S), so the binding budget is 65536/(4*256) =
+# 64 registers per thread and the kernel measures 56 to 64 -- at the boundary, not far below it.
+# At B=6 residency is 5 blocks only on A100; it is 6 on H100 and B300 and 3 on L40S.
+#
+# So these rungs REMOVE a construction-forced confound; they do not establish that residency holds
+# as H rises. That is unmeasured, because the resource probe never defines ONPAIR_HELD_HIGH and so
+# characterizes H=1 only. Until the probe covers H=1..4 at these B values, a measured H effect here
+# is the TOTAL effect of raising H, not an occupancy-isolated one, and must be reported as such.
+H_MIN_BLOCKS = (1, 2, 4, 6, 8)
 # S (staging bytes per token) only matters where it moves blocks*shared across a QUANTIZED
 # carveout step, and in the realistic range -- mean token length is 7.8 to 11.8 B, so the
 # largest batch needs roughly 10 to 12 -- there is about one step boundary near 12/13. Three
