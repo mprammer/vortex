@@ -38,9 +38,9 @@ H_THREADS = (64, 128, 256)
 # At B=6 residency is 5 blocks only on A100; it is 6 on H100 and B300 and 3 on L40S.
 #
 # So these rungs REMOVE a construction-forced confound; they do not establish that residency holds
-# as H rises. That is unmeasured, because the resource probe never defines ONPAIR_HELD_HIGH and so
-# characterizes H=1 only. Until the probe covers H=1..4 at these B values, a measured H effect here
-# is the TOTAL effect of raising H, not an occupancy-isolated one, and must be reported as such.
+# as H rises. The suite's H-aware resource-probe recipe now covers the same H=1..min(K,4) grid, but
+# no such capture has landed yet. Until it does, a measured H effect here is the TOTAL effect of
+# raising H, not an occupancy-isolated one, and must be reported as such.
 H_MIN_BLOCKS = (1, 2, 4, 6, 8)
 # S (staging bytes per token) only matters where it moves blocks*shared across a QUANTIZED
 # carveout step, and in the realistic range -- mean token length is 7.8 to 11.8 B, so the

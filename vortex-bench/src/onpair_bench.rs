@@ -6536,9 +6536,9 @@ fn select_gpu_kernels(requested: Option<&[String]>) -> Result<Vec<KernelVariant>
         // SM clocks is what tests whether decode rate tracks the clock, and the answer needs only
         // the kernel a user would actually get. Timing the whole parameter grid at every clock
         // costs a full pass per clock (measured: 1.4 h on a B300, 2.6 h on an A100 over fifteen
-        // columns), while this is roughly 20/475 of that. The selector's choice must be present or
-        // the cell aborts with "auto kernel ... was not timed", so the filter is by role rather
-        // than by an enumerated list that would go stale.
+        // columns), while this is 20/584 of the current registry. The selector's choice must be
+        // present or the cell aborts with "auto kernel ... was not timed", so the filter is by
+        // role rather than by an enumerated list that would go stale.
         GPU_KERNELS
             .iter()
             .filter(|v| matches!(v.role, KernelRole::Production))
