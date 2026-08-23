@@ -65,8 +65,22 @@
 #ifndef ONPAIR_HELD_HIGH
 #define ONPAIR_HELD_HIGH 1u
 #endif
-#if ONPAIR_HELD_HIGH < 1u || ONPAIR_HELD_HIGH > TOKENS_PER_THREAD
-#error "ONPAIR_HELD_HIGH must be in [1, TOKENS_PER_THREAD]"
+#if ONPAIR_HELD_HIGH > TOKENS_PER_THREAD
+#error "ONPAIR_HELD_HIGH must be in [0, TOKENS_PER_THREAD]"
+#endif
+
+// H=0 IS THE NO-HOIST CONTROL, and it is the configuration this file could not previously express.
+// H=1 is the shipped decoder and ALREADY hoists one round, so every H>=1 measurement answers "does
+// MORE hoisting help" and none of them answers "does hoisting help" -- which is the question the
+// paper asks of this design decision. At H=0 both hoist loops below iterate zero times and the
+// dense drain starts at round 0, which is exactly the pre-hoist path.
+//
+// The arrays still need one slot: a zero-length array is ill-formed, and sizing them by this macro
+// keeps the loops bounded by ONPAIR_HELD_HIGH so the slot is never written or read at H=0.
+#if ONPAIR_HELD_HIGH == 0u
+#define ONPAIR_HOIST_SLOTS 1u
+#else
+#define ONPAIR_HOIST_SLOTS ONPAIR_HELD_HIGH
 #endif
 
 // K <= 8 is a HARD limit of the request encoding, not a preference. pack_high_request puts the
@@ -266,10 +280,10 @@ extern "C" __global__ ONPAIR_LAUNCH_BOUNDS void ONPAIR_KERNEL_NAME(const uint16_
 
     // Hold the first H rounds of high-plane loads now and resolve them after the low-byte
     // emit. H=1 is the shipped decoder; larger H keeps more loads live across the emit.
-    uint32_t hoist_destination[ONPAIR_HELD_HIGH];
-    uint32_t hoist_length[ONPAIR_HELD_HIGH];
-    uint2 hoist_high[ONPAIR_HELD_HIGH];
-    bool hoist_active[ONPAIR_HELD_HIGH];
+    uint32_t hoist_destination[ONPAIR_HOIST_SLOTS];
+    uint32_t hoist_length[ONPAIR_HOIST_SLOTS];
+    uint2 hoist_high[ONPAIR_HOIST_SLOTS];
+    bool hoist_active[ONPAIR_HOIST_SLOTS];
 #pragma unroll
     for (uint32_t h = 0u; h < ONPAIR_HELD_HIGH; ++h) {
         const uint32_t idx = (uint32_t)lane + h * 32u;
