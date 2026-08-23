@@ -24,6 +24,9 @@ K_VALUES = (1, 2, 3, 4, 5, 6, 7, 8)
 # K=1,2,3,5,7 and B=1,6 while the job claimed H was swept over the grid. H=1 is the baseline
 # arm, so only H>=2 needs its own kernel.
 H_MAX = 4
+# The h=0 no-hoist control is emitted only where fig:hoist reads it (see the loop below).
+H0_THREADS = (256,)
+H0_MIN_BLOCKS = (1, 4, 8)
 H_THREADS = (64, 128, 256)
 # FULL PARITY WITH THE MAIN GRID as of 2026-08-21. B=1 and B=6 were missing, and the reason to add
 # them is that the __launch_bounds__ minimum does not itself dictate a register target there: at
@@ -161,7 +164,25 @@ def main():
     for k in K_VALUES:
         for t in H_THREADS:
             for b in H_MIN_BLOCKS:
-                for h in range(2, min(k, H_MAX) + 1):
+                # h=0 IS THE NO-HOIST CONTROL. H=1 is the shipped decoder and already hoists one
+                # round, so without an h=0 arm every hoist measurement compares one amount of
+                # hoisting against another and none of them isolates the hoist itself.
+                #
+                # SCOPED TO WHAT fig:hoist READS, deliberately. That figure is pinned to
+                # loghub-windows/line at OnPair-12 on the b300, T=256, B in {1,4,8}, K=1..8 -- so
+                # 24 kernels answer it. Emitting h=0 across the whole dh grid instead would add 120
+                # and put roughly +20% on every full GRID pass forever, for coordinates no figure
+                # reads. The arm is therefore non-rectangular against h>=2 on purpose; widen
+                # H0_THREADS/H0_MIN_BLOCKS if a later question needs it.
+                #
+                # These coordinates exist in the dg family too (H_THREADS/H_MIN_BLOCKS are the same
+                # tuples as THREADS/MIN_BLOCKS), which is what makes h0-against-dg a like-for-like
+                # delta. Comparing across mismatched coordinates is how the S axis once produced a
+                # spurious -22.8%.
+                hs = list(range(2, min(k, H_MAX) + 1))
+                if t in H0_THREADS and b in H0_MIN_BLOCKS:
+                    hs = [0] + hs
+                for h in hs:
                     name = f"onpair_dh_k{k}_t{t}_b{b}_h{h}"
                     (SRC / f"{name}.cu").write_text(CU_H.format(k=k, t=t, b=b, h=h, name=name))
                     written += 1
