@@ -75,9 +75,15 @@ __global__ void batch_sizes_kernel(const uint16_t *__restrict codes,
   const uint64_t b = (uint64_t)blockIdx.x * (blockDim.x >> 5) + warp;
   const uint64_t base = b * (uint64_t)TOK_PER_BATCH;
   if (base >= total_tokens) return;
+  // ROUNDS, not 4. A warp covers TOK_PER_BATCH tokens at 32 lanes per round, so hardcoding 4
+  // summed 128 tokens of every batch whatever the granularity: at 192 that produced offsets the
+  // host reference rejected (offsets_ok=NO) and a regen time ~30% low, because two thirds of the
+  // codes were being read. The validator caught it; the timing alone would have looked like a win.
+  constexpr int ROUNDS = (int)(TOK_PER_BATCH / 32u);
+  static_assert(TOK_PER_BATCH % 32u == 0u, "TOK_PER_BATCH must be a whole number of warp rounds");
   uint32_t s = 0;
 #pragma unroll
-  for (int k = 0; k < 4; ++k) {
+  for (int k = 0; k < ROUNDS; ++k) {
     const uint64_t i = base + (uint64_t)lane + (uint64_t)(k * 32);
     if (i < total_tokens) s += (uint32_t)lens[codes[i]];
   }
