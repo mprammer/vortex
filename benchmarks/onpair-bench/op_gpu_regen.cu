@@ -45,7 +45,21 @@
     }                                                                          \
   } while (0)
 
-static constexpr uint32_t TOK_PER_BATCH = 128;
+// BATCH GRANULARITY. One offset per batch of TOK_PER_BATCH codes, and a warp batch is 32*K
+// codes, so this constant IS the sidecar's write-time commitment to K: 128 is K=4, 192 is the
+// paper's default K=6. Overridable at compile time (-DTOK_PER_BATCH_OVERRIDE=192) to test whether
+// the regeneration cost depends on granularity: phase 1 reads every code regardless, and only the
+// CUB scan over n_chunks shrinks, so the prediction is that it does not.
+//
+// The DECODE half cannot follow. The kernel included below hardcodes its own 128-token batch
+// (chunk * 128u), so at any other granularity it would read the wrong offsets. At != 128 we
+// therefore measure regeneration ALONE and report nulls for the decode and the overhead rather
+// than a number that looks comparable and is not.
+#ifndef TOK_PER_BATCH_OVERRIDE
+#define TOK_PER_BATCH_OVERRIDE 128
+#endif
+static constexpr uint32_t TOK_PER_BATCH = TOK_PER_BATCH_OVERRIDE;
+static constexpr bool DECODE_VALID = (TOK_PER_BATCH_OVERRIDE == 128u);
 static constexpr int BLOCK_THREADS = 512;               // 16 warps/block
 static constexpr uint32_t WARPS_PER_BLOCK = BLOCK_THREADS / 32;
 
@@ -197,13 +211,16 @@ int main(int argc, char **argv) {
   CK(cudaMemcpy(choff_gpu.data(), d_choff, n_chunks * 8, cudaMemcpyDeviceToHost));
   bool offsets_ok = (memcmp(choff_gpu.data(), chunk_off_ref.data(), n_chunks * 8) == 0);
 
-  CK(cudaMemset(d_out, 0xA5, decoded_bytes + 64));
-  decode(d_choff);
-  CK(cudaDeviceSynchronize());
-  CK(cudaGetLastError());
-  std::vector<uint8_t> gpu_out(decoded_bytes);
-  CK(cudaMemcpy(gpu_out.data(), d_out, decoded_bytes, cudaMemcpyDeviceToHost));
-  bool decode_ok = (memcmp(gpu_out.data(), cpu_out.data(), decoded_bytes) == 0);
+  bool decode_ok = false;
+  if (DECODE_VALID) {
+    CK(cudaMemset(d_out, 0xA5, decoded_bytes + 64));
+    decode(d_choff);
+    CK(cudaDeviceSynchronize());
+    CK(cudaGetLastError());
+    std::vector<uint8_t> gpu_out(decoded_bytes);
+    CK(cudaMemcpy(gpu_out.data(), d_out, decoded_bytes, cudaMemcpyDeviceToHost));
+    decode_ok = (memcmp(gpu_out.data(), cpu_out.data(), decoded_bytes) == 0);
+  }
 
   // ── timing (CUDA events; min over iters; raw ns retained) ─────────────────
   cudaEvent_t ev0, ev1;
@@ -230,8 +247,11 @@ int main(int argc, char **argv) {
 
   std::vector<uint64_t> regen_ns, decode_ns, both_ns;
   double t_regen = time_min_raw(regen, regen_ns);
-  double t_decode = time_min_raw([&]() { decode(d_choff_ref); }, decode_ns);  // OP4: offsets preloaded
-  double t_both = time_min_raw([&]() { regen(); decode(d_choff); }, both_ns); // OP2: regen then decode
+  double t_decode = 0.0, t_both = 0.0;
+  if (DECODE_VALID) {
+    t_decode = time_min_raw([&]() { decode(d_choff_ref); }, decode_ns);  // OP4: offsets preloaded
+    t_both = time_min_raw([&]() { regen(); decode(d_choff); }, both_ns); // OP2: regen then decode
+  }
 
   cudaDeviceProp prop{};
   CK(cudaGetDeviceProperties(&prop, 0));
@@ -246,6 +266,8 @@ int main(int argc, char **argv) {
   };
 
   printf("{\n");
+  printf("  \"tok_per_batch\": %u,\n", TOK_PER_BATCH);
+  printf("  \"decode_valid\": %s,\n", DECODE_VALID ? "true" : "false");
   printf("  \"gpu\": \"%s\",\n", prop.name);
   printf("  \"kernel\": \"onpair_shmem_4tpt_split8read + gpu-regen-offsets\",\n");
   printf("  \"total_tokens\": %llu,\n", (unsigned long long)total_tokens);
@@ -274,5 +296,7 @@ int main(int argc, char **argv) {
           decoded_bytes / 1e6, t_regen, t_decode, t_both, overhead_pct,
           offsets_ok ? "YES" : "NO", decode_ok ? "YES" : "NO");
 
-  return (offsets_ok && decode_ok) ? 0 : 4;
+  // At a granularity the included decode kernel cannot serve, decode_ok is false BY CONSTRUCTION,
+  // so gate the exit code on what was actually measured.
+  return (offsets_ok && (decode_ok || !DECODE_VALID)) ? 0 : 4;
 }

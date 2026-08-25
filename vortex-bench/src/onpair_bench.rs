@@ -973,7 +973,17 @@ async fn run_cell(
 
         use vortex::array::match_each_integer_ptype;
         const REPS: usize = 7;
-        const TOK_PER_BATCH: usize = 128;
+        // Batch granularity of the sidecar. One offset per batch of TOK_PER_BATCH codes, so this
+        // is the write-time commitment to K: a warp batch is 32*K codes, and the paper's default
+        // K=6 is 192. Overridable because the footprint is NOT a fixed fraction of the column --
+        // a coarser batch stores fewer offsets, but each delta is larger, so the compressed size
+        // has to be measured rather than scaled from the 128 figure.
+        let tok_per_batch: usize = std::env::var("ONPAIR_OFFSET_BATCH")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(128);
+        #[allow(non_snake_case)]
+        let TOK_PER_BATCH = tok_per_batch;
         let mut ctx = SESSION.create_execution_ctx();
         let compressor = BtrBlocksCompressor::default();
         let file = std::fs::OpenOptions::new()
