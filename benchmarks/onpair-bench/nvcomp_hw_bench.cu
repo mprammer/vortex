@@ -32,6 +32,15 @@
 // integer nanoseconds (GOLD provenance, mirroring the OnPair bench).
 #include <cstdio>
 #include <cstdlib>
+
+// PAYLOAD BASIS. `N` is the size of the input FILE, which is what gets compressed. When the file
+// carries row structure (a u32 length prefix per string, so the DE is measured on a stream rows can
+// be recovered from, as Zstd and Parquet are), the file is LARGER than the string payload. The
+// ratio and the decode rate must stay on the payload -- the useful bytes -- or prefix bytes count
+// as output and both numbers inflate. NVCOMP_PAYLOAD_BYTES carries the payload size; unset means
+// the file IS the payload, which is the pre-existing flat-concatenation behaviour.
+static size_t g_payload_bytes = 0;
+
 #include <cstring>
 #include <vector>
 #include <utility>
@@ -322,14 +331,6 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
     printf("]\n");
     printf("%s}%s\n", indent, trailing_comma?",":"");
 }
-
-// PAYLOAD BASIS. `N` is the size of the input FILE, which is what gets compressed. When the file
-// carries row structure (a u32 length prefix per string, so the DE is measured on a stream rows can
-// be recovered from, as Zstd and Parquet are), the file is LARGER than the string payload. The
-// ratio and the decode rate must stay on the payload -- the useful bytes -- or prefix bytes count
-// as output and both numbers inflate. NVCOMP_PAYLOAD_BYTES carries the payload size; unset means
-// the file IS the payload, which is the pre-existing flat-concatenation behaviour.
-static size_t g_payload_bytes = 0;
 
 int main(int argc, char** argv){
     const char* path = argc>1?argv[1]:"/tmp/l_comment.bin";
