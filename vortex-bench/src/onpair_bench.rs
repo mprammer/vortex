@@ -982,12 +982,22 @@ async fn run_cell(
         // K=6 is 192. Overridable because the footprint is NOT a fixed fraction of the column --
         // a coarser batch stores fewer offsets, but each delta is larger, so the compressed size
         // has to be measured rather than scaled from the 128 figure.
-        let tok_per_batch: usize = std::env::var("ONPAIR_OFFSET_BATCH")
+        // A LIST, not a scalar. The sidecar's footprint is a write-time commitment to K (a warp
+        // batch is 32*K codes, so the shipped K=6 is 192) and it does NOT scale linearly: a coarser
+        // batch stores fewer offsets but each delta is larger. Measuring several granularities from
+        // ONE encode is nearly free -- the prefix sum is trivial beside decompressing the codes --
+        // and it is the only way to state what the choice of K costs rather than asserting it. The
+        // FIRST value is authoritative for anything that folds the sidecar into a stored total.
+        let grans: Vec<usize> = std::env::var("ONPAIR_OFFSET_BATCH")
             .ok()
-            .and_then(|v| v.parse().ok())
-            .unwrap_or(128);
-        #[allow(non_snake_case)]
-        let TOK_PER_BATCH = tok_per_batch;
+            .map(|v| {
+                v.split(',')
+                    .filter_map(|t| t.trim().parse::<usize>().ok())
+                    .filter(|&n| n > 0)
+                    .collect::<Vec<_>>()
+            })
+            .filter(|v: &Vec<usize>| !v.is_empty())
+            .unwrap_or_else(|| vec![192]);
         let mut ctx = SESSION.create_execution_ctx();
         let compressor = BtrBlocksCompressor::default();
         let file = std::fs::OpenOptions::new()
@@ -1020,76 +1030,78 @@ async fn run_cell(
             let lens: Vec<u32> = (0..dict_offsets_u64.len().saturating_sub(1))
                 .map(|i| (dict_offsets_u64[i + 1] - dict_offsets_u64[i]) as u32)
                 .collect();
-            let total_tokens = codes_u16.len();
-            let n_batches = total_tokens.div_ceil(TOK_PER_BATCH);
-            // Time the length prefix-sum (records per-128-token-batch bases). codes_u16/lens are
-            // already materialised, so this times ONLY the scan, not the codes decompress.
-            let mut gen_ns = Vec::with_capacity(REPS);
-            let mut chunk_off = vec![0u64; n_batches + 1];
-            let mut decoded_bytes = 0u64;
-            for _ in 0..REPS {
-                let t = Instant::now();
-                let mut acc = 0u64;
-                let mut b = 0usize;
-                for (i, &c) in codes_u16.iter().enumerate() {
-                    if i % TOK_PER_BATCH == 0 {
-                        chunk_off[b] = acc;
-                        b += 1;
+            for &TOK_PER_BATCH in &grans {
+                let total_tokens = codes_u16.len();
+                let n_batches = total_tokens.div_ceil(TOK_PER_BATCH);
+                // Time the length prefix-sum (records per-128-token-batch bases). codes_u16/lens are
+                // already materialised, so this times ONLY the scan, not the codes decompress.
+                let mut gen_ns = Vec::with_capacity(REPS);
+                let mut chunk_off = vec![0u64; n_batches + 1];
+                let mut decoded_bytes = 0u64;
+                for _ in 0..REPS {
+                    let t = Instant::now();
+                    let mut acc = 0u64;
+                    let mut b = 0usize;
+                    for (i, &c) in codes_u16.iter().enumerate() {
+                        if i % TOK_PER_BATCH == 0 {
+                            chunk_off[b] = acc;
+                            b += 1;
+                        }
+                        acc += lens[c as usize] as u64;
                     }
-                    acc += lens[c as usize] as u64;
+                    chunk_off[b] = acc;
+                    gen_ns.push(t.elapsed().as_nanos() as u64);
+                    decoded_bytes = acc;
                 }
-                chunk_off[b] = acc;
-                gen_ns.push(t.elapsed().as_nanos() as u64);
-                decoded_bytes = acc;
-            }
-            // Real BtrBlocks-compressed size of the sidecar (the GPU consumes it uncompressed;
-            // this is the on-disk stored cost). Uses the same delta/plain path as the OnPair children.
-            let off_prim = PrimitiveArray::from_iter(chunk_off[..n_batches].iter().copied());
-            let off_compressed_arr =
-                compress_offsets(&off_prim.into_array(), &compressor, &mut ctx)?;
-            let off_compressed = off_compressed_arr.nbytes();
-            // (Q2) Cost to DECOMPRESS the stored compressed sidecar back to the plain
-            // integer offsets the GPU consumes. Times canonicalization of the compressed
-            // offset array; a fresh clone per rep so this measures decompress work.
-            let mut decompress_ns = Vec::with_capacity(REPS);
-            for _ in 0..REPS {
-                let a = off_compressed_arr.clone();
-                let t = Instant::now();
-                let dec = a.execute::<PrimitiveArray>(&mut ctx)?;
-                decompress_ns.push(t.elapsed().as_nanos() as u64);
-                std::hint::black_box(dec.len());
-            }
-            // (Q3) Cost of the in-memory fixed-stride dictionary repack: scatter the
-            // packed dictionary bytes into MAX_TOKEN_SIZE-wide slots, the exact host
-            // build the CUDA decode consumes as `dict_padded`.
-            let dict_bytes_host: &[u8] = op.dict_bytes().as_slice();
-            let dict_entries = dict_offsets_u64.len().saturating_sub(1);
-            let dict_padded_bytes = dict_entries * vortex_onpair::MAX_TOKEN_SIZE;
-            let mut repack_ns = Vec::with_capacity(REPS);
-            let mut dict_padded = vec![0u8; dict_padded_bytes];
-            for _ in 0..REPS {
-                let t = Instant::now();
-                for i in 0..dict_entries {
-                    let start = dict_offsets_u64[i] as usize;
-                    let end = dict_offsets_u64[i + 1] as usize;
-                    dict_padded[i * vortex_onpair::MAX_TOKEN_SIZE
-                        ..i * vortex_onpair::MAX_TOKEN_SIZE + (end - start)]
-                        .copy_from_slice(&dict_bytes_host[start..end]);
+                // Real BtrBlocks-compressed size of the sidecar (the GPU consumes it uncompressed;
+                // this is the on-disk stored cost). Uses the same delta/plain path as the OnPair children.
+                let off_prim = PrimitiveArray::from_iter(chunk_off[..n_batches].iter().copied());
+                let off_compressed_arr =
+                    compress_offsets(&off_prim.into_array(), &compressor, &mut ctx)?;
+                let off_compressed = off_compressed_arr.nbytes();
+                // (Q2) Cost to DECOMPRESS the stored compressed sidecar back to the plain
+                // integer offsets the GPU consumes. Times canonicalization of the compressed
+                // offset array; a fresh clone per rep so this measures decompress work.
+                let mut decompress_ns = Vec::with_capacity(REPS);
+                for _ in 0..REPS {
+                    let a = off_compressed_arr.clone();
+                    let t = Instant::now();
+                    let dec = a.execute::<PrimitiveArray>(&mut ctx)?;
+                    decompress_ns.push(t.elapsed().as_nanos() as u64);
+                    std::hint::black_box(dec.len());
                 }
-                repack_ns.push(t.elapsed().as_nanos() as u64);
-                std::hint::black_box(&dict_padded);
+                // (Q3) Cost of the in-memory fixed-stride dictionary repack: scatter the
+                // packed dictionary bytes into MAX_TOKEN_SIZE-wide slots, the exact host
+                // build the CUDA decode consumes as `dict_padded`.
+                let dict_bytes_host: &[u8] = op.dict_bytes().as_slice();
+                let dict_entries = dict_offsets_u64.len().saturating_sub(1);
+                let dict_padded_bytes = dict_entries * vortex_onpair::MAX_TOKEN_SIZE;
+                let mut repack_ns = Vec::with_capacity(REPS);
+                let mut dict_padded = vec![0u8; dict_padded_bytes];
+                for _ in 0..REPS {
+                    let t = Instant::now();
+                    for i in 0..dict_entries {
+                        let start = dict_offsets_u64[i] as usize;
+                        let end = dict_offsets_u64[i + 1] as usize;
+                        dict_padded[i * vortex_onpair::MAX_TOKEN_SIZE
+                            ..i * vortex_onpair::MAX_TOKEN_SIZE + (end - start)]
+                            .copy_from_slice(&dict_bytes_host[start..end]);
+                    }
+                    repack_ns.push(t.elapsed().as_nanos() as u64);
+                    std::hint::black_box(&dict_padded);
+                }
+                let chunk_compressed = op.clone().into_array().nbytes();
+                writeln!(
+                    w,
+                    "{{\"dataset\":\"{dataset_id}\",\"column\":\"{column}\",\"bits\":{bits},\"chunk\":{chunk_idx},\"tok_per_batch\":{TOK_PER_BATCH},\"total_tokens\":{total_tokens},\"n_batches\":{n_batches},\"decoded_bytes\":{decoded_bytes},\"compressed_bytes\":{chunk_compressed},\"offset_raw_u64\":{},\"offset_raw_u32\":{},\"offset_compressed_bytes\":{off_compressed},\"dict_entries\":{dict_entries},\"dict_padded_bytes\":{dict_padded_bytes},\"gen_ns\":{:?},\"decompress_ns\":{:?},\"repack_ns\":{:?}}}",
+                    n_batches * 8,
+                    n_batches * 4,
+                    gen_ns,
+                    decompress_ns,
+                    repack_ns
+                )
+                .with_context(|| format!("ONPAIR_OFFSET_COST: write {oc_path} failed"))?;
             }
-            let chunk_compressed = op.clone().into_array().nbytes();
-            writeln!(
-                w,
-                "{{\"dataset\":\"{dataset_id}\",\"column\":\"{column}\",\"bits\":{bits},\"chunk\":{chunk_idx},\"total_tokens\":{total_tokens},\"n_batches\":{n_batches},\"decoded_bytes\":{decoded_bytes},\"compressed_bytes\":{chunk_compressed},\"offset_raw_u64\":{},\"offset_raw_u32\":{},\"offset_compressed_bytes\":{off_compressed},\"dict_entries\":{dict_entries},\"dict_padded_bytes\":{dict_padded_bytes},\"gen_ns\":{:?},\"decompress_ns\":{:?},\"repack_ns\":{:?}}}",
-                n_batches * 8,
-                n_batches * 4,
-                gen_ns,
-                decompress_ns,
-                repack_ns
-            )
-            .with_context(|| format!("ONPAIR_OFFSET_COST: write {oc_path} failed"))?;
         }
         w.flush()
             .with_context(|| format!("ONPAIR_OFFSET_COST: flush {oc_path} failed"))?;
@@ -7060,10 +7072,14 @@ fn fsst12_sidecar_bytes(codes: &[u16], lens: &[u8], ctx: &mut ExecutionCtx) -> R
     if codes.is_empty() {
         return Ok(0);
     }
+    // Same list semantics as the OnPair path, and the same default. The FIRST entry is the one
+    // that folds into Fsst12StoredSize, so both codecs commit to the same granularity when the
+    // sidecar is counted as stored metadata; the rest of the list is for the OnPair sweep only.
     let tok_per_batch: usize = std::env::var("ONPAIR_OFFSET_BATCH")
         .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(128);
+        .and_then(|v| v.split(',').next().and_then(|t| t.trim().parse::<usize>().ok()))
+        .filter(|&n| n > 0)
+        .unwrap_or(192);
     let n_batches = codes.len().div_ceil(tok_per_batch);
     let mut off = Vec::with_capacity(n_batches);
     let mut acc = 0u64;
