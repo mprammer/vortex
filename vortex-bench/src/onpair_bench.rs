@@ -690,7 +690,7 @@ pub async fn run_column(
     if codec == "fsst12" {
         #[cfg(not(feature = "cuda"))]
         {
-            let _ = (&sample, out_root, gpu_config);
+            drop((&sample, out_root, gpu_config));
             anyhow::bail!("--codec fsst12 requires a build with --features cuda");
         }
         #[cfg(feature = "cuda")]
@@ -814,6 +814,10 @@ async fn run_cell_fsst12(
         // Also measure the code stream through OnPair's instrument, so the cell can report a
         // container-matched ratio alongside the native one.
         stored.codes_btrblocks = fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
+        // Per-batch output-position sidecar, at the same granularity the OnPair path uses, so the
+        // two codecs can be compared with it counted as stored codec metadata.
+        stored.sidecar =
+            fsst12_sidecar_bytes(&inputs.codes_u16, &inputs.lens_table, &mut ctx)? as usize;
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
         // and its footprint still counts toward the stored size below.
@@ -7044,6 +7048,40 @@ fn fsst12_btrblocks_code_bytes(codes: &[u16], ctx: &mut ExecutionCtx) -> Result<
 ///
 /// Not cuda-gated: it is CPU compression, and keeping it reachable without a CUDA toolchain
 /// is what lets the fix be tested where it was written.
+/// Stored size of the per-batch output-position sidecar for an FSST-12 code stream.
+///
+/// The OnPair path measures this inside its `ONPAIR_OFFSET_COST` block, but FSST-12 goes through
+/// `run_cell_fsst12` and so never got one -- which left the two codecs on different bases when the
+/// sidecar is counted as stored metadata. Same construction as the OnPair block: one u64 per batch
+/// of `tok_per_batch` codes holding the running decoded-byte total, then `compress_offsets`, which
+/// is the same delta-or-plain keep-the-smaller path the OnPair children use. Granularity comes from
+/// ONPAIR_OFFSET_BATCH so both codecs can be measured at the same write-time commitment to K.
+fn fsst12_sidecar_bytes(codes: &[u16], lens: &[u8], ctx: &mut ExecutionCtx) -> Result<u64> {
+    if codes.is_empty() {
+        return Ok(0);
+    }
+    let tok_per_batch: usize = std::env::var("ONPAIR_OFFSET_BATCH")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(128);
+    let n_batches = codes.len().div_ceil(tok_per_batch);
+    let mut off = Vec::with_capacity(n_batches);
+    let mut acc = 0u64;
+    for (i, &c) in codes.iter().enumerate() {
+        if i % tok_per_batch == 0 {
+            off.push(acc);
+        }
+        acc += lens[c as usize] as u64;
+    }
+    let compressor = BtrBlocksCompressor::default();
+    let arr = compress_offsets(
+        &PrimitiveArray::from_iter(off.into_iter()).into_array(),
+        &compressor,
+        ctx,
+    )?;
+    Ok(arr.nbytes() as u64)
+}
+
 fn fsst12_stored_offset_bytes(row_code_offsets: &[u64], ctx: &mut ExecutionCtx) -> Result<u64> {
     if row_code_offsets.is_empty() {
         return Ok(0);

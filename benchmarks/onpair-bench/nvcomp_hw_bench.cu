@@ -77,6 +77,7 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
     out = CodecResult{};
     size_t N = host.size();
     size_t num = (N + chunk - 1) / chunk;
+    const size_t PB = g_payload_bytes ? g_payload_bytes : N;  // ratio/rate basis
     cudaStream_t stream; CK(cudaStreamCreate(&stream));
 
     // ---- upload uncompressed, build chunk ptr/size arrays ----
@@ -104,7 +105,7 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
     for(int i=0;i<citers;i++) NK(compAsync(d_inptr,d_insz,chunk,num,d_ctemp,ctemp,d_cptr,d_csz,copts,d_st,stream));
     CK(cudaEventRecord(cb,stream)); CK(cudaEventSynchronize(cb));
     float cms=0; CK(cudaEventElapsedTime(&cms,ca,cb)); cms/=citers;
-    double enc_gibs=(double)N/(cms/1e3)/(1024.0*1024*1024);
+    double enc_gibs=(double)PB/(cms/1e3)/(1024.0*1024*1024);
     std::vector<size_t> h_csz(num); CK(cudaMemcpy(h_csz.data(),d_csz,num*sizeof(size_t),cudaMemcpyDeviceToHost));
     std::vector<nvcompStatus_t> h_status(num);
     CK(cudaMemcpy(h_status.data(),d_st,num*sizeof(nvcompStatus_t),cudaMemcpyDeviceToHost));
@@ -225,12 +226,12 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
         out.validation_failed=true;
         ok=false;
     }
-    double gibs = (double)N/(ms/1e3)/ (1024.0*1024*1024);
-    double gbs  = (double)N/(ms/1e3)/ 1e9;
+    double gibs = (double)PB/(ms/1e3)/ (1024.0*1024*1024);
+    double gbs  = (double)PB/(ms/1e3)/ 1e9;
     fprintf(stderr,"%-13s chunk=%6zu  ratio=%.2fx  compress=%6.1f GiB/s  decode=%6.1f GiB/s (%.0f GB/s)  valid=%s\n",
-           name, chunk, (double)N/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
+           name, chunk, (double)PB/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
 
-    out.ratio = ok ? (double)N/ctot : 0.0;
+    out.ratio = ok ? (double)PB/ctot : 0.0;
     out.compress_gib_s = ok ? enc_gibs : 0.0;
     out.decode_gib_s = ok ? gibs : 0.0;
     out.valid = ok;
@@ -322,6 +323,14 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
     printf("%s}%s\n", indent, trailing_comma?",":"");
 }
 
+// PAYLOAD BASIS. `N` is the size of the input FILE, which is what gets compressed. When the file
+// carries row structure (a u32 length prefix per string, so the DE is measured on a stream rows can
+// be recovered from, as Zstd and Parquet are), the file is LARGER than the string payload. The
+// ratio and the decode rate must stay on the payload -- the useful bytes -- or prefix bytes count
+// as output and both numbers inflate. NVCOMP_PAYLOAD_BYTES carries the payload size; unset means
+// the file IS the payload, which is the pre-existing flat-concatenation behaviour.
+static size_t g_payload_bytes = 0;
+
 int main(int argc, char** argv){
     const char* path = argc>1?argv[1]:"/tmp/l_comment.bin";
     if(argc>2 && (size_t)atol(argv[2])!=LEGACY_CHUNK){
@@ -335,7 +344,13 @@ int main(int argc, char** argv){
     std::vector<unsigned char> host((size_t)sz);
     if(fread(host.data(),1,(size_t)sz,f)!=(size_t)sz){ fprintf(stderr,"short read from %s\n",path); fclose(f); return 1; }
     fclose(f);
-    fprintf(stderr,"input: %s  %.1f MiB\n", path, sz/1048576.0);
+    if(const char* e = getenv("NVCOMP_PAYLOAD_BYTES")){
+        long v = atol(e);
+        if(v <= 0 || v > sz){ fprintf(stderr,"NVCOMP_PAYLOAD_BYTES=%s invalid for a %ld-byte file\n", e, sz); return 1; }
+        g_payload_bytes = (size_t)v;
+    }
+    fprintf(stderr,"input: %s  %.1f MiB (payload %.1f MiB)\n", path, sz/1048576.0,
+            (g_payload_bytes?g_payload_bytes:(size_t)sz)/1048576.0);
     CK(cudaSetDevice(0));
 
     // Two presets per HW codec: "hi" = max compression ratio, "fast" = best

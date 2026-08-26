@@ -78,12 +78,67 @@ def dump_column(dataset_id: str, column: str, out_path: str, cap: int = DEFAULT_
     return total
 
 
+def dump_column_prefixed(dataset_id: str, column: str, out_path: str,
+                         cap: int = DEFAULT_CAP) -> tuple[int, int]:
+    """Write the column as a u32-length-prefixed record stream. Returns (payload, file) bytes.
+
+    WHY. The flat dump above loses row boundaries, so a compressor fed from it is measured on a
+    byte stream rows cannot be recovered from -- while nvCOMP Zstd prefixes every string with a u32
+    length ("the same as what Parquet does") and OnPair stores row-to-code offsets. That put the
+    hardware DE on a basis no other technique used. This dumper closes it: same bytes, same cap on
+    the PAYLOAD, plus the row structure every other technique already pays for.
+
+    The cap counts payload only, so the file is larger than `cap` by 4 bytes per row. The bench must
+    be told the payload size (NVCOMP_PAYLOAD_BYTES) or it will treat prefix bytes as decoded output.
+    """
+    import struct
+
+    parquet = resolve_parquet(dataset_id, column)
+    if not parquet.exists():
+        raise FileNotFoundError(f"source parquet missing: {parquet}")
+    tmp = out_path + ".part"
+    payload = 0
+    written = 0
+    with open(tmp, "wb") as out:
+        for b in pq.ParquetFile(parquet).iter_batches(batch_size=1 << 20, columns=[column]):
+            for v in b.column(0).to_pylist():
+                if v is None:
+                    continue
+                raw = v.encode("utf-8")
+                if payload + len(raw) > cap:
+                    raw = raw[: cap - payload]
+                    if not raw:
+                        break
+                out.write(struct.pack("<I", len(raw)))
+                out.write(raw)
+                payload += len(raw)
+                written += 4 + len(raw)
+                if payload >= cap:
+                    break
+            if payload >= cap:
+                break
+    Path(tmp).replace(out_path)
+    return payload, written
+
+
 def main(argv: list[str]) -> int:
     if len(argv) < 4:
         print("usage: dump_columns.py <dataset_id> <column> <out_path> [cap_bytes]", file=sys.stderr)
         return 2
     ds, col, out = argv[1], argv[2], argv[3]
     cap = int(argv[4]) if len(argv) > 4 else DEFAULT_CAP
+    if "--length-prefix" in argv:
+        argv = [a for a in argv if a != "--length-prefix"]
+        try:
+            payload, fbytes = dump_column_prefixed(ds, col, out, cap)
+        except KeyError:
+            print(f"unknown column: {ds}/{col}", file=sys.stderr)
+            return 2
+        except FileNotFoundError as e:
+            print(str(e), file=sys.stderr)
+            return 3
+        print(f"{payload} {fbytes}")
+        return 0
     try:
         n = dump_column(ds, col, out, cap)
     except KeyError as e:

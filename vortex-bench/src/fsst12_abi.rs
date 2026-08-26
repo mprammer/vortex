@@ -269,6 +269,7 @@ pub fn normalize_rows(
             row_offsets: row_code_offsets.len() * size_of::<u64>(),
             table: entries * (size_of::<u64>() + size_of::<u8>()),
             codes_btrblocks: 0,
+            sidecar: 0,
         },
         row_code_offsets,
     })
@@ -345,6 +346,10 @@ pub struct Fsst12StoredSize {
     /// container. [`Fsst12StoredSize::total`] is the native measure; [`Self::total_container_matched`]
     /// is the one that isolates the codec.
     pub codes_btrblocks: usize,
+    /// Stored size of the per-batch output-position sidecar, at the granularity
+    /// `ONPAIR_OFFSET_BATCH` selects. Counted as codec metadata, the same way the symbol table
+    /// is: FastPair cannot place a batch's output without it. Zero when unmeasured.
+    pub sidecar: usize,
 }
 
 impl Fsst12StoredSize {
@@ -352,7 +357,7 @@ impl Fsst12StoredSize {
     /// dense 12-bit packing. This is the honest figure to compare against published FSST
     /// numbers, and the pessimistic one to compare against OnPair-in-Vortex.
     pub fn total(&self) -> usize {
-        self.packed_codes + self.row_offsets + self.table
+        self.packed_codes + self.row_offsets + self.table + self.sidecar
     }
 
     /// Container-matched total: the code stream measured by the same instrument as OnPair's,
@@ -362,7 +367,7 @@ impl Fsst12StoredSize {
         if self.codes_btrblocks == 0 {
             return self.total();
         }
-        self.codes_btrblocks + self.row_offsets + self.table
+        self.codes_btrblocks + self.row_offsets + self.table + self.sidecar
     }
 }
 
