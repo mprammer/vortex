@@ -44,6 +44,15 @@
 //     *GetRequiredAlignments (round the compressed-chunk stride if a codec errors).
 //   - Bitcomp targets numeric/sparse data — expect POOR ratio on text columns. That is
 //     a valid measurement, not a bug: it directly informs the §7 claim.
+// THE RATIO AND RATE BASIS. Set from NVCOMP_PAYLOAD_BYTES. The driver (de_stage.py) feeds every
+// codec a u32-length-framed record stream, so the FILE is payload plus four bytes per row, and
+// dividing by the file would count framing as compressed input and as decoded output. Unset
+// reproduces the previous file-is-payload behaviour exactly.
+//
+// DECLARED HERE, ABOVE EVERY USE, ON PURPOSE. The hardware bench carried this below main() while
+// the function reading it sat earlier in the file; nvcc rejected it 137 minutes into a leg.
+static size_t g_payload_bytes = 0;
+
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -61,7 +70,11 @@ static const size_t LEGACY_CHUNK = 262144; // 256 KiB, the duplicated top-level 
 // One codec's result at one chunk size. `valid` is false when the codec rejected
 // this config or the byte round-trip failed; scalars are 0 and iters empty then.
 struct CodecResult {
-    double ratio = 0.0;          // raw_bytes / compressed_bytes
+    double ratio = 0.0;          // payload_bytes / compressed_bytes
+    // RECORDED, NOT DERIVED, matching nvcomp_hw_bench.cu: ratio and the rates are rounded doubles
+    // on output, so a consumer cannot recover the bytes or check which basis it was handed.
+    unsigned long long compressed_bytes = 0;
+    unsigned long long basis_bytes = 0;   // the numerator used: payload, or the file if flat
     double compress_gib_s = 0.0; // encode throughput over uncompressed bytes
     double decode_gib_s = 0.0;   // min-reduced decode throughput over uncompressed bytes
     bool valid = false;          // supported AND byte-exact
@@ -86,6 +99,10 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
 {
     out = CodecResult{};
     size_t N = host.size();
+    // PB is the ratio's numerator and the rate's numerator: the useful string bytes. Chunking
+    // still covers the whole file, because the framing bytes are really there and really get
+    // compressed -- they just are not payload.
+    const size_t PB = g_payload_bytes ? g_payload_bytes : N;
     size_t num = (N + chunk - 1) / chunk;
     cudaStream_t stream; CK(cudaStreamCreate(&stream));
 
@@ -113,7 +130,7 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
     for(int i=0;i<citers;i++) NK(compAsync(d_inptr,d_insz,chunk,num,d_ctemp,ctemp,d_cptr,d_csz,copts,d_st,stream));
     CK(cudaEventRecord(cb,stream)); CK(cudaEventSynchronize(cb));
     float cms=0; CK(cudaEventElapsedTime(&cms,ca,cb)); cms/=citers;
-    double enc_gibs=(double)N/(cms/1e3)/(1024.0*1024*1024);
+    double enc_gibs=(double)PB/(cms/1e3)/(1024.0*1024*1024);
     std::vector<size_t> h_csz(num); CK(cudaMemcpy(h_csz.data(),d_csz,num*sizeof(size_t),cudaMemcpyDeviceToHost));
     std::vector<nvcompStatus_t> h_status(num);
     CK(cudaMemcpy(h_status.data(),d_st,num*sizeof(nvcompStatus_t),cudaMemcpyDeviceToHost));
@@ -220,17 +237,19 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
         out.validation_failed=true;
         ok=false;
     }
-    double gibs = (double)N/(ms/1e3)/ (1024.0*1024*1024);
-    double gbs  = (double)N/(ms/1e3)/ 1e9;
+    double gibs = (double)PB/(ms/1e3)/ (1024.0*1024*1024);
+    double gbs  = (double)PB/(ms/1e3)/ 1e9;
     fprintf(stderr,"%-13s chunk=%6zu  ratio=%.2fx  compress=%6.1f GiB/s  decode=%6.1f GiB/s (%.0f GB/s)  valid=%s\n",
-           name, chunk, (double)N/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
+           name, chunk, (double)PB/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
 
     // Publish rates/samples ONLY on a validated round-trip (CodecResult's invalid
     // contract): a failed cell keeps default-zero scalars + an empty iters vector, so it
     // can never surface as best_*. (Tightens the copied-from-hw-bench behavior.)
     out.valid = ok;
     if(ok){
-        out.ratio = (double)N/ctot;
+        out.ratio = (double)PB/ctot;
+        out.compressed_bytes = (unsigned long long)ctot;
+        out.basis_bytes = (unsigned long long)PB;
         out.compress_gib_s = enc_gibs;
         out.decode_gib_s = gibs;
     } else {
@@ -303,6 +322,8 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
 {
     printf("%s\"%s\": {\n", indent, name);
     printf("%s  \"ratio\": %.2f,\n", indent, r.ratio);
+    printf("%s  \"compressed_bytes\": %llu,\n", indent, r.compressed_bytes);
+    printf("%s  \"basis_bytes\": %llu,\n", indent, r.basis_bytes);
     printf("%s  \"compress_gib_s\": %.1f,\n", indent, r.compress_gib_s);
     printf("%s  \"decode_gib_s\": %.1f,\n", indent, r.decode_gib_s);
     printf("%s  \"supported\": %s,\n", indent, r.supported?"true":"false");
@@ -324,7 +345,13 @@ int main(int argc, char** argv){
     std::vector<unsigned char> host((size_t)sz);
     if(fread(host.data(),1,(size_t)sz,f)!=(size_t)sz){ fprintf(stderr,"short read from %s\n",path); fclose(f); return 1; }
     fclose(f);
-    fprintf(stderr,"input: %s  %.1f MiB\n", path, sz/1048576.0);
+    if(const char* e = getenv("NVCOMP_PAYLOAD_BYTES")){
+        long v = atol(e);
+        if(v <= 0 || v > sz){ fprintf(stderr,"NVCOMP_PAYLOAD_BYTES=%s invalid for a %ld-byte file\n", e, sz); return 1; }
+        g_payload_bytes = (size_t)v;
+    }
+    fprintf(stderr,"input: %s  %.1f MiB (payload %.1f MiB)\n", path, sz/1048576.0,
+            (g_payload_bytes?g_payload_bytes:(size_t)sz)/1048576.0);
     CK(cudaSetDevice(0));
 
     const size_t sweep_chunks[5] = {32*1024, 64*1024, 128*1024, 256*1024, 512*1024};
@@ -359,7 +386,13 @@ int main(int argc, char** argv){
     const std::vector<CodecResult>& lres = sweep_results[legacy_idx];
 
     printf("{\n");
+    // raw_bytes keeps its old meaning -- the FILE -- because de_stage.py validates it against the
+    // dumped byte count. The new fields say what the numbers are on, so a consumer can recompute
+    // any basis instead of trusting a convention it cannot see.
     printf("  \"raw_bytes\": %ld,\n", sz);
+    printf("  \"file_bytes\": %ld,\n", sz);
+    printf("  \"payload_bytes\": %zu,\n", g_payload_bytes ? g_payload_bytes : (size_t)sz);
+    printf("  \"framing\": \"%s\",\n", g_payload_bytes ? "u32-length" : "flat");
     printf("  \"chunk_bytes\": %zu,\n", (size_t)LEGACY_CHUNK);
     printf("  \"codecs\": {\n");
     for(size_t k=0;k<lres.size();k++)
