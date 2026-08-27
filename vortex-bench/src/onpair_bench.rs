@@ -207,6 +207,29 @@ pub struct CellResult {
     /// from one taken at another granularity.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub sidecar_tok_per_batch: Option<usize>,
+    /// EVERY STORED COMPONENT, NAMED AND SEPARATE, summed over chunks.
+    ///
+    /// The compression ratio was corrected three times in two days, in both directions, because
+    /// each denominator was a total: a reader could not see which components were inside it and so
+    /// could not tell that the two codecs' totals contained different things. FSST-12's was the
+    /// worse case -- `table` was recoverable and `packed_codes + row_offsets` was recoverable, but
+    /// `row_offsets` was not separable from anything committed, so its denominator could not be
+    /// recomposed at all.
+    ///
+    /// So no total is authoritative here. Every component is recorded on its own and any
+    /// denominator is composed by name in post-processing, which is also what makes it checkable
+    /// that two techniques' denominators contain analogous things:
+    ///
+    ///   OnPair    codes, codes_offsets, dict_offsets, lengths, dict, sidecar
+    ///   FSST-12   packed_codes, codes_btrblocks, row_offsets, table_symbols, table_lengths, sidecar
+    ///
+    /// `codes` and `packed_codes`/`codes_btrblocks` are the code stream; `codes_offsets` and
+    /// `row_offsets` are the row boundaries; `dict`+`dict_offsets` and
+    /// `table_symbols`+`table_lengths` are the dictionary. `lengths` has no FSST-12 counterpart
+    /// because FSST-12 derives it (fsst12_abi.rs:202) -- see
+    /// docs/notes/2026-08-27-stored-size-accounting.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stored_components: Option<std::collections::BTreeMap<String, u64>>,
     /// `sample_bytes / on_disk_bytes`.
     pub disk_ratio: f64,
     /// Whether the decoded strings matched the input exactly.
@@ -797,6 +820,8 @@ async fn run_cell_fsst12(
     let mut stored_total = 0u64;
     let mut stored_matched_total = 0u64;
     let mut sidecar_total = 0u64;
+    // Named components, summed over chunks. See CellResult::stored_components.
+    let mut comp: std::collections::BTreeMap<String, u64> = Default::default();
     let mut table_bytes_total = 0u64;
     for r in ranges.iter().cloned() {
         let slice = sample.array.slice(r)?;
@@ -850,6 +875,16 @@ async fn run_cell_fsst12(
             &mut ctx,
         )? as usize;
         sidecar_total += stored.sidecar as u64;
+        for (k, v) in [
+            ("packed_codes", stored.packed_codes),
+            ("codes_btrblocks", stored.codes_btrblocks),
+            ("row_offsets", stored.row_offsets),
+            ("table_symbols", stored.table_symbols),
+            ("table_lengths", stored.table_lengths),
+            ("sidecar", stored.sidecar),
+        ] {
+            *comp.entry(k.to_string()).or_default() += v as u64;
+        }
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
         // and its footprint still counts toward the stored size below.
@@ -931,6 +966,7 @@ async fn run_cell_fsst12(
         mem_ratio_container_matched: Some(ratio(sample.raw_bytes, stored_matched_total)),
         sidecar_bytes: Some(sidecar_total),
         sidecar_tok_per_batch: Some(offset_batch_granularities()?[0]),
+        stored_components: Some(comp),
         disk_ratio: 0.0,
         verified,
         onpair_only: false,
@@ -1055,6 +1091,22 @@ async fn run_cell(
             acc += onpair_sidecar_bytes(op, sidecar_tok_per_batch, &mut ctx, &compressor)?;
         }
         acc
+    };
+    // NAMED COMPONENTS ON EVERY CELL, not behind ONPAIR_CHILD_BYTES. The env gate meant most cells
+    // could not say what their own denominator contained, which is how two codecs' totals came to
+    // hold different things unnoticed. This is the same breakdown the gated JSONL writes, summed
+    // over chunks; that file stays, because it is per-chunk and this is per-cell.
+    let stored_components: std::collections::BTreeMap<String, u64> = {
+        let mut m: std::collections::BTreeMap<String, u64> = Default::default();
+        for op in &onpairs {
+            *m.entry("codes".into()).or_default() += op.codes().nbytes();
+            *m.entry("codes_offsets".into()).or_default() += op.codes_offsets().nbytes();
+            *m.entry("dict_offsets".into()).or_default() += op.dict_offsets().nbytes();
+            *m.entry("lengths".into()).or_default() += op.uncompressed_lengths().nbytes();
+            *m.entry("dict".into()).or_default() += op.dict_bytes().len() as u64;
+        }
+        m.insert("sidecar".into(), sidecar_bytes);
+        m
     };
     let dict_bytes: u64 = onpairs.iter().map(|a| a.dict_bytes().len() as u64).sum();
     let n_chunks = onpairs.len();
@@ -1292,6 +1344,7 @@ async fn run_cell(
         mem_ratio_container_matched: None,
         sidecar_bytes: Some(sidecar_bytes),
         sidecar_tok_per_batch: Some(sidecar_tok_per_batch),
+        stored_components: Some(stored_components),
         disk_ratio: ratio(sample.raw_bytes, on_disk_bytes),
         verified,
         onpair_only,

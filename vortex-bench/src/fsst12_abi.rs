@@ -268,6 +268,8 @@ pub fn normalize_rows(
             packed_codes,
             row_offsets: row_code_offsets.len() * size_of::<u64>(),
             table: entries * (size_of::<u64>() + size_of::<u8>()),
+            table_symbols: entries * size_of::<u64>(),
+            table_lengths: entries * size_of::<u8>(),
             codes_btrblocks: 0,
             sidecar: 0,
         },
@@ -333,7 +335,16 @@ pub struct Fsst12StoredSize {
     pub row_offsets: usize,
     /// Dictionary as stored: 8 B symbol plus 1 B length per trained entry. Excludes the
     /// GPU-side padding and the widened decode table, which are load-time artifacts.
+    ///
+    /// This is the SUM of the two fields below, kept for callers that want the dictionary as one
+    /// number. Report the parts when comparing against OnPair, whose dictionary is a byte buffer
+    /// plus an offsets child: `table_symbols` is the analogue of `dict_bytes` and `table_lengths`
+    /// of `dict_offsets`, and comparing a sum against a sum hides which side carries the cost.
     pub table: usize,
+    /// The symbol bytes alone: 8 B per trained entry.
+    pub table_symbols: usize,
+    /// The per-entry lengths alone: 1 B per trained entry.
+    pub table_lengths: usize,
     /// The code stream measured the way OnPair's is: as an integer array handed to
     /// BtrBlocks, rather than as FSST-12's own fixed-width 12-bit packing. Filled by the
     /// caller, which owns the compressor; zero means not measured.
