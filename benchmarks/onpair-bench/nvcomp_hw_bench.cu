@@ -59,7 +59,12 @@ static const size_t LEGACY_CHUNK = 262144; // 256 KiB
 // rejected this (chunk,codec) config or the byte round-trip failed; in that case
 // the scalar fields are 0 and decode_ns_iters is empty.
 struct CodecResult {
-    double ratio = 0.0;          // raw_bytes / compressed_bytes
+    double ratio = 0.0;          // payload_bytes / compressed_bytes
+    // RECORDED, NOT DERIVED. ratio and the rates are doubles rounded on output, so a consumer
+    // cannot recover the bytes from them or check the basis it was given. Carrying the two integers
+    // lets any reducer recompute every basis exactly and assert ratio against them.
+    unsigned long long compressed_bytes = 0;
+    unsigned long long basis_bytes = 0;   // the numerator actually used (payload, or file if flat)
     double compress_gib_s = 0.0; // encode throughput over uncompressed bytes
     double decode_gib_s = 0.0;   // min-reduced decode throughput over uncompressed bytes
     bool valid = false;          // HW-supported AND byte-exact
@@ -241,6 +246,8 @@ void run(const char* name, std::vector<unsigned char>& host, size_t chunk,
            name, chunk, (double)PB/ctot, enc_gibs, gibs, gbs, ok?"YES":"NO");
 
     out.ratio = ok ? (double)PB/ctot : 0.0;
+    out.compressed_bytes = (unsigned long long)ctot;
+    out.basis_bytes = (unsigned long long)PB;
     out.compress_gib_s = ok ? enc_gibs : 0.0;
     out.decode_gib_s = ok ? gibs : 0.0;
     out.valid = ok;
@@ -320,6 +327,8 @@ static void print_codec_obj(const char* indent, const char* name, const CodecRes
 {
     printf("%s\"%s\": {\n", indent, name);
     printf("%s  \"ratio\": %.2f,\n", indent, r.ratio);
+    printf("%s  \"compressed_bytes\": %llu,\n", indent, r.compressed_bytes);
+    printf("%s  \"basis_bytes\": %llu,\n", indent, r.basis_bytes);
     printf("%s  \"compress_gib_s\": %.1f,\n", indent, r.compress_gib_s);
     printf("%s  \"decode_gib_s\": %.1f,\n", indent, r.decode_gib_s);
     printf("%s  \"supported\": %s,\n", indent, r.supported?"true":"false");
@@ -405,7 +414,19 @@ int main(int argc, char** argv){
     const std::vector<CodecResult>& lres = sweep_results[legacy_idx];
 
     printf("{\n");
+    // EVERY BASIS IS RECORDED; NONE IS INFERRED. raw_bytes stays the FILE size, because
+    // de_stage.py validates it against the dumped byte count and figures/suite.py recomputes rate
+    // from it -- changing its meaning in place would have made those consumers silently wrong
+    // rather than loudly broken. The new fields are additive and say what the numbers are on:
+    //   payload_bytes  the ratio's and rate's numerator -- the useful string bytes
+    //   file_bytes     what was actually compressed, payload plus framing
+    //   framing        how rows are delimited in the compressed stream, or "flat" for none
+    // A consumer can now recompute any basis and check it against `ratio` instead of trusting a
+    // convention it cannot see. An old consumer keeps reading raw_bytes and keeps working.
     printf("  \"raw_bytes\": %ld,\n", sz);
+    printf("  \"file_bytes\": %ld,\n", sz);
+    printf("  \"payload_bytes\": %zu,\n", g_payload_bytes ? g_payload_bytes : (size_t)sz);
+    printf("  \"framing\": \"%s\",\n", g_payload_bytes ? "u32-length" : "flat");
     printf("  \"chunk_bytes\": %zu,\n", (size_t)LEGACY_CHUNK);
     printf("  \"codecs\": {\n");
     for(size_t k=0;k<lres.size();k++)
