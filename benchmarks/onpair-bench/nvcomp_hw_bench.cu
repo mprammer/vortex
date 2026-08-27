@@ -372,8 +372,14 @@ int main(int argc, char** argv){
     if(argc>3){ deflate_algos[0]=atoi(argv[3]); deflate_names[0]="DEFLATE-custom"; deflate_algos[1]=-1; }
 
     // ---- chunk sweep: report DE's BEST decode over all (chunk x codec) configs ----
-    const size_t sweep_chunks[5] = {32*1024, 64*1024, 128*1024, 256*1024, 512*1024};
-    const int n_sweep = 5;
+    // THE OLD RANGE ENDED WHERE THE OPTIMUM WAS. The engine's best chunk size was 512 KiB -- the
+    // largest swept -- on 15 of 15 columns, which means the sweep found a boundary rather than an
+    // optimum, and the resulting rate is a lower bound on what the engine can do. Since that rate
+    // is the denominator of the paper's headline multiple, the multiple was an upper bound. 1 and
+    // 2 MiB bracket it: if 512 KiB still wins with two larger sizes available, it is an optimum.
+    const size_t sweep_chunks[7] = {32*1024, 64*1024, 128*1024, 256*1024, 512*1024,
+                                    1024*1024, 2048*1024};
+    const int n_sweep = 7;
 
     // Per-chunk results, in sweep order. legacy_idx marks the 256 KiB cell that is
     // duplicated at the top level for exact backward-compat.

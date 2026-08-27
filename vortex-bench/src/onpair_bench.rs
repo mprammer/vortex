@@ -118,7 +118,11 @@ const NVCOMP_ZSTD_VALUES_PER_FRAME: usize = 2048;
 #[cfg(feature = "cuda")]
 const NVCOMP_ZSTD_LEVEL: i32 = -10;
 #[cfg(feature = "cuda")]
-const NVCOMP_ZSTD_LEVELS: &[i32] = &[-10, 1, 3];
+// LEVELS 9 AND 19 ADDED. -10/1/3 truncate the ratio axis at the low end, which flatters us in
+// "no baseline reaches those rates at an equal or better compression ratio": the comparator was
+// never given its high-ratio configurations. 9 and 19 are Zstd's own higher-effort settings, so
+// the dominance claim is tested against the ratio range Zstd actually reaches.
+const NVCOMP_ZSTD_LEVELS: &[i32] = &[-10, 1, 3, 9, 19];
 
 /// One row of benchmark output: a single `(column, bits, chunk, threshold)`
 /// cell.
