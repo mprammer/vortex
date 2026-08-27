@@ -183,6 +183,26 @@ pub struct CellResult {
     /// OnPair, where the two coincide by construction.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub mem_ratio_container_matched: Option<f64>,
+    /// Stored size of the per-batch output-position sidecar, summed over chunks, at
+    /// [`Self::sidecar_tok_per_batch`]. Measured on both codecs by the same instrument
+    /// (`compress_offsets`, delta-or-plain, keep the smaller).
+    ///
+    /// NOT included in `in_memory_bytes`, `mem_ratio` or `mem_ratio_container_matched` on either
+    /// codec, so those keep the meaning they have had all along. A reducer that wants the figure
+    /// the paper reports adds this to both codecs; one that wants the container alone ignores it.
+    /// Recording it rather than folding it in is what makes both statements checkable from the
+    /// same record.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_bytes: Option<u64>,
+    /// Codes per sidecar entry: the write-time commitment to K, since a warp batch is `32*K`
+    /// codes and the shipped K=6 is 192.
+    ///
+    /// Present on every cell that measured a sidecar, because the footprint is NOT linear in this
+    /// number -- a coarser batch stores fewer offsets but each delta is larger -- so two cells that
+    /// differ only here are different measurements, and a record without it cannot be told apart
+    /// from one taken at another granularity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_tok_per_batch: Option<usize>,
     /// `sample_bytes / on_disk_bytes`.
     pub disk_ratio: f64,
     /// Whether the decoded strings matched the input exactly.
@@ -772,6 +792,7 @@ async fn run_cell_fsst12(
     let mut all_inputs = Vec::with_capacity(ranges.len());
     let mut stored_total = 0u64;
     let mut stored_matched_total = 0u64;
+    let mut sidecar_total = 0u64;
     let mut table_bytes_total = 0u64;
     for r in ranges.iter().cloned() {
         let slice = sample.array.slice(r)?;
@@ -818,6 +839,7 @@ async fn run_cell_fsst12(
         // two codecs can be compared with it counted as stored codec metadata.
         stored.sidecar =
             fsst12_sidecar_bytes(&inputs.codes_u16, &inputs.lens_table, &mut ctx)? as usize;
+        sidecar_total += stored.sidecar as u64;
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
         // and its footprint still counts toward the stored size below.
@@ -897,6 +919,8 @@ async fn run_cell_fsst12(
         gpu,
         mem_ratio: ratio(sample.raw_bytes, stored_total),
         mem_ratio_container_matched: Some(ratio(sample.raw_bytes, stored_matched_total)),
+        sidecar_bytes: Some(sidecar_total),
+        sidecar_tok_per_batch: Some(offset_batch_granularities()?[0]),
         disk_ratio: 0.0,
         verified,
         onpair_only: false,
@@ -959,10 +983,69 @@ async fn run_cell(
         .collect::<Result<Vec<_>>>()?;
     let encode_secs = t0.elapsed().as_secs_f64();
 
+    // PER-CHILD BREAKDOWN, env-gated. `in_memory_bytes` is one total, which cannot answer what the
+    // string part alone costs. Offsets in Vortex are a separate child with their own integer
+    // encoding (`compress_offsets` picks delta-plus-bitpack or plain per column and keeps the
+    // smaller), so a string-codec comparison can legitimately report codes and dictionary without
+    // them -- and on short-row columns it has to, or every technique's ratio ends up measuring how
+    // well it compresses offsets rather than strings. Emitted per chunk rather than reduced here,
+    // so the choice of basis is made in post-processing over measured components.
+    //
+    // Errors propagate. The first version swallowed both the open and the write, which would have
+    // returned a leg that looked complete and a file that was empty or short -- the same shape of
+    // failure the whole change is meant to remove.
+    if let Ok(path) = std::env::var("ONPAIR_CHILD_BYTES") {
+        use std::io::Write;
+        let file = std::fs::OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open(&path)
+            .with_context(|| format!("ONPAIR_CHILD_BYTES: open {path} failed"))?;
+        let mut w = std::io::BufWriter::new(file);
+        for (chunk_idx, op) in onpairs.iter().enumerate() {
+            // FULL CELL IDENTITY on every row. dataset/column/bits alone collide across the chunk
+            // size and threshold arms of the same suite, and a reducer that groups on the short
+            // key silently keeps whichever row it read last.
+            writeln!(
+                w,
+                "{{\"dataset\":\"{dataset_id}\",\"column\":\"{column}\",\"bits\":{bits},\
+                 \"chunk_bytes\":{chunk_bytes},\"threshold\":{threshold},\
+                 \"training_seed\":{training_seed},\"chunk_idx\":{chunk_idx},\
+                 \"codes\":{},\"codes_offsets\":{},\"dict_offsets\":{},\
+                 \"lengths\":{},\"dict\":{},\"total\":{}}}",
+                op.codes().nbytes(),
+                op.codes_offsets().nbytes(),
+                op.dict_offsets().nbytes(),
+                op.uncompressed_lengths().nbytes(),
+                op.dict_bytes().len(),
+                op.clone().into_array().nbytes(),
+            )
+            .with_context(|| format!("ONPAIR_CHILD_BYTES: write {path} failed"))?;
+        }
+        w.flush()
+            .with_context(|| format!("ONPAIR_CHILD_BYTES: flush {path} failed"))?;
+    }
+
     let in_memory_bytes: u64 = onpairs
         .iter()
         .map(|a| a.clone().into_array().nbytes())
         .sum();
+
+    // SIDECAR, ON EVERY CELL. The per-batch output-position offsets are a write-time commitment
+    // this codec makes and FSST-12's stored size now carries the same measurement, so leaving it
+    // to an env-gated block meant most cells could not say what their own basis was. Sized here at
+    // the authoritative granularity; reported beside in_memory_bytes rather than inside it, so no
+    // previously-recorded field changes meaning.
+    let sidecar_tok_per_batch = offset_batch_granularities()?[0];
+    let sidecar_bytes: u64 = {
+        let mut ctx = SESSION.create_execution_ctx();
+        let compressor = BtrBlocksCompressor::default();
+        let mut acc = 0u64;
+        for op in &onpairs {
+            acc += onpair_sidecar_bytes(op, sidecar_tok_per_batch, &mut ctx, &compressor)?;
+        }
+        acc
+    };
     let dict_bytes: u64 = onpairs.iter().map(|a| a.dict_bytes().len() as u64).sum();
     let n_chunks = onpairs.len();
 
@@ -988,16 +1071,7 @@ async fn run_cell(
         // ONE encode is nearly free -- the prefix sum is trivial beside decompressing the codes --
         // and it is the only way to state what the choice of K costs rather than asserting it. The
         // FIRST value is authoritative for anything that folds the sidecar into a stored total.
-        let grans: Vec<usize> = std::env::var("ONPAIR_OFFSET_BATCH")
-            .ok()
-            .map(|v| {
-                v.split(',')
-                    .filter_map(|t| t.trim().parse::<usize>().ok())
-                    .filter(|&n| n > 0)
-                    .collect::<Vec<_>>()
-            })
-            .filter(|v: &Vec<usize>| !v.is_empty())
-            .unwrap_or_else(|| vec![192]);
+        let grans = offset_batch_granularities()?;
         let mut ctx = SESSION.create_execution_ctx();
         let compressor = BtrBlocksCompressor::default();
         let file = std::fs::OpenOptions::new()
@@ -1192,6 +1266,8 @@ async fn run_cell(
         // the same measurement for it; reporting a second identical number would imply a
         // distinction that does not exist here.
         mem_ratio_container_matched: None,
+        sidecar_bytes: Some(sidecar_bytes),
+        sidecar_tok_per_batch: Some(sidecar_tok_per_batch),
         disk_ratio: ratio(sample.raw_bytes, on_disk_bytes),
         verified,
         onpair_only,
@@ -7060,6 +7136,101 @@ fn fsst12_btrblocks_code_bytes(codes: &[u16], ctx: &mut ExecutionCtx) -> Result<
 ///
 /// Not cuda-gated: it is CPU compression, and keeping it reachable without a CUDA toolchain
 /// is what lets the fix be tested where it was written.
+/// The sidecar granularities requested by `ONPAIR_OFFSET_BATCH`, or the shipped default.
+///
+/// ONE parser, and a strict one. There used to be two, written apart and disagreeing: the OnPair
+/// sweep dropped unparsable entries and the FSST path read only the first, and both fell open to
+/// their own default. So `192,typo,32` silently measured two of the three points that were asked
+/// for, and `0,192` put the two codecs on different granularities inside one table -- in each case
+/// the leg completed and the numbers looked ordinary. A granularity nobody chose is the failure
+/// this whole change exists to remove, so an unreadable list is an error, not a fallback.
+///
+/// A batch is `32*K` codes, so the shipped K=6 is 192. The FIRST entry is authoritative for
+/// anything folded into a stored total, on both codecs; the rest are sweep points.
+fn offset_batch_granularities() -> Result<Vec<usize>> {
+    let Ok(raw) = std::env::var("ONPAIR_OFFSET_BATCH") else {
+        return Ok(vec![192]);
+    };
+    let mut out = Vec::new();
+    for tok in raw.split(',') {
+        let n: usize = tok.trim().parse().with_context(|| {
+            format!("ONPAIR_OFFSET_BATCH: '{}' in '{raw}' is not an integer", tok.trim())
+        })?;
+        if n == 0 {
+            anyhow::bail!("ONPAIR_OFFSET_BATCH: a batch of 0 codes is not a granularity");
+        }
+        if out.contains(&n) {
+            anyhow::bail!("ONPAIR_OFFSET_BATCH: '{raw}' repeats {n}");
+        }
+        out.push(n);
+    }
+    if out.is_empty() {
+        anyhow::bail!("ONPAIR_OFFSET_BATCH is set but empty");
+    }
+    Ok(out)
+}
+
+/// Stored size of the per-batch output-position sidecar for one OnPair chunk.
+///
+/// The counterpart of [`fsst12_sidecar_bytes`], and deliberately the same construction: one u64 per
+/// batch of `tok_per_batch` codes holding the running decoded-byte total, then `compress_offsets`,
+/// the delta-or-plain keep-the-smaller path the OnPair children themselves take. The two codecs'
+/// sidecars have to be measured by one instrument, or the comparison is between instruments.
+///
+/// Called unconditionally, not under `ONPAIR_OFFSET_COST`, so every cell records what its own
+/// sidecar costs. The gated block measures the same quantity across a list of granularities and
+/// times the scan as well; this only sizes it at the authoritative one.
+fn onpair_sidecar_bytes(
+    op: &OnPairArray,
+    tok_per_batch: usize,
+    ctx: &mut ExecutionCtx,
+    compressor: &BtrBlocksCompressor,
+) -> Result<u64> {
+    use vortex::array::match_each_integer_ptype;
+
+    let codes_arr = op.codes().clone().execute::<PrimitiveArray>(ctx)?;
+    if codes_arr.is_empty() {
+        return Ok(0);
+    }
+    let codes_u16: Vec<u16> = match_each_integer_ptype!(codes_arr.ptype(), |P| {
+        codes_arr
+            .as_slice::<P>()
+            .iter()
+            .map(|&v| v as u16)
+            .collect()
+    });
+    let dict_offsets_arr = op.dict_offsets().clone().execute::<PrimitiveArray>(ctx)?;
+    let dict_offsets: Vec<u64> = match_each_integer_ptype!(dict_offsets_arr.ptype(), |P| {
+        dict_offsets_arr
+            .as_slice::<P>()
+            .iter()
+            .map(|&v| v as u64)
+            .collect()
+    });
+    let n_entries = dict_offsets.len().saturating_sub(1);
+    let n_batches = codes_u16.len().div_ceil(tok_per_batch);
+    let mut off = Vec::with_capacity(n_batches);
+    let mut acc = 0u64;
+    for (i, &c) in codes_u16.iter().enumerate() {
+        if i % tok_per_batch == 0 {
+            off.push(acc);
+        }
+        // As in the FSST-12 sidecar: a code past the dictionary is a corrupt code stream, and the
+        // sidecar built from it would be wrong rather than absent.
+        anyhow::ensure!(
+            (c as usize) < n_entries,
+            "OnPair sidecar: code {c} at index {i} is outside the {n_entries}-entry dictionary"
+        );
+        acc += dict_offsets[c as usize + 1] - dict_offsets[c as usize];
+    }
+    let arr = compress_offsets(
+        &PrimitiveArray::from_iter(off.into_iter()).into_array(),
+        compressor,
+        ctx,
+    )?;
+    Ok(arr.nbytes() as u64)
+}
+
 /// Stored size of the per-batch output-position sidecar for an FSST-12 code stream.
 ///
 /// The OnPair path measures this inside its `ONPAIR_OFFSET_COST` block, but FSST-12 goes through
@@ -7072,14 +7243,10 @@ fn fsst12_sidecar_bytes(codes: &[u16], lens: &[u8], ctx: &mut ExecutionCtx) -> R
     if codes.is_empty() {
         return Ok(0);
     }
-    // Same list semantics as the OnPair path, and the same default. The FIRST entry is the one
-    // that folds into Fsst12StoredSize, so both codecs commit to the same granularity when the
-    // sidecar is counted as stored metadata; the rest of the list is for the OnPair sweep only.
-    let tok_per_batch: usize = std::env::var("ONPAIR_OFFSET_BATCH")
-        .ok()
-        .and_then(|v| v.split(',').next().and_then(|t| t.trim().parse::<usize>().ok()))
-        .filter(|&n| n > 0)
-        .unwrap_or(192);
+    // The FIRST entry is the one that folds into Fsst12StoredSize, so both codecs commit to the
+    // same granularity when the sidecar is counted as stored metadata; the rest of the list is
+    // for the OnPair sweep only.
+    let tok_per_batch = offset_batch_granularities()?[0];
     let n_batches = codes.len().div_ceil(tok_per_batch);
     let mut off = Vec::with_capacity(n_batches);
     let mut acc = 0u64;
@@ -7087,7 +7254,16 @@ fn fsst12_sidecar_bytes(codes: &[u16], lens: &[u8], ctx: &mut ExecutionCtx) -> R
         if i % tok_per_batch == 0 {
             off.push(acc);
         }
-        acc += lens[c as usize] as u64;
+        // A code outside the symbol table is a corrupt code stream, and the sidecar built from it
+        // would be silently wrong. Panicking here would report that as an index panic inside a
+        // benchmark; naming it is more useful.
+        let len = *lens.get(c as usize).ok_or_else(|| {
+            anyhow::anyhow!(
+                "FSST-12 sidecar: code {c} at index {i} is outside the {}-entry symbol table",
+                lens.len()
+            )
+        })?;
+        acc += len as u64;
     }
     let compressor = BtrBlocksCompressor::default();
     let arr = compress_offsets(

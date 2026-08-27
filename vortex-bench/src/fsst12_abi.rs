@@ -347,8 +347,13 @@ pub struct Fsst12StoredSize {
     /// is the one that isolates the codec.
     pub codes_btrblocks: usize,
     /// Stored size of the per-batch output-position sidecar, at the granularity
-    /// `ONPAIR_OFFSET_BATCH` selects. Counted as codec metadata, the same way the symbol table
-    /// is: FastPair cannot place a batch's output without it. Zero when unmeasured.
+    /// `ONPAIR_OFFSET_BATCH` selects. Zero when unmeasured.
+    ///
+    /// REPORTED BESIDE THE TOTALS, NOT INSIDE THEM. It was briefly summed into both totals, which
+    /// put the two codecs back on different bases in the opposite direction: OnPair's
+    /// `in_memory_bytes` is the Vortex container and has never carried a sidecar, so FSST-12 alone
+    /// would have been charged for one. Both codecs now carry it as a separate measured component
+    /// and the reducer adds it to both or to neither. The paper's figure counts it on both.
     pub sidecar: usize,
 }
 
@@ -356,18 +361,22 @@ impl Fsst12StoredSize {
     /// Native total: FSST-12 stored as its reference implementation stores it, with codes in
     /// dense 12-bit packing. This is the honest figure to compare against published FSST
     /// numbers, and the pessimistic one to compare against OnPair-in-Vortex.
+    ///
+    /// Excludes [`Self::sidecar`]; see that field.
     pub fn total(&self) -> usize {
-        self.packed_codes + self.row_offsets + self.table + self.sidecar
+        self.packed_codes + self.row_offsets + self.table
     }
 
     /// Container-matched total: the code stream measured by the same instrument as OnPair's,
     /// so the comparison isolates the codec rather than the storage format. Falls back to the
     /// native total when `codes_btrblocks` was not measured.
+    ///
+    /// Excludes [`Self::sidecar`]; see that field.
     pub fn total_container_matched(&self) -> usize {
         if self.codes_btrblocks == 0 {
             return self.total();
         }
-        self.codes_btrblocks + self.row_offsets + self.table + self.sidecar
+        self.codes_btrblocks + self.row_offsets + self.table
     }
 }
 
