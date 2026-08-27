@@ -1082,6 +1082,13 @@ async fn run_cell(
         let mut w = std::io::BufWriter::new(file);
         for (chunk_idx, op) in onpairs.iter().enumerate() {
             let codes_arr = op.codes().clone().execute::<PrimitiveArray>(&mut ctx)?;
+            // Mirror the FSST helper's early return rather than handing an empty array to
+            // compress_offsets. A mixed column can produce an all-empty chunk, and the two codecs
+            // must agree that its sidecar costs nothing without depending on what the compressor
+            // does with a zero-length input.
+            if codes_arr.is_empty() {
+                continue;
+            }
             let codes_u16: Vec<u16> = match_each_integer_ptype!(codes_arr.ptype(), |P| {
                 codes_arr
                     .as_slice::<P>()
@@ -1104,6 +1111,33 @@ async fn run_cell(
             let lens: Vec<u32> = (0..dict_offsets_u64.len().saturating_sub(1))
                 .map(|i| (dict_offsets_u64[i + 1] - dict_offsets_u64[i]) as u32)
                 .collect();
+            // (Q3) Cost of the in-memory fixed-stride dictionary repack: scatter the packed
+            // dictionary bytes into MAX_TOKEN_SIZE-wide slots, the exact host build the CUDA
+            // decode consumes as `dict_padded`.
+            //
+            // OUTSIDE THE GRANULARITY LOOP, because the dictionary does not depend on the batch
+            // size. Timed inside it, a three-value sweep ran twenty-one repacks and wrote three
+            // different noisy figures into three records that differ only in K -- a reducer
+            // comparing total load cost by granularity would have read cache order as a K effect.
+            // The one measurement is repeated verbatim in each record; `repack_ns` is
+            // granularity-independent.
+            let dict_bytes_host: &[u8] = op.dict_bytes().as_slice();
+            let dict_entries = dict_offsets_u64.len().saturating_sub(1);
+            let dict_padded_bytes = dict_entries * vortex_onpair::MAX_TOKEN_SIZE;
+            let mut repack_ns = Vec::with_capacity(REPS);
+            let mut dict_padded = vec![0u8; dict_padded_bytes];
+            for _ in 0..REPS {
+                let t = Instant::now();
+                for i in 0..dict_entries {
+                    let start = dict_offsets_u64[i] as usize;
+                    let end = dict_offsets_u64[i + 1] as usize;
+                    dict_padded[i * vortex_onpair::MAX_TOKEN_SIZE
+                        ..i * vortex_onpair::MAX_TOKEN_SIZE + (end - start)]
+                        .copy_from_slice(&dict_bytes_host[start..end]);
+                }
+                repack_ns.push(t.elapsed().as_nanos() as u64);
+                std::hint::black_box(&dict_padded);
+            }
             for &TOK_PER_BATCH in &grans {
                 let total_tokens = codes_u16.len();
                 let n_batches = total_tokens.div_ceil(TOK_PER_BATCH);
@@ -1144,30 +1178,10 @@ async fn run_cell(
                     decompress_ns.push(t.elapsed().as_nanos() as u64);
                     std::hint::black_box(dec.len());
                 }
-                // (Q3) Cost of the in-memory fixed-stride dictionary repack: scatter the
-                // packed dictionary bytes into MAX_TOKEN_SIZE-wide slots, the exact host
-                // build the CUDA decode consumes as `dict_padded`.
-                let dict_bytes_host: &[u8] = op.dict_bytes().as_slice();
-                let dict_entries = dict_offsets_u64.len().saturating_sub(1);
-                let dict_padded_bytes = dict_entries * vortex_onpair::MAX_TOKEN_SIZE;
-                let mut repack_ns = Vec::with_capacity(REPS);
-                let mut dict_padded = vec![0u8; dict_padded_bytes];
-                for _ in 0..REPS {
-                    let t = Instant::now();
-                    for i in 0..dict_entries {
-                        let start = dict_offsets_u64[i] as usize;
-                        let end = dict_offsets_u64[i + 1] as usize;
-                        dict_padded[i * vortex_onpair::MAX_TOKEN_SIZE
-                            ..i * vortex_onpair::MAX_TOKEN_SIZE + (end - start)]
-                            .copy_from_slice(&dict_bytes_host[start..end]);
-                    }
-                    repack_ns.push(t.elapsed().as_nanos() as u64);
-                    std::hint::black_box(&dict_padded);
-                }
                 let chunk_compressed = op.clone().into_array().nbytes();
                 writeln!(
                     w,
-                    "{{\"dataset\":\"{dataset_id}\",\"column\":\"{column}\",\"bits\":{bits},\"chunk\":{chunk_idx},\"tok_per_batch\":{TOK_PER_BATCH},\"total_tokens\":{total_tokens},\"n_batches\":{n_batches},\"decoded_bytes\":{decoded_bytes},\"compressed_bytes\":{chunk_compressed},\"offset_raw_u64\":{},\"offset_raw_u32\":{},\"offset_compressed_bytes\":{off_compressed},\"dict_entries\":{dict_entries},\"dict_padded_bytes\":{dict_padded_bytes},\"gen_ns\":{:?},\"decompress_ns\":{:?},\"repack_ns\":{:?}}}",
+                    "{{\"dataset\":\"{dataset_id}\",\"column\":\"{column}\",\"bits\":{bits},\"chunk\":{chunk_idx},\"tok_per_batch\":{TOK_PER_BATCH},\"total_tokens\":{total_tokens},\"n_batches\":{n_batches},\"decoded_bytes\":{decoded_bytes},\"compressed_bytes\":{chunk_compressed},\"offset_raw_u64\":{},\"offset_raw_u32\":{},\"offset_compressed_bytes\":{off_compressed},\"dict_entries\":{dict_entries},\"dict_padded_bytes\":{dict_padded_bytes},\"gen_ns\":{:?},\"decompress_ns\":{:?},\"repack_ns\":{:?},\"repack_granularity_independent\":true}}",
                     n_batches * 8,
                     n_batches * 4,
                     gen_ns,
@@ -7154,7 +7168,10 @@ fn offset_batch_granularities() -> Result<Vec<usize>> {
     let mut out = Vec::new();
     for tok in raw.split(',') {
         let n: usize = tok.trim().parse().with_context(|| {
-            format!("ONPAIR_OFFSET_BATCH: '{}' in '{raw}' is not an integer", tok.trim())
+            format!(
+                "ONPAIR_OFFSET_BATCH: '{}' in '{raw}' is not an integer",
+                tok.trim()
+            )
         })?;
         if n == 0 {
             anyhow::bail!("ONPAIR_OFFSET_BATCH: a batch of 0 codes is not a granularity");

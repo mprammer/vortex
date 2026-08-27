@@ -79,14 +79,29 @@ def dump_column(dataset_id: str, column: str, out_path: str, cap: int = DEFAULT_
 
 
 def dump_column_prefixed(dataset_id: str, column: str, out_path: str,
-                         cap: int = DEFAULT_CAP) -> tuple[int, int]:
-    """Write the column as a u32-length-prefixed record stream. Returns (payload, file) bytes.
+                         cap: int = DEFAULT_CAP) -> tuple[int, int, int]:
+    """Write the column as a u32-length-prefixed record stream.
+
+    Returns (payload_bytes, file_bytes, rows).
 
     WHY. The flat dump above loses row boundaries, so a compressor fed from it is measured on a
     byte stream rows cannot be recovered from -- while nvCOMP Zstd prefixes every string with a u32
     length ("the same as what Parquet does") and OnPair stores row-to-code offsets. That put the
-    hardware DE on a basis no other technique used. This dumper closes it: same bytes, same cap on
-    the PAYLOAD, plus the row structure every other technique already pays for.
+    hardware DE on a basis no other technique used. This dumper closes it: same rows, same bytes,
+    plus the row structure every other technique already pays for.
+
+    THE SAME SAMPLE AS RUST, NOT MERELY THE SAME BYTE COUNT. The Rust `Sample` stops BEFORE the
+    first row whose bytes would cross the cap; it never splits one. Truncating instead produced a
+    stream that framed correctly, matched on payload bytes -- so `de_stage.py` accepted it -- and
+    still held a different set of rows: `["abc", "", "d"]` at cap 3 gave Rust two rows and this
+    dumper one. A row count is returned so the two can be compared on row structure rather than on
+    a byte total that agrees for the wrong reason. Zero-length rows never cross, so they are kept,
+    which is also what Rust does.
+
+    NULLS ARE REFUSED, NOT SKIPPED. This framing has no validity channel, so a null row can only be
+    dropped (losing a row Rust keeps) or written as empty (losing the distinction). Both are
+    decisions about what is being measured, and neither should be made silently by a dumper. No
+    column in the corpus is nullable; if one becomes so, represent validity deliberately.
 
     The cap counts payload only, so the file is larger than `cap` by 4 bytes per row. The bench must
     be told the payload size (NVCOMP_PAYLOAD_BYTES) or it will treat prefix bytes as decoded output.
@@ -99,45 +114,54 @@ def dump_column_prefixed(dataset_id: str, column: str, out_path: str,
     tmp = out_path + ".part"
     payload = 0
     written = 0
+    rows = 0
+    done = False
     with open(tmp, "wb") as out:
         for b in pq.ParquetFile(parquet).iter_batches(batch_size=1 << 20, columns=[column]):
             for v in b.column(0).to_pylist():
                 if v is None:
-                    continue
+                    raise ValueError(
+                        f"{dataset_id}/{column} row {rows} is null; the u32-length framing has no "
+                        "validity channel (see dump_column_prefixed)"
+                    )
                 raw = v.encode("utf-8")
-                if payload + len(raw) > cap:
-                    raw = raw[: cap - payload]
-                    if not raw:
-                        break
+                if raw and payload + len(raw) > cap:
+                    done = True   # stop BEFORE it, as the Rust sampler does; never split a row
+                    break
                 out.write(struct.pack("<I", len(raw)))
                 out.write(raw)
                 payload += len(raw)
                 written += 4 + len(raw)
-                if payload >= cap:
-                    break
-            if payload >= cap:
+                rows += 1
+            if done:
                 break
     Path(tmp).replace(out_path)
-    return payload, written
+    return payload, written, rows
 
 
 def main(argv: list[str]) -> int:
+    # OPTIONS FIRST. `cap = int(argv[4])` used to run before --length-prefix was removed, so the
+    # natural `dump_columns.py ds col out --length-prefix` died on an uncaught ValueError.
+    prefixed = "--length-prefix" in argv
+    argv = [a for a in argv if a != "--length-prefix"]
     if len(argv) < 4:
-        print("usage: dump_columns.py <dataset_id> <column> <out_path> [cap_bytes]", file=sys.stderr)
+        print("usage: dump_columns.py <dataset_id> <column> <out_path> [cap_bytes] "
+              "[--length-prefix]\n"
+              "  --length-prefix  u32-length-framed records; prints 'payload file rows' on stdout",
+              file=sys.stderr)
         return 2
     ds, col, out = argv[1], argv[2], argv[3]
     cap = int(argv[4]) if len(argv) > 4 else DEFAULT_CAP
-    if "--length-prefix" in argv:
-        argv = [a for a in argv if a != "--length-prefix"]
+    if prefixed:
         try:
-            payload, fbytes = dump_column_prefixed(ds, col, out, cap)
+            payload, fbytes, rows = dump_column_prefixed(ds, col, out, cap)
         except KeyError:
             print(f"unknown column: {ds}/{col}", file=sys.stderr)
             return 2
         except FileNotFoundError as e:
             print(str(e), file=sys.stderr)
             return 3
-        print(f"{payload} {fbytes}")
+        print(f"{payload} {fbytes} {rows}")
         return 0
     try:
         n = dump_column(ds, col, out, cap)
