@@ -837,8 +837,14 @@ async fn run_cell_fsst12(
         stored.codes_btrblocks = fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
         // Per-batch output-position sidecar, at the same granularity the OnPair path uses, so the
         // two codecs can be compared with it counted as stored codec metadata.
-        stored.sidecar =
-            fsst12_sidecar_bytes(&inputs.codes_u16, &inputs.lens_table, &mut ctx)? as usize;
+        // The FIRST granularity is the one that folds into a stored total, so both codecs commit
+        // to the same write-time K; the rest of the list is the OnPair sweep only.
+        stored.sidecar = fsst12_sidecar_bytes(
+            &inputs.codes_u16,
+            &inputs.lens_table,
+            offset_batch_granularities()?[0],
+            &mut ctx,
+        )? as usize;
         sidecar_total += stored.sidecar as u64;
         // An all-empty chunk yields no codes, and the optimized kernels would compute a
         // zero-width grid and launch it anyway. Skip staging it: there is nothing to decode,
@@ -7162,9 +7168,17 @@ fn fsst12_btrblocks_code_bytes(codes: &[u16], ctx: &mut ExecutionCtx) -> Result<
 /// A batch is `32*K` codes, so the shipped K=6 is 192. The FIRST entry is authoritative for
 /// anything folded into a stored total, on both codecs; the rest are sweep points.
 fn offset_batch_granularities() -> Result<Vec<usize>> {
-    let Ok(raw) = std::env::var("ONPAIR_OFFSET_BATCH") else {
-        return Ok(vec![192]);
-    };
+    match std::env::var("ONPAIR_OFFSET_BATCH") {
+        Ok(raw) => parse_offset_batch(&raw),
+        Err(_) => Ok(vec![DEFAULT_TOK_PER_BATCH]),
+    }
+}
+
+/// The shipped granularity: K=6, and a warp batch is `32*K` codes.
+const DEFAULT_TOK_PER_BATCH: usize = 192;
+
+/// [`offset_batch_granularities`] without the environment, so the grammar itself is testable.
+fn parse_offset_batch(raw: &str) -> Result<Vec<usize>> {
     let mut out = Vec::new();
     for tok in raw.split(',') {
         let n: usize = tok.trim().parse().with_context(|| {
@@ -7254,16 +7268,18 @@ fn onpair_sidecar_bytes(
 /// `run_cell_fsst12` and so never got one -- which left the two codecs on different bases when the
 /// sidecar is counted as stored metadata. Same construction as the OnPair block: one u64 per batch
 /// of `tok_per_batch` codes holding the running decoded-byte total, then `compress_offsets`, which
-/// is the same delta-or-plain keep-the-smaller path the OnPair children use. Granularity comes from
-/// ONPAIR_OFFSET_BATCH so both codecs can be measured at the same write-time commitment to K.
-fn fsst12_sidecar_bytes(codes: &[u16], lens: &[u8], ctx: &mut ExecutionCtx) -> Result<u64> {
+/// is the same delta-or-plain keep-the-smaller path the OnPair children use. The caller passes the
+/// granularity so both codecs can be measured at the same write-time commitment to K, and so the
+/// construction can be exercised without reaching into the environment.
+fn fsst12_sidecar_bytes(
+    codes: &[u16],
+    lens: &[u8],
+    tok_per_batch: usize,
+    ctx: &mut ExecutionCtx,
+) -> Result<u64> {
     if codes.is_empty() {
         return Ok(0);
     }
-    // The FIRST entry is the one that folds into Fsst12StoredSize, so both codecs commit to the
-    // same granularity when the sidecar is counted as stored metadata; the rest of the list is
-    // for the OnPair sweep only.
-    let tok_per_batch = offset_batch_granularities()?[0];
     let n_batches = codes.len().div_ceil(tok_per_batch);
     let mut off = Vec::with_capacity(n_batches);
     let mut acc = 0u64;
@@ -10008,5 +10024,83 @@ mod fsst12_inputs_tests {
         // Accounting is the comparable-to-OnPair total, not the bare payload.
         assert!(stored.total() > stored.packed_codes);
         assert!(stored.row_offsets > 0 && stored.table > 0);
+    }
+
+    /// An empty chunk costs nothing, on BOTH codecs, without depending on what the offset
+    /// compressor does with a zero-length input. A mixed column can produce an all-empty chunk,
+    /// and the two paths have to agree on it, or the comparison acquires a difference that is an
+    /// artifact of the instrument.
+    #[test]
+    fn empty_code_stream_has_no_sidecar() {
+        let mut ctx = SESSION.create_execution_ctx();
+        assert_eq!(
+            fsst12_sidecar_bytes(&[], &[3u8; 16], 192, &mut ctx).expect("empty sidecar"),
+            0
+        );
+    }
+
+    /// One entry per batch of `tok_per_batch` codes, at every boundary case: a single partial
+    /// batch, an exactly-divisible count, and a remainder. The stored size is compressed, so this
+    /// asserts the shape rather than a byte count -- what must hold is that the granularity is
+    /// honoured at all, since an implementation ignoring the argument returns the same bytes.
+    ///
+    /// LENGTHS ARE IRREGULAR ON PURPOSE. With a token-length cycle that divides the batch size,
+    /// every batch decodes to the same number of bytes, the offsets are an exact arithmetic
+    /// sequence, and `compress_offsets` represents it in metadata alone -- `nbytes()` then reports
+    /// 0. That is the compressor being right about degenerate input, not the sidecar being free;
+    /// no real column produces it. The irregular series here stores about 1.07 B per entry, which
+    /// is the figure the paper's sidecar fractions are built from.
+    #[test]
+    fn sidecar_batch_boundaries_and_granularity() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let lens: Vec<u8> = (0..256u32).map(|i| ((i * 7919) % 13 + 1) as u8).collect();
+
+        for n in [1usize, 192, 193, 384, 385] {
+            let codes: Vec<u16> = (0..n).map(|i| ((i * 31) % 256) as u16).collect();
+            let b = fsst12_sidecar_bytes(&codes, &lens, 192, &mut ctx).expect("sidecar");
+            assert!(b > 0, "{n} codes must produce a measured sidecar, not zero");
+        }
+
+        // Six times as many entries at 32 as at 192, so the stored sidecar cannot be smaller.
+        // This is the property the paper puts a number on.
+        let codes: Vec<u16> = (0..100_000usize).map(|i| ((i * 31) % 256) as u16).collect();
+        let coarse = fsst12_sidecar_bytes(&codes, &lens, 192, &mut ctx).expect("coarse");
+        let fine = fsst12_sidecar_bytes(&codes, &lens, 32, &mut ctx).expect("fine");
+        assert!(
+            fine > coarse,
+            "a 32-code batch stores six times the entries of a 192-code batch, so it cannot be \
+             smaller: fine={fine} coarse={coarse}"
+        );
+    }
+
+    /// A code past the end of the symbol table is a corrupt code stream. It used to index out of
+    /// bounds, reporting a real data defect as an index panic inside a benchmark.
+    #[test]
+    fn sidecar_rejects_a_code_outside_the_symbol_table() {
+        let mut ctx = SESSION.create_execution_ctx();
+        let err = fsst12_sidecar_bytes(&[0, 1, 9], &[4u8; 4], 192, &mut ctx)
+            .expect_err("code 9 is outside a 4-entry table");
+        assert!(
+            err.to_string().contains("outside the 4-entry symbol table"),
+            "unhelpful error: {err}"
+        );
+    }
+
+    /// The grammar, which used to fail open in two different ways. Every rejected case here is one
+    /// that previously produced a completed leg measured at a granularity nobody chose.
+    #[test]
+    fn offset_batch_grammar_is_strict() {
+        assert_eq!(parse_offset_batch("192").unwrap(), vec![192]);
+        assert_eq!(
+            parse_offset_batch("192,128,32").unwrap(),
+            vec![192, 128, 32]
+        );
+        assert_eq!(parse_offset_batch(" 192 , 128 ").unwrap(), vec![192, 128]);
+        for bad in ["192,typo,32", "0,192", "", ",128", "128,", "192,192", "-32"] {
+            assert!(
+                parse_offset_batch(bad).is_err(),
+                "'{bad}' must be rejected, not silently reduced"
+            );
+        }
     }
 }
