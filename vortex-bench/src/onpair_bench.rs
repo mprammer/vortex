@@ -124,6 +124,35 @@ const NVCOMP_ZSTD_LEVEL: i32 = -10;
 // the dominance claim is tested against the ratio range Zstd actually reaches.
 const NVCOMP_ZSTD_LEVELS: &[i32] = &[-10, 1, 3, 9, 19];
 
+// FRAME SIZE IS AN AXIS, AND IT WAS PINNED. NVCOMP_ZSTD_VALUES_PER_FRAME fixed the frame at 2048
+// VALUES, which in bytes lands anywhere from 24 KiB (l_shipinstruct, 12 B rows) to 483 KiB
+// (Loghub Windows, 242 B rows) -- a 20x spread across the corpus, and below NVIDIA's own 64 KiB
+// "good starting chunk size" on two columns. The DE is swept over a fixed BYTE grid on every
+// column; Zstd was not, so its oracle was never searched on this axis. nvCOMP's release notes
+// record Zstd's max chunk rising from 64 KB to 16 MB and ratio gains "up to 30% on 512 KB
+// chunks", so the axis is documented as consequential.
+//
+// Targets are BYTES, converted per column to a value count from that column's mean row length,
+// which is what puts Zstd on the same axis as the DE rather than a per-column-varying one.
+#[cfg(feature = "cuda")]
+const NVCOMP_ZSTD_FRAME_BYTES: &[usize] =
+    &[32768, 65536, 131072, 262144, 524288, 1048576, 2097152];
+
+/// Byte targets for the Zstd frame sweep, or the pinned legacy point when unset.
+/// `NVCOMP_ZSTD_FRAME_BYTES=65536,524288` narrows it; unset sweeps the DE grid.
+#[cfg(feature = "cuda")]
+fn nvcomp_zstd_frame_targets() -> Vec<Option<usize>> {
+    match std::env::var("NVCOMP_ZSTD_FRAME_BYTES") {
+        Ok(raw) if raw.trim() == "legacy" => vec![None],
+        Ok(raw) => raw
+            .split(',')
+            .filter_map(|t| t.trim().parse::<usize>().ok())
+            .map(Some)
+            .collect(),
+        Err(_) => NVCOMP_ZSTD_FRAME_BYTES.iter().copied().map(Some).collect(),
+    }
+}
+
 /// One row of benchmark output: a single `(column, bits, chunk, threshold)`
 /// cell.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -705,6 +734,78 @@ fn compress_offsets(
     } else {
         plain
     })
+}
+
+/// FSST-12's stored footprint by component, computed HOST-SIDE for one column.
+///
+/// WHY THIS EXISTS SEPARATELY FROM THE CELL PATH. Section 5 excludes the row-offsets array from
+/// the reported compression ratio, on the ground that bulk decompression never reads it. Applying
+/// that to FSST-12 needs its components apart, and the committed cells collapse them: they carry
+/// `in_memory_bytes` and `mem_ratio_container_matched` and nothing to subtract from either. The
+/// raw `(rows+1)*8` in `Fsst12StoredSize::row_offsets` is not the stored figure -- the cell path
+/// overwrites it with the `compress_offsets` result -- so it cannot be reconstructed by arithmetic
+/// either. It has to be measured.
+///
+/// None of the arithmetic needs a GPU: `fsst12_abi` carries no CUDA and neither do the three
+/// helpers used below. The CELL path is gated only because it also stages GPU decode inputs. This
+/// is that computation without the staging, so the numbers can be produced on a laptop.
+///
+/// VALIDATE THE RESULT, DO NOT TRUST IT: `codes_btrblocks + row_offsets + table` must equal the
+/// committed cell's container-matched total for the same column, which is
+/// `sample_bytes / mem_ratio_container_matched`. If it does, this split describes the same
+/// artifact the paper already reports and the offsets can be subtracted with confidence.
+pub fn fsst12_stored_components(
+    parquet_path: &Path,
+    column: &str,
+    sample_bytes: u64,
+    chunk_bytes: u64,
+    tok_per_batch: usize,
+) -> Result<std::collections::BTreeMap<String, u64>> {
+    let sample = build_sample(parquet_path, column, sample_bytes)?;
+    let ranges = chunk_ranges(sample.rows, sample.raw_bytes, chunk_bytes);
+    let mut comp: std::collections::BTreeMap<String, u64> = Default::default();
+    comp.insert("rows".into(), sample.rows as u64);
+    comp.insert("sample_bytes".into(), sample.raw_bytes);
+    for r in ranges.iter().cloned() {
+        let slice = sample.array.slice(r)?;
+        let mut ctx = SESSION.create_execution_ctx();
+        let decoded = slice.execute::<VarBinViewArray>(&mut ctx)?;
+        let mut flat: Vec<u8> = Vec::new();
+        let mut spans: Vec<(usize, usize)> = Vec::new();
+        let mut saw_null = false;
+        decoded.with_iterator(|values| {
+            for value in values {
+                match value {
+                    Some(v) => {
+                        let start = flat.len();
+                        flat.extend_from_slice(v);
+                        spans.push((start, flat.len()));
+                    }
+                    None => saw_null = true,
+                }
+            }
+        });
+        anyhow::ensure!(!saw_null, "column {column} contains nulls; FSST-12 carries no validity");
+        let rows: Vec<&[u8]> = spans.iter().map(|&(a, b)| &flat[a..b]).collect();
+        let (inputs, mut stored, _secs) = fsst12_decode_inputs(&rows)?;
+        // Exactly the three corrections the cell path applies, in the same order.
+        stored.row_offsets =
+            fsst12_stored_offset_bytes(&inputs.row_code_offsets, &mut ctx)? as usize;
+        stored.codes_btrblocks = fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
+        stored.sidecar = fsst12_sidecar_bytes(
+            &inputs.codes_u16, &inputs.lens_table, tok_per_batch, &mut ctx)? as usize;
+        for (k, v) in [
+            ("packed_codes", stored.packed_codes),
+            ("codes_btrblocks", stored.codes_btrblocks),
+            ("row_offsets", stored.row_offsets),
+            ("table", stored.table),
+            ("sidecar", stored.sidecar),
+            ("total_container_matched", stored.total_container_matched()),
+        ] {
+            *comp.entry(k.to_string()).or_default() += v as u64;
+        }
+    }
+    Ok(comp)
 }
 
 /// Run the full `bits × chunk_bytes × threshold` matrix for one column.
@@ -6783,6 +6884,7 @@ async fn run_gpu_kernel_bench(
             iterations,
             NVCOMP_ZSTD_LEVEL,
             nvcomp_zstd::DecompressBackend::Hardware,
+            None,
         )
         .await
         .unwrap_or_else(|error| NvcompZstdGpuResult {
@@ -6802,14 +6904,17 @@ async fn run_gpu_kernel_bench(
             decode_ms_iters: Vec::new(),
             decode_ns_iters: Vec::new(),
         });
-        let mut z = Vec::with_capacity(NVCOMP_ZSTD_LEVELS.len());
+        let frame_targets = nvcomp_zstd_frame_targets();
+        let mut z = Vec::with_capacity(NVCOMP_ZSTD_LEVELS.len() * frame_targets.len());
         for &level in NVCOMP_ZSTD_LEVELS {
+          for &frame_bytes in &frame_targets {
             z.push(
                 run_nvcomp_zstd_bench(
                     onpairs,
                     iterations,
                     level,
                     nvcomp_zstd::DecompressBackend::Default,
+                    frame_bytes,
                 )
                 .await
                 .unwrap_or_else(|error| NvcompZstdGpuResult {
@@ -6818,7 +6923,7 @@ async fn run_gpu_kernel_bench(
                     iterations,
                     backend: "default".to_string(),
                     zstd_level: level,
-                    values_per_frame: NVCOMP_ZSTD_VALUES_PER_FRAME,
+                    values_per_frame: 0,
                     raw_bytes: decoded_bytes,
                     compressed_bytes: 0,
                     frames: 0,
@@ -6830,6 +6935,7 @@ async fn run_gpu_kernel_bench(
                     decode_ns_iters: Vec::new(),
                 }),
             );
+          }
         }
         (Some(hw), z)
     };
@@ -7318,6 +7424,92 @@ fn onpair_sidecar_bytes(
     )?;
     Ok(arr.nbytes() as u64)
 }
+
+/// One row of [`onpair_sidecar_by_granularity`]: what one chunk's sidecar costs at one granularity.
+#[derive(Debug, Clone, Serialize)]
+pub struct OnPairSidecarRecord {
+    pub chunk: usize,
+    pub tok_per_batch: usize,
+    pub total_tokens: usize,
+    pub n_batches: usize,
+    pub compressed_bytes: u64,
+    pub offset_compressed_bytes: u64,
+}
+
+/// Stored sidecar footprint for one MATERIALIZED OnPair cell, at several batch granularities.
+///
+/// WHY THIS EXISTS SEPARATELY FROM THE CELL PATH. The reported compression ratio charges the
+/// sidecar at the shipped K=6, or 192 codes per batch, while the plotted decode rate is the best
+/// byte-validated kernel for that column and the kernel sweep varies K. Where the winning kernel
+/// is not K=6, the figure pairs a rate with a stored representation that kernel does not read.
+/// The leg measured 32, 128 and 192 during MATERIALIZE and nothing coarser, so the granularities
+/// several reported kernels actually use -- 224, 256 and 512 -- have no measurement at all.
+///
+/// RECOVERED FROM THE COMMITTED CELLS, NOT BY RE-ENCODING. This reads the cell's own
+/// `part_*.vortex` back and sizes the sidecar over the arrays the leg wrote, so no dictionary is
+/// retrained and the result composes with the leg by construction. That distinction is not
+/// academic: FSST-12's trained dictionary is platform-dependent, and a re-encode on another host
+/// would not be comparable with the committed numbers.
+///
+/// No GPU, for the same reason `fsst12_stored_components` needs none: the sidecar is a prefix sum
+/// over token lengths followed by `compress_offsets`. Both run on a laptop.
+///
+/// VALIDATE THE RESULT, DO NOT TRUST IT. Ask for 192 alongside whatever else you need and diff it
+/// against the leg's own `onpair_offset_cost.jsonl` record for the same column, bit width and
+/// chunk. It reads the same array through the same compressor, so it must reproduce exactly; if it
+/// does not, the read path and the write path disagree and nothing else here is safe to use.
+pub async fn onpair_sidecar_by_granularity(
+    cell_dir: &Path,
+    column: &str,
+    granularities: &[usize],
+) -> Result<Vec<OnPairSidecarRecord>> {
+    for &g in granularities {
+        anyhow::ensure!(g > 0, "onpair sidecar: granularity must be positive, got {g}");
+    }
+    let mut files: Vec<PathBuf> = std::fs::read_dir(cell_dir)
+        .with_context(|| format!("onpair sidecar: read_dir {} failed", cell_dir.display()))?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| {
+            p.extension().is_some_and(|e| e == "vortex")
+                && p.file_name()
+                    .is_some_and(|n| n.to_string_lossy().starts_with("part_"))
+        })
+        .collect();
+    // Sorted, because chunk index is positional: the leg's records are keyed by it and a
+    // directory listing is not ordered.
+    files.sort();
+    anyhow::ensure!(
+        !files.is_empty(),
+        "onpair sidecar: no part_*.vortex under {}",
+        cell_dir.display()
+    );
+
+    let chunks = read_onpair_chunks(&files, column).await?;
+    let mut ctx = SESSION.create_execution_ctx();
+    let compressor = BtrBlocksCompressor::default();
+    let mut out = Vec::with_capacity(chunks.len() * granularities.len());
+    for (chunk, op) in chunks.iter().enumerate() {
+        let compressed_bytes = op.clone().into_array().nbytes() as u64;
+        let total_tokens = op.codes().clone().execute::<PrimitiveArray>(&mut ctx)?.len();
+        for &tok_per_batch in granularities {
+            out.push(OnPairSidecarRecord {
+                chunk,
+                tok_per_batch,
+                total_tokens,
+                n_batches: total_tokens.div_ceil(tok_per_batch),
+                compressed_bytes,
+                offset_compressed_bytes: onpair_sidecar_bytes(
+                    op,
+                    tok_per_batch,
+                    &mut ctx,
+                    &compressor,
+                )?,
+            });
+        }
+    }
+    Ok(out)
+}
+
 
 /// Stored size of the per-batch output-position sidecar for an FSST-12 code stream.
 ///
@@ -8135,6 +8327,7 @@ async fn run_nvcomp_zstd_bench(
     iterations: u64,
     zstd_level: i32,
     backend: nvcomp_zstd::DecompressBackend,
+    frame_bytes: Option<usize>,
 ) -> Result<NvcompZstdGpuResult> {
     let iterations = iterations.max(1);
     let mut setup_ctx = create_cuda_execution_ctx()?;
@@ -8159,10 +8352,19 @@ async fn run_nvcomp_zstd_bench(
     }
 
     let vbv = VarBinViewArray::from_iter_bin(values.iter().map(Vec::as_slice));
+    // A byte target becomes a value count via this column's mean row length, so the frame is the
+    // same SIZE on every column rather than the same row count. Clamped to at least one value.
+    let values_per_frame = match frame_bytes {
+        None => NVCOMP_ZSTD_VALUES_PER_FRAME,
+        Some(target) => {
+            let mean = (raw_bytes as f64 / values.len().max(1) as f64).max(1.0);
+            ((target as f64 / mean).round() as usize).max(1)
+        }
+    };
     let zstd_array = Zstd::from_var_bin_view_without_dict(
         &vbv,
         zstd_level,
-        NVCOMP_ZSTD_VALUES_PER_FRAME,
+        values_per_frame,
         setup_ctx.execution_ctx(),
     )?;
     let opts = nvcomp_zstd::ZstdDecompressOpts { backend };
@@ -8211,7 +8413,7 @@ async fn run_nvcomp_zstd_bench(
         iterations,
         backend: nvcomp_backend_name(backend).to_string(),
         zstd_level,
-        values_per_frame: NVCOMP_ZSTD_VALUES_PER_FRAME,
+        values_per_frame,
         raw_bytes,
         compressed_bytes,
         frames,
