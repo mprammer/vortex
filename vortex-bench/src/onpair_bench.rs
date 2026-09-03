@@ -808,6 +808,62 @@ pub fn fsst12_stored_components(
     Ok(comp)
 }
 
+/// [`fsst12_stored_components`] over rows supplied directly, at several sidecar granularities.
+///
+/// WHY ROWS AND NOT A PARQUET PATH. The campaign's per-column dumps under
+/// `~/data/onpair-campaign-cols` are byte-for-byte the samples the leg trained on -- row count and
+/// payload length match the committed cell on all fifteen columns -- so feeding them in removes
+/// `build_sample` from the comparison entirely. Whatever makes seven columns miss their committed
+/// totals, it is then provably not the sampling.
+///
+/// SEVERAL GRANULARITIES IN ONE CALL because only the sidecar depends on one: the dictionary, the
+/// code stream and the row offsets are trained and compressed once and reused, so this costs one
+/// training pass rather than one per granularity, and guarantees every granularity describes the
+/// same artifact. `total_container_matched` excludes the sidecar, so it is constant across the
+/// returned rows and directly comparable with the cell.
+///
+/// Single chunk, which is what the leg ran: its `chunk1000mb` cells hold a sample under 1 GB, so
+/// `chunk_ranges` yielded one range. Asserted rather than assumed.
+pub fn fsst12_stored_components_from_rows(
+    rows: &[&[u8]],
+    granularities: &[usize],
+    chunk_bytes: u64,
+) -> Result<Vec<(usize, std::collections::BTreeMap<String, u64>)>> {
+    let raw: u64 = rows.iter().map(|r| r.len() as u64).sum();
+    anyhow::ensure!(
+        raw <= chunk_bytes,
+        "fsst12 components: sample of {raw} B exceeds the {chunk_bytes} B chunk, so the leg would \
+         have split it; this path measures a single chunk"
+    );
+    let mut ctx = SESSION.create_execution_ctx();
+    let (inputs, mut stored, _secs) = fsst12_decode_inputs(rows)?;
+    // The same two corrections the cell path applies, in the same order, through the same helpers.
+    stored.row_offsets = fsst12_stored_offset_bytes(&inputs.row_code_offsets, &mut ctx)? as usize;
+    stored.codes_btrblocks = fsst12_btrblocks_code_bytes(&inputs.codes_u16, &mut ctx)? as usize;
+    let mut out = Vec::with_capacity(granularities.len());
+    for &g in granularities {
+        anyhow::ensure!(g > 0, "fsst12 components: granularity must be positive, got {g}");
+        stored.sidecar =
+            fsst12_sidecar_bytes(&inputs.codes_u16, &inputs.lens_table, g, &mut ctx)? as usize;
+        let mut comp: std::collections::BTreeMap<String, u64> = Default::default();
+        for (k, v) in [
+            ("rows", rows.len()),
+            ("sample_bytes", raw as usize),
+            ("tok_per_batch", g),
+            ("packed_codes", stored.packed_codes),
+            ("codes_btrblocks", stored.codes_btrblocks),
+            ("row_offsets", stored.row_offsets),
+            ("table", stored.table),
+            ("sidecar", stored.sidecar),
+            ("total_container_matched", stored.total_container_matched()),
+        ] {
+            comp.insert(k.to_string(), v as u64);
+        }
+        out.push((g, comp));
+    }
+    Ok(out)
+}
+
 /// Run the full `bits × chunk_bytes × threshold` matrix for one column.
 #[expect(clippy::too_many_arguments)]
 pub async fn run_column(
