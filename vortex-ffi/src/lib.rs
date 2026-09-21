@@ -15,6 +15,7 @@ mod error;
 mod expression;
 mod log;
 mod ptype;
+mod read_at;
 mod scalar;
 mod scan;
 mod session;
