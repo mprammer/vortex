@@ -70,6 +70,14 @@ static POOL: LazyLock<CurrentThreadWorkerPool> = LazyLock::new(|| RUNTIME.new_po
 #[macro_export]
 macro_rules! box_wrapper {
     ($(#[$meta:meta])* $T:ty, $ffi_ident:ident) => {
+        $crate::box_wrapper!(@impl $(#[$meta])* $T, $ffi_ident, {});
+    };
+    // Drain the runtime after freeing, for types that own a spawned task. See
+    // `CurrentThreadRuntime::drain`.
+    ($(#[$meta:meta])* $T:ty, $ffi_ident:ident, drain_on_free) => {
+        $crate::box_wrapper!(@impl $(#[$meta])* $T, $ffi_ident, { $crate::RUNTIME.drain(); });
+    };
+    (@impl $(#[$meta:meta])* $T:ty, $ffi_ident:ident, $after_free:block) => {
         paste::paste! {
             $(#[$meta])*
             pub struct $ffi_ident($T);
@@ -121,7 +129,8 @@ macro_rules! box_wrapper {
             #[unsafe(no_mangle)]
             pub unsafe extern "C-unwind" fn [<$ffi_ident _free>](ptr: *const $ffi_ident) {
                 if !ptr.is_null() {
-                    std::mem::drop(unsafe { Box::from_raw(ptr.cast::<$T>().cast_mut()) })
+                    std::mem::drop(unsafe { Box::from_raw(ptr.cast::<$T>().cast_mut()) });
+                    $after_free
                 }
             }
         }

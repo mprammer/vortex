@@ -561,8 +561,8 @@ typedef struct {
      */
     uint64_t len;
     /**
-     * Maximum number of concurrent "read_at" calls. 0 selects a default. The
-     * cap is per-source, so opening many files multiplies it.
+     * Maximum number of concurrent "read_at" calls for this source. 0 selects a
+     * default. A process-wide ceiling applies across all sources as well.
      */
     size_t concurrency;
     /**
@@ -571,13 +571,13 @@ typedef struct {
      */
     vx_view name;
     /**
-     * Required. Must write all "length" bytes at "offset" into "dst" and return
-     * 0, or return non-zero; success without filling "dst" leaks uninitialized
-     * memory into the scan.
+     * Required. Writes "length" bytes at "offset" into "dst" and returns the
+     * count written; a short count or a negative value fails the read.
      */
-    int32_t (*read_at)(void *ctx, uint64_t offset, uint8_t *dst, size_t length);
+    int64_t (*read_at)(void *ctx, uint64_t offset, uint8_t *dst, size_t length);
     /**
-     * Optional. Called once, after Vortex has dropped the source.
+     * Optional. Called once, before the call that drops the source returns -
+     * on that thread, or on a worker thread if any are configured.
      */
     void (*release)(void *ctx);
 } vx_readat;
@@ -937,7 +937,8 @@ vx_data_source_new_buffer(const vx_session *session, const void *buffer, size_t 
  *
  * "reader" is read during this call only; its callbacks and context must stay
  * valid until "release" runs. A rejected descriptor leaves ownership with the
- * caller and never calls "release"; once accepted, "release" always runs.
+ * caller and never calls "release"; once accepted, "release" runs before this
+ * call returns if it fails, and otherwise before vx_data_source_free returns.
  *
  * On error, returns NULL and sets "err".
  */

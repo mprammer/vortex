@@ -50,7 +50,8 @@ box_wrapper!(
     ///
     /// Copying a vx_data_source via vx_data_source_clone is a cheap operation.
     MultiLayoutDataSource,
-    vx_data_source
+    vx_data_source,
+    drain_on_free
 );
 
 /// Options for creating a data source.
@@ -202,7 +203,8 @@ pub unsafe extern "C-unwind" fn vx_data_source_new_buffer(
 ///
 /// "reader" is read during this call only; its callbacks and context must stay
 /// valid until "release" runs. A rejected descriptor leaves ownership with the
-/// caller and never calls "release"; once accepted, "release" always runs.
+/// caller and never calls "release"; once accepted, "release" runs before this
+/// call returns if it fails, and otherwise before vx_data_source_free returns.
 ///
 /// On error, returns NULL and sets "err".
 #[unsafe(no_mangle)]
@@ -211,7 +213,7 @@ pub unsafe extern "C-unwind" fn vx_data_source_new_readat(
     reader: *const vx_readat,
     err: *mut *mut vx_error,
 ) -> *const vx_data_source {
-    try_or(err, ptr::null(), || {
+    let ds = try_or(err, ptr::null(), || {
         vortex_ensure!(!session.is_null());
 
         let session = vx_session::as_ref(session);
@@ -231,7 +233,14 @@ pub unsafe extern "C-unwind" fn vx_data_source_new_readat(
         );
 
         Ok(vx_data_source::new(ds))
-    })
+    });
+
+    // A failure past descriptor validation leaves the reader owned by a spawned
+    // task with no data source to free, so release it here instead.
+    if ds.is_null() {
+        RUNTIME.drain();
+    }
+    ds
 }
 
 /// Increase reference count on vx_data_source
@@ -282,6 +291,13 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
+    use vortex::array::array_session;
+    use vortex::array::arrays::StructArray;
+    use vortex::array::assert_arrays_eq;
+    use vortex_array::VortexSessionExecute;
+
+    use crate::array::vx_array;
+    use crate::array::vx_array_free;
     use crate::data_source::vx_data_source_dtype;
     use crate::data_source::vx_data_source_free;
     use crate::data_source::vx_data_source_get_row_count;
@@ -292,8 +308,13 @@ mod tests {
     use crate::dtype::vx_dtype;
     use crate::dtype::vx_dtype_free;
     use crate::read_at::vx_readat;
+    use crate::scan::vx_data_source_scan;
     use crate::scan::vx_estimate;
     use crate::scan::vx_estimate_type;
+    use crate::scan::vx_partition_free;
+    use crate::scan::vx_partition_next;
+    use crate::scan::vx_scan_free;
+    use crate::scan::vx_scan_next_partition;
     use crate::session::vx_session;
     use crate::session::vx_session_free;
     use crate::session::vx_session_new;
@@ -489,19 +510,19 @@ mod tests {
         offset: u64,
         dst: *mut u8,
         length: usize,
-    ) -> i32 {
+    ) -> i64 {
         let ctx = unsafe { &*ctx.cast::<ReadAtCtx>() };
         let Ok(start) = usize::try_from(offset) else {
-            return 1;
+            return -1;
         };
         let Some(end) = start.checked_add(length) else {
-            return 1;
+            return -1;
         };
         if end > ctx.data.len() {
-            return 1;
+            return -1;
         }
         unsafe { ptr::copy_nonoverlapping(ctx.data[start..end].as_ptr(), dst, length) };
-        0
+        length as i64
     }
 
     unsafe extern "C" fn release_cb(ctx: *mut c_void) {
@@ -516,22 +537,65 @@ mod tests {
         _offset: u64,
         _dst: *mut u8,
         _length: usize,
-    ) -> i32 {
+    ) -> i64 {
         -7
     }
 
-    fn readat_ctx(session: *const vx_session) -> (Box<ReadAtCtx>, u64, tempfile::NamedTempFile) {
-        let (sample, _) = unsafe { write_sample(session) };
-        let data = read(sample.path()).unwrap();
-        let len = data.len() as u64;
-        (
-            Box::new(ReadAtCtx {
-                data,
-                releases: AtomicUsize::new(0),
-            }),
-            len,
-            sample,
-        )
+    /// Reports success while leaving the buffer untouched - what a naive
+    /// `pread(2)` wrapper does at EOF or on EINTR.
+    unsafe extern "C" fn short_read_at_cb(
+        _ctx: *mut c_void,
+        _offset: u64,
+        _dst: *mut u8,
+        length: usize,
+    ) -> i64 {
+        (length / 2) as i64
+    }
+
+    /// A written sample file, the callback state that serves it, and the array
+    /// it should read back as.
+    struct Sample {
+        ctx: Box<ReadAtCtx>,
+        len: u64,
+        array: StructArray,
+        _file: tempfile::NamedTempFile,
+    }
+
+    impl Sample {
+        fn new(session: *const vx_session) -> Self {
+            let (file, array) = unsafe { write_sample(session) };
+            let data = read(file.path()).unwrap();
+            let len = data.len() as u64;
+            Self {
+                ctx: Box::new(ReadAtCtx {
+                    data,
+                    releases: AtomicUsize::new(0),
+                }),
+                len,
+                array,
+                _file: file,
+            }
+        }
+
+        /// An anonymous descriptor over this sample. Tests needing a name or a
+        /// missing callback adjust the returned struct.
+        fn reader(
+            &self,
+            read_at: unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> i64,
+        ) -> vx_readat {
+            vx_readat {
+                ctx: (&raw const *self.ctx).cast::<c_void>().cast_mut(),
+                len: self.len,
+                concurrency: 0,
+                name: vx_view::from_str(""),
+                read_at: Some(read_at),
+                release: Some(release_cb),
+            }
+        }
+
+        fn releases(&self) -> usize {
+            self.ctx.releases.load(Ordering::SeqCst)
+        }
     }
 
     #[test]
@@ -539,16 +603,9 @@ mod tests {
     fn test_create_readat() {
         unsafe {
             let session = vx_session_new();
-            let (ctx, len, _sample) = readat_ctx(session);
-
-            let reader = vx_readat {
-                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
-                len,
-                concurrency: 0,
-                name: vx_view::from_str("test://sample.vortex"),
-                read_at: Some(read_at_cb),
-                release: Some(release_cb),
-            };
+            let sample = Sample::new(session);
+            let mut reader = sample.reader(read_at_cb);
+            reader.name = vx_view::from_str("test://sample.vortex");
 
             let mut error = ptr::null_mut();
             let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
@@ -561,13 +618,13 @@ mod tests {
             assert_eq!(row_count.r#type, vx_estimate_type::VX_ESTIMATE_EXACT);
             assert_eq!(row_count.estimate, SAMPLE_ROWS as u64);
 
-            assert_eq!(ctx.releases.load(Ordering::SeqCst), 0);
+            assert_eq!(sample.releases(), 0);
 
             vx_dtype_free(ffi_dtype);
             vx_data_source_free(ds);
             vx_session_free(session);
 
-            assert_eq!(ctx.releases.load(Ordering::SeqCst), 1);
+            assert_eq!(sample.releases(), 1);
         }
     }
 
@@ -578,7 +635,7 @@ mod tests {
     fn test_create_readat_invalid() {
         unsafe {
             let session = vx_session_new();
-            let (ctx, len, _sample) = readat_ctx(session);
+            let sample = Sample::new(session);
             let mut error = ptr::null_mut();
 
             let ds = vx_data_source_new_readat(ptr::null(), ptr::null(), &raw mut error);
@@ -592,19 +649,13 @@ mod tests {
 
             // read_at is required.
             let mut error = ptr::null_mut();
-            let reader = vx_readat {
-                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
-                len,
-                concurrency: 0,
-                name: vx_view::from_str(""),
-                read_at: None,
-                release: Some(release_cb),
-            };
+            let mut reader = sample.reader(read_at_cb);
+            reader.read_at = None;
             let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
             assert_error(error);
             assert!(ds.is_null());
 
-            assert_eq!(ctx.releases.load(Ordering::SeqCst), 0);
+            assert_eq!(sample.releases(), 0);
             vx_session_free(session);
         }
     }
@@ -616,23 +667,95 @@ mod tests {
     fn test_create_readat_callback_failure() {
         unsafe {
             let session = vx_session_new();
-            let (ctx, len, _sample) = readat_ctx(session);
+            let sample = Sample::new(session);
+            let reader = sample.reader(failing_read_at_cb);
 
-            let reader = vx_readat {
-                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
-                len,
-                concurrency: 0,
-                name: vx_view::from_str(""),
-                read_at: Some(failing_read_at_cb),
-                release: Some(release_cb),
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+            assert_eq!(sample.releases(), 1);
+
+            vx_session_free(session);
+        }
+    }
+
+    /// A short read must fail rather than reach `set_len`, which would expose
+    /// the unwritten tail of the buffer to the scan.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_create_readat_short_read() {
+        unsafe {
+            let session = vx_session_new();
+            let sample = Sample::new(session);
+            let reader = sample.reader(short_read_at_cb);
+
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+
+            // The descriptor was accepted before the read failed, so Vortex owns
+            // the context and must have released it before returning.
+            assert_eq!(sample.releases(), 1);
+
+            vx_session_free(session);
+        }
+    }
+
+    /// A name view of NULL with a non-zero length is a caller bug, not an
+    /// anonymous source.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_create_readat_invalid_name() {
+        unsafe {
+            let session = vx_session_new();
+            let sample = Sample::new(session);
+            let mut reader = sample.reader(read_at_cb);
+            reader.name = vx_view {
+                ptr: ptr::null(),
+                len: 5,
             };
 
             let mut error = ptr::null_mut();
             let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
             assert_error(error);
             assert!(ds.is_null());
-            assert_eq!(ctx.releases.load(Ordering::SeqCst), 1);
+            assert_eq!(sample.releases(), 0);
 
+            vx_session_free(session);
+        }
+    }
+
+    /// Scan data through the callbacks, not just the footer: this is the path
+    /// that exercises data segments, coalescing and concurrent reads.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_scan_readat() {
+        let mut ctx_exec = array_session().create_execution_ctx();
+        unsafe {
+            let session = vx_session_new();
+            let sample = Sample::new(session);
+            let reader = sample.reader(read_at_cb);
+
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_no_error(error);
+
+            let scan = vx_data_source_scan(ds, ptr::null(), ptr::null_mut(), &raw mut error);
+            assert_no_error(error);
+            let partition = vx_scan_next_partition(scan, &raw mut error);
+            assert_no_error(error);
+            let array = vx_partition_next(partition, &raw mut error);
+            assert_no_error(error);
+            assert!(!array.is_null());
+
+            assert_arrays_eq!(vx_array::as_ref(array), sample.array, &mut ctx_exec);
+
+            vx_array_free(array);
+            vx_partition_free(partition);
+            vx_scan_free(scan);
+            vx_data_source_free(ds);
             vx_session_free(session);
         }
     }
