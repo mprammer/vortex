@@ -33,6 +33,8 @@ use crate::box_wrapper;
 use crate::dtype::vx_dtype;
 use crate::error::try_or;
 use crate::error::vx_error;
+use crate::read_at::read_at_from_ffi;
+use crate::read_at::vx_readat;
 use crate::scan::vx_estimate;
 use crate::scan::vx_estimate_type;
 use crate::session::vx_session;
@@ -192,6 +194,46 @@ pub unsafe extern "C-unwind" fn vx_data_source_new_buffer(
     })
 }
 
+/// Create a data source that reads through caller-supplied callbacks instead of
+/// Vortex's own I/O.
+///
+/// Unlike vx_data_source_new_buffer, this keeps I/O pruning: only the segments a
+/// scan needs are fetched, rather than the whole file up front.
+///
+/// "reader" is read during this call only; its callbacks and context must stay
+/// valid until "release" runs. A rejected descriptor leaves ownership with the
+/// caller and never calls "release"; once accepted, "release" always runs.
+///
+/// On error, returns NULL and sets "err".
+#[unsafe(no_mangle)]
+pub unsafe extern "C-unwind" fn vx_data_source_new_readat(
+    session: *const vx_session,
+    reader: *const vx_readat,
+    err: *mut *mut vx_error,
+) -> *const vx_data_source {
+    try_or(err, ptr::null(), || {
+        vortex_ensure!(!session.is_null());
+
+        let session = vx_session::as_ref(session);
+        let source = unsafe { read_at_from_ffi(reader) }?;
+
+        let (file, len) = RUNTIME.block_on(async {
+            let len = source.size().await?;
+            let file = session.open_options().open(source).await?;
+            VortexResult::Ok((file, len))
+        })?;
+
+        let ds = MultiLayoutDataSource::new_with_first(
+            file.layout_reader()?,
+            Vec::new(),
+            vec![Some(len)],
+            session,
+        );
+
+        Ok(vx_data_source::new(ds))
+    })
+}
+
 /// Increase reference count on vx_data_source
 #[unsafe(no_mangle)]
 pub unsafe extern "C-unwind" fn vx_data_source_clone(
@@ -237,17 +279,22 @@ mod tests {
     use std::ffi::c_void;
     use std::fs::read;
     use std::ptr;
+    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::Ordering;
 
     use crate::data_source::vx_data_source_dtype;
     use crate::data_source::vx_data_source_free;
     use crate::data_source::vx_data_source_get_row_count;
     use crate::data_source::vx_data_source_new;
     use crate::data_source::vx_data_source_new_buffer;
+    use crate::data_source::vx_data_source_new_readat;
     use crate::data_source::vx_data_source_options;
     use crate::dtype::vx_dtype;
     use crate::dtype::vx_dtype_free;
+    use crate::read_at::vx_readat;
     use crate::scan::vx_estimate;
     use crate::scan::vx_estimate_type;
+    use crate::session::vx_session;
     use crate::session::vx_session_free;
     use crate::session::vx_session_new;
     use crate::string::vx_view;
@@ -426,6 +473,166 @@ mod tests {
 
             vx_dtype_free(ffi_dtype);
             vx_data_source_free(ds);
+            vx_session_free(session);
+        }
+    }
+
+    /// Backing store for the callback reader: the whole file in memory, plus a
+    /// count of `release` calls so the test can prove it runs exactly once.
+    struct ReadAtCtx {
+        data: Vec<u8>,
+        releases: AtomicUsize,
+    }
+
+    unsafe extern "C" fn read_at_cb(
+        ctx: *mut c_void,
+        offset: u64,
+        dst: *mut u8,
+        length: usize,
+    ) -> i32 {
+        let ctx = unsafe { &*ctx.cast::<ReadAtCtx>() };
+        let Ok(start) = usize::try_from(offset) else {
+            return 1;
+        };
+        let Some(end) = start.checked_add(length) else {
+            return 1;
+        };
+        if end > ctx.data.len() {
+            return 1;
+        }
+        unsafe { ptr::copy_nonoverlapping(ctx.data[start..end].as_ptr(), dst, length) };
+        0
+    }
+
+    unsafe extern "C" fn release_cb(ctx: *mut c_void) {
+        let ctx = unsafe { &*ctx.cast::<ReadAtCtx>() };
+        ctx.releases.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// A reader whose callback always fails, to check the error surfaces
+    /// instead of handing uninitialized bytes to the scan.
+    unsafe extern "C" fn failing_read_at_cb(
+        _ctx: *mut c_void,
+        _offset: u64,
+        _dst: *mut u8,
+        _length: usize,
+    ) -> i32 {
+        -7
+    }
+
+    fn readat_ctx(session: *const vx_session) -> (Box<ReadAtCtx>, u64, tempfile::NamedTempFile) {
+        let (sample, _) = unsafe { write_sample(session) };
+        let data = read(sample.path()).unwrap();
+        let len = data.len() as u64;
+        (
+            Box::new(ReadAtCtx {
+                data,
+                releases: AtomicUsize::new(0),
+            }),
+            len,
+            sample,
+        )
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_create_readat() {
+        unsafe {
+            let session = vx_session_new();
+            let (ctx, len, _sample) = readat_ctx(session);
+
+            let reader = vx_readat {
+                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
+                len,
+                concurrency: 0,
+                name: vx_view::from_str("test://sample.vortex"),
+                read_at: Some(read_at_cb),
+                release: Some(release_cb),
+            };
+
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_no_error(error);
+            assert!(!ds.is_null());
+
+            let ffi_dtype = vx_data_source_dtype(ds);
+            let mut row_count = vx_estimate::default();
+            vx_data_source_get_row_count(ds, &raw mut row_count);
+            assert_eq!(row_count.r#type, vx_estimate_type::VX_ESTIMATE_EXACT);
+            assert_eq!(row_count.estimate, SAMPLE_ROWS as u64);
+
+            assert_eq!(ctx.releases.load(Ordering::SeqCst), 0);
+
+            vx_dtype_free(ffi_dtype);
+            vx_data_source_free(ds);
+            vx_session_free(session);
+
+            assert_eq!(ctx.releases.load(Ordering::SeqCst), 1);
+        }
+    }
+
+    /// Descriptor validation fails before ownership transfers, so the caller
+    /// keeps the context and `release` must not run.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_create_readat_invalid() {
+        unsafe {
+            let session = vx_session_new();
+            let (ctx, len, _sample) = readat_ctx(session);
+            let mut error = ptr::null_mut();
+
+            let ds = vx_data_source_new_readat(ptr::null(), ptr::null(), &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, ptr::null(), &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+
+            // read_at is required.
+            let mut error = ptr::null_mut();
+            let reader = vx_readat {
+                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
+                len,
+                concurrency: 0,
+                name: vx_view::from_str(""),
+                read_at: None,
+                release: Some(release_cb),
+            };
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+
+            assert_eq!(ctx.releases.load(Ordering::SeqCst), 0);
+            vx_session_free(session);
+        }
+    }
+
+    /// A failing callback must surface as an error. Ownership has already
+    /// transferred by then, so `release` still runs.
+    #[test]
+    #[cfg_attr(miri, ignore)]
+    fn test_create_readat_callback_failure() {
+        unsafe {
+            let session = vx_session_new();
+            let (ctx, len, _sample) = readat_ctx(session);
+
+            let reader = vx_readat {
+                ctx: (&raw const *ctx).cast::<c_void>().cast_mut(),
+                len,
+                concurrency: 0,
+                name: vx_view::from_str(""),
+                read_at: Some(failing_read_at_cb),
+                release: Some(release_cb),
+            };
+
+            let mut error = ptr::null_mut();
+            let ds = vx_data_source_new_readat(session, &raw const reader, &raw mut error);
+            assert_error(error);
+            assert!(ds.is_null());
+            assert_eq!(ctx.releases.load(Ordering::SeqCst), 1);
+
             vx_session_free(session);
         }
     }
