@@ -156,7 +156,7 @@ impl VTable for ALP {
                     .map(|dtype| children.get(3, &dtype, usize::try_from(p.chunk_offsets_len())?))
                     .transpose()?;
 
-                Patches::new(len, p.offset()?, indices, values, chunk_offsets)
+                Patches::from_metadata(len, p, indices, values, chunk_offsets)
             })
             .transpose()?;
 
@@ -482,6 +482,7 @@ impl ValidityChild<ALP> for ALP {
 #[cfg(test)]
 mod tests {
     use std::f64::consts::PI;
+    use std::ops::Range;
     use std::sync::LazyLock;
 
     use rstest::rstest;
@@ -502,6 +503,50 @@ mod tests {
         crate::initialize(&session);
         session
     });
+
+    #[rstest]
+    #[case(0..4105, 0)]
+    #[case(5..4100, 2)]
+    #[case(1025..4100, 0)]
+    #[case(1023..1026, 4)]
+    fn test_deserialize_sliced_patches(
+        #[case] range: Range<usize>,
+        #[case] within: usize,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let mut values = vec![1.0f64; 4105];
+        for index in [1, 4, 5, 31, 1023, 1025, 3072, 4095, 4096, 4102] {
+            values[index] = PI;
+        }
+        let original = PrimitiveArray::from_iter(values);
+        let encoded = alp_encode(original.as_view(), Some(Exponents { e: 0, f: 0 }), &mut ctx)?;
+        let sliced = ALP::try_new(
+            encoded.encoded().slice(range.clone())?,
+            encoded.exponents(),
+            encoded.patches().unwrap().slice(range.clone())?,
+        )?;
+        assert_eq!(
+            sliced.patches().unwrap().offset_within_chunk(),
+            Some(within)
+        );
+
+        let metadata = ALP::serialize(sliced.as_view(), &SESSION)?.unwrap();
+        let deserialized = Array::<ALP>::try_from_parts(ALP.deserialize(
+            sliced.dtype(),
+            sliced.len(),
+            &metadata,
+            &[],
+            &sliced.as_array().children(),
+            &SESSION,
+        )?)?;
+
+        assert_eq!(
+            deserialized.patches().unwrap().offset_within_chunk(),
+            Some(within)
+        );
+        assert_arrays_eq!(deserialized, original.slice(range)?, &mut ctx);
+        Ok(())
+    }
 
     #[rstest]
     #[case(0)]

@@ -297,6 +297,33 @@ impl Patches {
         })
     }
 
+    /// Reconstruct patches from serialized metadata, validating components as in [`Self::new`].
+    ///
+    /// Retains the offset within the first chunk after slicing. Older metadata that omits
+    /// this offset keeps the constructor's default of zero when chunk offsets are present.
+    pub fn from_metadata(
+        array_len: usize,
+        metadata: PatchesMetadata,
+        indices: ArrayRef,
+        values: ArrayRef,
+        chunk_offsets: Option<ArrayRef>,
+    ) -> VortexResult<Self> {
+        let mut patches = Self::new(
+            array_len,
+            metadata.offset()?,
+            indices,
+            values,
+            chunk_offsets,
+        )?;
+        if let Some(offset) = metadata.offset_within_chunk {
+            patches.offset_within_chunk = Some(
+                usize::try_from(offset)
+                    .map_err(|_| vortex_err!("offset_within_chunk does not fit in usize"))?,
+            );
+        }
+        Ok(patches)
+    }
+
     /// Construct new patches without validating any of the arguments
     ///
     /// # Safety
@@ -1239,6 +1266,7 @@ fn take_indices_with_search_fn<
 mod test {
     use vortex_buffer::BufferMut;
     use vortex_buffer::buffer;
+    use vortex_error::VortexResult;
     use vortex_mask::Mask;
 
     use crate::IntoArray;
@@ -2309,6 +2337,52 @@ mod test {
         let dropped_first = patches.slice(1024..2048).unwrap().unwrap();
         let resliced = dropped_first.slice(0..1024).unwrap().unwrap();
         assert_eq!(resliced.num_patches(), 1);
+    }
+
+    #[test]
+    fn test_from_metadata_missing_within_chunk() -> VortexResult<()> {
+        let patches = Patches::new(
+            2048,
+            0,
+            buffer![100u64, 1200].into_array(),
+            buffer![10i32, 20].into_array(),
+            Some(buffer![0u64, 1].into_array()),
+        )?;
+        let mut metadata = patches.to_metadata(2048, patches.dtype())?;
+        metadata.offset_within_chunk = None;
+        let decoded = Patches::from_metadata(
+            2048,
+            metadata,
+            patches.indices().clone(),
+            patches.values().clone(),
+            patches.chunk_offsets().clone(),
+        )?;
+        assert_eq!(decoded.offset_within_chunk(), Some(0));
+        assert_eq!(decoded.search_index(1200)?, SearchResult::Found(1));
+        Ok(())
+    }
+
+    #[test]
+    fn test_from_metadata_flat_within_chunk() -> VortexResult<()> {
+        let patches = Patches::new(
+            10,
+            5,
+            buffer![7u64].into_array(),
+            buffer![10i32].into_array(),
+            None,
+        )?;
+        let mut metadata = patches.to_metadata(10, patches.dtype())?;
+        metadata.offset_within_chunk = Some(2);
+        let decoded = Patches::from_metadata(
+            10,
+            metadata,
+            patches.indices().clone(),
+            patches.values().clone(),
+            None,
+        )?;
+        assert_eq!(decoded.offset_within_chunk(), Some(2));
+        assert_eq!(decoded.search_index(2)?, SearchResult::Found(0));
+        Ok(())
     }
 
     #[test]
