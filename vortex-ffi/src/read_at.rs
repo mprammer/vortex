@@ -8,7 +8,9 @@
 
 use std::ffi::c_void;
 use std::sync::Arc;
+use std::sync::LazyLock;
 
+use async_lock::Semaphore;
 use futures::FutureExt;
 use futures::future::BoxFuture;
 use vortex::array::buffer::BufferHandle;
@@ -29,6 +31,11 @@ use crate::string::vx_view;
 /// since a host that delegates its I/O is usually talking to remote storage.
 const DEFAULT_CONCURRENCY: usize = 192;
 
+/// Ceiling on callbacks in flight across every source in the process, since
+/// per-source limits otherwise multiply. The Java bindings cap upcalls likewise.
+static READ_LIMITER: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(DEFAULT_CONCURRENCY)));
+
 /// A random-access byte source implemented by the caller.
 ///
 /// "read_at" must tolerate concurrent calls from arbitrary threads. The struct
@@ -41,19 +48,19 @@ pub struct vx_readat {
     /// Total length of the source in bytes. Must be exact: the footer is read
     /// relative to the end, so a wrong length surfaces as a corrupt file.
     pub len: u64,
-    /// Maximum number of concurrent "read_at" calls. 0 selects a default. The
-    /// cap is per-source, so opening many files multiplies it.
+    /// Maximum number of concurrent "read_at" calls for this source. 0 selects a
+    /// default. A process-wide ceiling applies across all sources as well.
     pub concurrency: usize,
     /// Optional name, typically the URI, used for cache keys and error messages;
     /// it should be stable and unique. Copied. Zero-length means anonymous.
     pub name: vx_view,
-    /// Required. Must write all "length" bytes at "offset" into "dst" and return
-    /// 0, or return non-zero; success without filling "dst" leaks uninitialized
-    /// memory into the scan.
+    /// Required. Writes "length" bytes at "offset" into "dst" and returns the
+    /// count written; a short count or a negative value fails the read.
     pub read_at: Option<
-        unsafe extern "C" fn(ctx: *mut c_void, offset: u64, dst: *mut u8, length: usize) -> i32,
+        unsafe extern "C" fn(ctx: *mut c_void, offset: u64, dst: *mut u8, length: usize) -> i64,
     >,
-    /// Optional. Called once, after Vortex has dropped the source.
+    /// Optional. Called once, before the call that drops the source returns -
+    /// on that thread, or on a worker thread if any are configured.
     pub release: Option<unsafe extern "C" fn(ctx: *mut c_void)>,
 }
 
@@ -63,7 +70,7 @@ struct CReadAtInner {
     len: u64,
     concurrency: usize,
     name: Option<Arc<str>>,
-    read_at: unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> i32,
+    read_at: unsafe extern "C" fn(*mut c_void, u64, *mut u8, usize) -> i64,
     release: Option<unsafe extern "C" fn(*mut c_void)>,
 }
 
@@ -120,8 +127,18 @@ impl VortexReadAt for CReadAt {
         let handle = self.handle.clone();
 
         async move {
+            // Take a permit before occupying a blocking thread. The lock-free path
+            // barges ahead of waiters: the limiter must not become the bottleneck.
+            let permit = match READ_LIMITER.try_acquire_arc() {
+                Some(permit) => permit,
+                None => READ_LIMITER.acquire_arc().await,
+            };
+
             handle
                 .spawn_blocking(move || {
+                    // Cancelling the read drops the task handle but cannot interrupt a
+                    // callback already running, so the permit stays with the work.
+                    let _permit = permit;
                     let end = offset
                         .checked_add(length as u64)
                         .ok_or_else(|| vortex_err!("read {offset}+{length} overflows u64"))?;
@@ -137,7 +154,7 @@ impl VortexReadAt for CReadAt {
                     if length > 0 {
                         // SAFETY: spare capacity covers `length` bytes; the pointer is
                         // not retained past the call.
-                        let rc = unsafe {
+                        let written = unsafe {
                             (inner.read_at)(
                                 inner.ctx,
                                 offset,
@@ -145,15 +162,21 @@ impl VortexReadAt for CReadAt {
                                 length,
                             )
                         };
-                        if rc != 0 {
+                        if written < 0 {
                             vortex_bail!(
-                                "read_at callback failed with code {rc} for {offset}..{end}"
+                                "read_at callback failed with code {written} for {offset}..{end}"
+                            );
+                        }
+                        // A host returning short without saying so would leave the tail of
+                        // `dst` uninitialized for the scan to read.
+                        if written as u64 != length as u64 {
+                            vortex_bail!(
+                                "read_at callback wrote {written} of {length} bytes for {offset}..{end}"
                             );
                         }
                     }
 
-                    // SAFETY: the callback contract requires all `length` bytes written
-                    // whenever it reports success.
+                    // SAFETY: the callback reported writing all `length` bytes, checked above.
                     unsafe { buffer.set_len(length) };
 
                     Ok(BufferHandle::new_host(buffer.freeze()))
@@ -178,11 +201,10 @@ pub(crate) unsafe fn read_at_from_ffi(
         .read_at
         .ok_or_else(|| vortex_err!("vx_readat.read_at is required"))?;
 
-    let name = if reader.name.ptr.is_null() || reader.name.len == 0 {
-        None
-    } else {
-        Some(Arc::from(unsafe { reader.name.as_str() }?))
-    };
+    // `as_str` rejects a null pointer with a non-zero length, which a manual
+    // null check here would silently accept as anonymous.
+    let name = unsafe { reader.name.as_str() }?;
+    let name = (!name.is_empty()).then(|| Arc::from(name));
 
     let concurrency = if reader.concurrency == 0 {
         DEFAULT_CONCURRENCY
