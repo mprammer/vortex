@@ -226,7 +226,7 @@ impl VTable for BitPacked {
                     .map(|dtype| children.get(2, &dtype, p.chunk_offsets_len() as usize))
                     .transpose()?;
 
-                Patches::new(len, p.offset()?, indices, values, chunk_offsets)
+                Patches::from_metadata(len, p, indices, values, chunk_offsets)
             })
             .transpose()?;
 
@@ -345,5 +345,90 @@ impl BitPacked {
         ctx: &mut ExecutionCtx,
     ) -> VortexResult<BitPackedArray> {
         BitPackedData::encode(array, bit_width, ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ops::Range;
+    use std::sync::LazyLock;
+
+    use rstest::rstest;
+    use vortex_array::VortexSessionExecute;
+    use vortex_array::arrays::PrimitiveArray;
+    use vortex_array::arrays::slice::SliceKernel;
+    use vortex_array::assert_arrays_eq;
+    use vortex_session::VortexSession;
+
+    use super::*;
+    use crate::bitpack_compress::bitpack_encode;
+
+    static SESSION: LazyLock<VortexSession> = LazyLock::new(|| {
+        let session = vortex_array::array_session();
+        crate::initialize(&session);
+        session
+    });
+
+    #[rstest]
+    #[case(0..4105, 0)]
+    #[case(5..4100, 2)]
+    #[case(1025..4100, 0)]
+    #[case(1023..1026, 4)]
+    fn test_deserialize_sliced_patches(
+        #[case] range: Range<usize>,
+        #[case] within: usize,
+    ) -> VortexResult<()> {
+        let mut ctx = SESSION.create_execution_ctx();
+        let patched_indices = [1usize, 4, 5, 31, 1023, 1025, 3072, 4095, 4096, 4102];
+        let mut values = vec![1u32; 4105];
+        for index in patched_indices {
+            values[index] = 1 << 20;
+        }
+        let original = PrimitiveArray::from_iter(values);
+        let encoded = bitpack_encode(&original, 4, None, &mut ctx)?;
+
+        let sliced = <BitPacked as SliceKernel>::slice(encoded.as_view(), range.clone(), &mut ctx)?
+            .ok_or_else(|| vortex_err!("slice kernel should apply to a patched array"))?
+            .try_downcast::<BitPacked>()
+            .map_err(|a| vortex_err!("expected BitPacked, got {}", a.encoding_id()))?;
+        let patches = sliced
+            .patches()
+            .ok_or_else(|| vortex_err!("expected patches"))?;
+        assert_eq!(patches.offset_within_chunk(), Some(within));
+
+        let metadata = BitPacked::serialize(sliced.as_view(), &SESSION)?
+            .ok_or_else(|| vortex_err!("expected metadata"))?;
+        let buffers = sliced
+            .as_array()
+            .buffers()
+            .into_iter()
+            .map(BufferHandle::new_host)
+            .collect::<Vec<_>>();
+        let deserialized = Array::<BitPacked>::try_from_parts(BitPacked.deserialize(
+            sliced.dtype(),
+            sliced.len(),
+            &metadata,
+            &buffers,
+            &sliced.as_array().children(),
+            &SESSION,
+        )?)?;
+
+        let deserialized_patches = deserialized
+            .patches()
+            .ok_or_else(|| vortex_err!("expected patches"))?;
+        assert_eq!(deserialized_patches.offset_within_chunk(), Some(within));
+
+        // Decoding the whole array never reads the offset; the search path does, so a lost
+        // offset only shows up as a patch that random access can no longer find.
+        for index in patched_indices.into_iter().filter(|i| range.contains(i)) {
+            assert!(
+                deserialized_patches
+                    .get_patched(index - range.start)?
+                    .is_some(),
+                "lost the patch at index {index}"
+            );
+        }
+        assert_arrays_eq!(deserialized, original.slice(range)?, &mut ctx);
+        Ok(())
     }
 }
